@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
-from spark_keeper.automation.errors import AuthenticationRequired, SendFailed, TargetNotFound
+from spark_keeper.automation.douyin_chat import DouyinChatAdapter, LoginResult
+from spark_keeper.automation.errors import (
+    AuthenticationRequired,
+    AutomationError,
+    SendFailed,
+    TargetNotFound,
+)
 from spark_keeper.automation.service import BatchService, wait_for_delay
 from spark_keeper.database import Database, today_iso
 from spark_keeper.dpapi import DpapiJsonStore
@@ -22,11 +29,30 @@ from spark_keeper.models import (
     MessageKind,
 )
 
+ACCOUNT_PROFILE = "https://www.douyin.com/user/test-account"
+ACCOUNT_KEY = hashlib.sha256(ACCOUNT_PROFILE.encode("utf-8")).hexdigest()
+
+
+class IdentityPage:
+    def __init__(self, profile: str = ACCOUNT_PROFILE) -> None:
+        self.profile = profile
+
+    async def evaluate(self, _script):
+        return self.profile
+
+
+class IdentityContext:
+    async def storage_state(self):
+        return {"cookies": [], "origins": []}
+
 
 class FakeFactory:
+    def __init__(self, profile: str = ACCOUNT_PROFILE) -> None:
+        self.profile = profile
+
     @asynccontextmanager
     async def open(self, **_):
-        yield SimpleNamespace(page=object())
+        yield SimpleNamespace(page=IdentityPage(self.profile), context=IdentityContext())
 
 
 class ContinuingAdapter:
@@ -73,7 +99,7 @@ class CaptureAdapter:
 
 def setup_service(tmp_path) -> tuple[BatchService, Database]:
     database = Database(tmp_path / "state.sqlite3")
-    database.save_account("account-key", "测试账号")
+    database.save_account(ACCOUNT_KEY, "测试账号")
     database.add_target(FriendCandidate("friend-1", "失败好友", douyin_id="id-1"), "失败")
     database.add_target(FriendCandidate("friend-2", "成功好友", douyin_id="id-2"), "成功")
     database.save_plan(enabled=False, send_time="09:00", message_text="测试消息", confirmed=True)
@@ -293,7 +319,7 @@ async def test_native_failures_preserve_triggered_unknown_guard(
     expected = AttemptStatus.UNKNOWN if unknown else AttemptStatus.FAILED
     item = result.results[0]
     assert item.status is expected
-    assert database.has_daily_guard("account-key", target.id, today_iso()) == unknown
+    assert database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso()) == unknown
     row = database.get_attempt(item.attempt_id)
     assert row["status"] == expected.value
     assert row["message_kind"] == "spark_sticker"
@@ -406,9 +432,9 @@ async def test_batch_sends_all_enabled_targets_beyond_five_in_order(tmp_path, mo
         (operation, target.id) for target in targets for operation in ("open", "verify", "sent")
     ]
     assert all(
-        database.has_daily_guard("account-key", target.id, today_iso()) for target in targets
+        database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso()) for target in targets
     )
-    assert not database.has_daily_guard("account-key", disabled.id, today_iso())
+    assert not database.has_daily_guard(ACCOUNT_KEY, disabled.id, today_iso())
 
 
 @pytest.mark.asyncio
@@ -483,8 +509,8 @@ async def test_batch_cancellation_during_delay_cancels_unsent_targets(
         AttemptStatus.SUCCESS,
         AttemptStatus.CANCELLED,
     ]
-    assert database.has_daily_guard("account-key", first_enabled.id, today_iso())
-    assert not database.has_daily_guard("account-key", second_enabled.id, today_iso())
+    assert database.has_daily_guard(ACCOUNT_KEY, first_enabled.id, today_iso())
+    assert not database.has_daily_guard(ACCOUNT_KEY, second_enabled.id, today_iso())
     assert result.results[1].target_alias == target_label(second_enabled)
 
 
@@ -553,7 +579,7 @@ async def test_scheduled_batch_cannot_override_duplicate(tmp_path, monkeypatch) 
     assert first.results[0].status is AttemptStatus.SUCCESS
     second = await service.run_batch(BatchMode.SCHEDULED, target_ids=[target.id])
     assert second.results[0].status is AttemptStatus.DUPLICATE
-    assert database.has_daily_guard("account-key", target.id, today_iso())
+    assert database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso())
     assert second.results[0].target_alias == target_label(target)
 
 
@@ -565,11 +591,7 @@ async def test_visible_capture_returns_candidate_without_send_path(tmp_path, mon
     capture_requested.set()
     browser_ready = threading.Event()
 
-    async def same_account(_session) -> Account:
-        return Account("account-key", "测试账号", "now")
-
     monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", CaptureAdapter)
-    monkeypatch.setattr("spark_keeper.automation.service.derive_account_identity", same_account)
 
     candidate = await service.capture_current_chat_friend(
         "测试好友乙",
@@ -642,7 +664,7 @@ async def test_target_errors_keep_full_details_and_existing_send_safety(
     assert event["message"] == item.detail
     assert event["target_alias"] == item.target_alias
     assert (item.target_alias, item.detail) in progress
-    assert database.has_daily_guard("account-key", target.id, today_iso()) == (
+    assert database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso()) == (
         failure_phase == "after_trigger"
     )
     attempt = database.get_attempt(item.attempt_id)
@@ -700,3 +722,367 @@ async def test_pre_cancelled_batch_keeps_real_labels_for_every_target(tmp_path, 
         target_label(target) for target in database.list_targets()
     ]
     assert all(item.status is AttemptStatus.CANCELLED for item in result.results)
+
+
+@pytest.mark.asyncio
+async def test_batch_rejects_different_browser_account_before_reserving(tmp_path, monkeypatch):
+    service, database = setup_service(tmp_path)
+    service.browser_factory = FakeFactory("https://www.douyin.com/user/other-account")
+
+    class NoTargetAdapter(ContinuingAdapter):
+        async def open_confirmed_target(self, _target):
+            pytest.fail("mismatched browser must not select or send")
+
+    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", NoTargetAdapter)
+    result = await service.run_batch(BatchMode.MANUAL)
+    assert result.status is BatchStatus.FAILED
+    assert result.error_code is ErrorCode.CONFIGURATION_INVALID
+    assert database.count_rows("send_attempts") == 0
+    assert database.count_rows("daily_send_guards") == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_snapshots_account_plan_targets_only_under_mutex(tmp_path, monkeypatch):
+    service, database = setup_service(tmp_path)
+    held = False
+
+    class Mutex:
+        def acquire(self):
+            nonlocal held
+            held = True
+
+        def release(self):
+            nonlocal held
+            held = False
+
+    def guarded(method):
+        def read(*args, **kwargs):
+            assert held
+            return method(*args, **kwargs)
+        return read
+
+    for name in ("get_account", "get_plan", "list_targets"):
+        monkeypatch.setattr(database, name, guarded(getattr(database, name)))
+    monkeypatch.setattr("spark_keeper.automation.service.WindowsTaskMutex", Mutex)
+    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", ContinuingAdapter)
+    result = await service.run_batch(BatchMode.MANUAL)
+    assert result.status is BatchStatus.PARTIAL
+    assert not held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["interactive", "delete", "account", "state", None])
+async def test_login_commit_failures_never_pair_new_state_with_old_account(
+    tmp_path, monkeypatch, failure,
+):
+    service, database = setup_service(tmp_path)
+    database.save_plan(enabled=True, send_time="09:00", message_text="消息", confirmed=True)
+    old_account = database.get_account()
+    old_targets = database.list_targets()
+    old_plan = database.get_plan()
+    state = service.state_store
+    old_bytes = state.path.read_bytes()
+    new_state = {"cookies": [{"name": "uid_tt", "value": "new-private-cookie"}]}
+    steps = []
+    save_account = database.save_account
+    delete_state = state.delete
+
+    async def login(_factory, *, status=None, cancel=None):
+        steps.append("interactive")
+        assert database.get_account() == old_account
+        assert state.path.read_bytes() == old_bytes
+        if failure == "interactive":
+            raise RuntimeError("interactive failed")
+        return LoginResult(Account("new-account", "新账号", ""), new_state)
+
+    def delete():
+        steps.append("delete")
+        if failure == "delete":
+            raise PermissionError("delete failed")
+        delete_state()
+
+    def account(*args):
+        steps.append("account")
+        assert not state.exists()
+        if failure == "account":
+            raise RuntimeError("account failed")
+        return save_account(*args)
+
+    def save(value):
+        steps.append("state")
+        assert database.get_account().platform_user_id == "new-account"
+        assert not state.exists()
+        assert value == new_state
+        if failure == "state":
+            raise OSError("state failed")
+        state.path.write_bytes(b"new-encrypted-state")
+
+    monkeypatch.setattr("spark_keeper.automation.service.interactive_login", login)
+    monkeypatch.setattr(state, "delete", delete)
+    monkeypatch.setattr(database, "save_account", account)
+    monkeypatch.setattr(state, "save", save)
+    if failure:
+        with pytest.raises((RuntimeError, OSError), match=f"{failure} failed"):
+            await service.login()
+        assert not any(event["category"] == "login" for event in database.list_events())
+    else:
+        await service.login()
+        assert steps == ["interactive", "delete", "account", "state"]
+        assert state.path.read_bytes() == b"new-encrypted-state"
+        assert any(event["category"] == "login" for event in database.list_events())
+    if failure in {"interactive", "delete", "account"}:
+        assert database.get_account() == old_account
+        assert database.list_targets() == old_targets
+        assert database.get_plan() == old_plan
+    else:
+        assert database.get_account().platform_user_id == "new-account"
+        assert not any(target.enabled for target in database.list_targets())
+        assert not database.get_plan().enabled
+        assert database.get_plan().confirmed_at is None
+    if failure in {"interactive", "delete"}:
+        assert state.path.read_bytes() == old_bytes
+    elif failure in {"account", "state"}:
+        assert not state.exists()
+        with pytest.raises(ValueError, match="请先扫码登录"):
+            await service.run_batch(BatchMode.MANUAL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before", "interactive", "returned"])
+async def test_login_cancellation_preserves_entire_old_login(tmp_path, monkeypatch, phase):
+    service, database = setup_service(tmp_path)
+    before = (database.get_account(), database.get_plan(), database.list_targets())
+    credentials = service.state_store.path.read_bytes()
+    cancel = threading.Event()
+    if phase == "before":
+        cancel.set()
+
+    async def login(_factory, *, status=None, cancel=None):
+        assert phase != "before"
+        cancel.set()
+        if phase == "interactive":
+            raise AutomationError(ErrorCode.CANCELLED, "登录已取消")
+        return LoginResult(Account("new-account", "新账号", ""), {"cookies": []})
+
+    monkeypatch.setattr("spark_keeper.automation.service.interactive_login", login)
+    with pytest.raises(AutomationError) as caught:
+        await service.login(cancel=cancel)
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert (database.get_account(), database.get_plan(), database.list_targets()) == before
+    assert service.state_store.path.read_bytes() == credentials
+    assert not any(event["category"] == "login" for event in database.list_events())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["delay", "target", "reserved"])
+@pytest.mark.parametrize("conflict", [False, True])
+@pytest.mark.parametrize("manual_override", [False, True])
+async def test_cross_midnight_rechecks_guard_before_send(
+    tmp_path, monkeypatch, phase, conflict, manual_override,
+):
+    service, database = setup_service(tmp_path)
+    first, target = database.list_targets()
+    day = "2026-09-04"
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: day)
+    monkeypatch.setattr("spark_keeper.automation.service.today_iso", lambda: day)
+    sent = []
+
+    if conflict:
+        other_batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+        existing = database.reserve_attempt(
+            batch_id=other_batch, account_key=ACCOUNT_KEY, target_id=target.id,
+            run_date="2026-09-05", message_text="已经发送", manual_override=False,
+        )
+        database.finish_attempt(existing.attempt_id, AttemptStatus.UNKNOWN)
+        existing_before = database.get_attempt(existing.attempt_id)
+
+    class MidnightAdapter(ContinuingAdapter):
+        async def open_confirmed_target(self, selected):
+            nonlocal day
+            self.target_id = selected.id
+            if phase == "target" and selected.id == target.id:
+                day = "2026-09-05"
+
+        async def send_text_and_confirm(self, _text, on_trigger):
+            nonlocal day
+            if phase == "reserved" and self.target_id == target.id:
+                await asyncio.sleep(0)
+                day = "2026-09-05"
+            on_trigger()
+            sent.append(self.target_id)
+
+    async def wait(_seconds, _cancel):
+        nonlocal day
+        day = "2026-09-05"
+        return False
+
+    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", MidnightAdapter)
+    service.delay_sampler = lambda *_args: 1 if phase == "delay" else 0
+    service.delay_waiter = wait
+    result = await service.run_batch(
+        BatchMode.MANUAL,
+        manual_override_target_ids=[target.id] if manual_override else [],
+    )
+    item = result.results[1]
+    blocked = conflict or manual_override
+    assert sent == ([first.id] if blocked else [first.id, target.id])
+    assert item.status is (AttemptStatus.DUPLICATE if blocked else AttemptStatus.SUCCESS)
+    row = database.get_attempt(item.attempt_id)
+    assert bool(row["triggered_at"]) == (not blocked)
+    if blocked:
+        assert item.error_code is ErrorCode.DUPLICATE_BLOCKED
+    if not blocked:
+        assert row["run_date"] == "2026-09-05"
+        repeat = await service.run_batch(BatchMode.MANUAL, target_ids=[target.id])
+        assert repeat.results[0].status is AttemptStatus.DUPLICATE
+        assert sent == [first.id, target.id]
+    if conflict:
+        assert database.get_attempt(existing.attempt_id) == existing_before
+    assert not database.has_daily_guard(ACCOUNT_KEY, target.id, "2026-09-04")
+    assert not database.list_pending_actions("unknown_send")
+
+
+@pytest.mark.asyncio
+async def test_trigger_persistence_failure_does_not_send_or_become_unknown(tmp_path, monkeypatch):
+    service, database = setup_service(tmp_path)
+    target = database.list_targets()[1]
+    sent = []
+
+    class SendingAdapter(ContinuingAdapter):
+        async def send_text_and_confirm(self, _text, on_trigger):
+            on_trigger()
+            sent.append(True)
+
+    with database.connect(immediate=True) as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_trigger BEFORE UPDATE OF triggered_at ON send_attempts "
+            "BEGIN SELECT RAISE(ABORT, 'trigger persistence failed'); END"
+        )
+    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", SendingAdapter)
+    result = await service.run_batch(BatchMode.MANUAL, target_ids=[target.id])
+    assert sent == []
+    assert result.results[0].status is AttemptStatus.FAILED
+    assert result.results[0].error_code is ErrorCode.INTERNAL_ERROR
+    assert not database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso())
+    assert database.get_attempt(result.results[0].attempt_id)["triggered_at"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("kind", "boundary"), [
+    (MessageKind.TEXT, "snapshot"),
+    (MessageKind.SPARK_STICKER, "snapshot"),
+    (MessageKind.SPARK_STICKER, "identity"),
+])
+async def test_real_adapter_final_preparation_await_rechecks_actual_day_before_click(
+    tmp_path, monkeypatch, kind, boundary,
+):
+    service, database = setup_service(tmp_path)
+    target = database.list_targets()[1]
+    day = "2026-09-04"
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: day)
+    monkeypatch.setattr("spark_keeper.automation.service.today_iso", lambda: day)
+    other_batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    existing = database.reserve_attempt(
+        batch_id=other_batch, account_key=ACCOUNT_KEY, target_id=target.id,
+        run_date="2026-09-05", message_text="当日已有消息", manual_override=False,
+    )
+    database.finish_attempt(existing.attempt_id, AttemptStatus.UNKNOWN)
+    protected = database.get_attempt(existing.attempt_id)
+    events = []
+    snapshot = {"conversationId": "conversation", "watermark": "10", "messages": []}
+
+    class Action:
+        async def click(self):
+            pytest.fail("actual adapter must reject before the irreversible click")
+
+        async def press(self, _key):
+            pytest.fail("actual adapter must reject before the irreversible Enter")
+
+        async def dispose(self):
+            events.append("disposed")
+
+    class Control:
+        async def count(self):
+            return 1
+
+        def nth(self, _index):
+            return self
+
+        async def is_visible(self):
+            return True
+
+        async def element_handle(self):
+            events.append("captured")
+            return Action()
+
+        async def click(self):
+            events.append("focused")
+
+        async def fill(self, text):
+            self.text = text
+
+        async def evaluate(self, _script):
+            return self.text
+
+    class BoundaryPage(IdentityPage):
+        def get_by_role(self, *_args, **_kwargs):
+            return Control()
+
+    class BoundaryAdapter(DouyinChatAdapter):
+        async def open_chat(self):
+            pass
+
+        async def open_confirmed_target(self, _target):
+            pass
+
+        async def verify_recipient(self, _target):
+            nonlocal day
+            if boundary == "identity":
+                await asyncio.sleep(0)
+                day = "2026-09-05"
+                events.append("midnight")
+
+        async def _composer(self):
+            return Control()
+
+        async def _prepare_spark_sticker(self, _target):
+            return Control(), snapshot
+
+        async def _text_message_snapshot(self, _text):
+            nonlocal day
+            if "captured" in events:
+                await asyncio.sleep(0)
+                day = "2026-09-05"
+                events.append("midnight")
+            return snapshot
+
+        async def _spark_sticker_snapshot(self, *, require_panel=False):
+            nonlocal day
+            assert require_panel
+            if boundary == "snapshot":
+                await asyncio.sleep(0)
+                day = "2026-09-05"
+                events.append("midnight")
+            return snapshot
+
+    @asynccontextmanager
+    async def open_session(**_kwargs):
+        yield SimpleNamespace(page=BoundaryPage(), context=IdentityContext())
+
+    service.browser_factory = SimpleNamespace(open=open_session)
+    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", BoundaryAdapter)
+    result = await service.run_batch(
+        BatchMode.MANUAL, target_ids=[target.id], message_kind_override=kind,
+        message_text_override="消息" if kind is MessageKind.TEXT else "",
+    )
+    assert events[-3:] == ["captured", "midnight", "disposed"]
+    assert result.results[0].status is AttemptStatus.DUPLICATE
+    assert result.results[0].error_code is ErrorCode.DUPLICATE_BLOCKED
+    rejected = database.get_attempt(result.results[0].attempt_id)
+    assert rejected["triggered_at"] is None
+    assert rejected["run_date"] == "2026-09-05"
+    assert rejected["override_of"] == existing.attempt_id
+    assert database.get_attempt(existing.attempt_id) == protected
+    assert not database.has_daily_guard(ACCOUNT_KEY, target.id, "2026-09-04")
+    assert database.has_daily_guard(ACCOUNT_KEY, target.id, "2026-09-05")
+    assert not database.list_pending_actions("unknown_send")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 from dataclasses import replace
@@ -20,8 +21,16 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
 )
 
+from spark_keeper.automation.errors import AutomationError
 from spark_keeper.logging_safe import format_error
-from spark_keeper.models import AttemptStatus, BatchMode, FriendCandidate, MessageKind, Target
+from spark_keeper.models import (
+    AttemptStatus,
+    BatchMode,
+    ErrorCode,
+    FriendCandidate,
+    MessageKind,
+    Target,
+)
 from spark_keeper.scheduler import SchedulerError
 from spark_keeper.ui import app as app_module
 from spark_keeper.ui import theme
@@ -43,6 +52,10 @@ def app(tmp_path, monkeypatch, qapp):
     monkeypatch.setattr(app_module.TaskScheduler, "exists", lambda self: False)
     instance = SparkKeeperApp(smoke_mode=True)
     instance._poll_timer.stop()
+    message = instance.messages.get(timeout=10)
+    assert message[0] == "scheduler_snapshot"
+    instance.messages.put(message)
+    instance._poll_messages()
     yield instance
     instance.busy = False
     instance.close()
@@ -732,7 +745,7 @@ def test_confirmation_previews_preserve_markup_and_decline_prevents_actions(
     if action == "duplicate":
         assert theme.confirm.call_count == 2
         assert message in theme.confirm.call_args_list[0].args[2]
-        app._persist_plan.assert_called_once_with(require_confirmation=True)
+        app._persist_plan.assert_not_called()
     else:
         theme.confirm.assert_called_once()
         app._persist_plan.assert_not_called()
@@ -1201,7 +1214,7 @@ def test_native_plan_save_and_reload_preserve_hidden_text_draft(app, monkeypatch
     monkeypatch.setattr(app.scheduler, "sync", Mock())
     app.message_text.setPlainText("保留草稿")
     app.sticker_mode_button.setChecked(True)
-    saved = app._persist_plan(require_confirmation=True)
+    saved = app._persist_plan(app._snapshot_plan(), require_confirmation=True)
     assert saved.message_kind == MessageKind.SPARK_STICKER
     assert saved.message_text == ""
     app._refresh_plan()
@@ -1233,7 +1246,7 @@ def test_plan_scheduler_failure_restores_previous_message_kind(app, monkeypatch,
         app.scheduler, "sync", Mock(side_effect=[SchedulerError("同步失败"), None])
     )
     with pytest.raises(SchedulerError, match="同步失败"):
-        app._persist_plan(require_confirmation=True)
+        app._persist_plan(app._snapshot_plan(), require_confirmation=True)
     restored = app.database.get_plan()
     assert restored.message_kind == previous.message_kind
     assert restored.message_text == previous.message_text
@@ -1283,8 +1296,7 @@ def test_native_confirmation_decline_never_sends_or_previews_text(app, monkeypat
     app._start_async.assert_not_called()
     app._run_missed_action.assert_not_called()
     app.service.run_batch.assert_not_called()
-    if action != "duplicate":
-        app._persist_plan.assert_not_called()
+    app._persist_plan.assert_not_called()
     theme.show_message.assert_not_called()
 
 
@@ -1309,7 +1321,8 @@ async def test_manual_send_uses_confirmed_message_snapshot(app, monkeypatch, mes
     assert kwargs["message_text_override"] == (
         "" if message_kind == MessageKind.SPARK_STICKER else "确认过的文本"
     )
-    assert kwargs["target_ids"] == [targets[0].id]
+    assert kwargs["target_ids"] == (targets[0].id,)
+    assert app._persist_plan.call_args.args[0].message_text == kwargs["message_text_override"]
 
 
 @pytest.mark.parametrize("message_kind", list(MessageKind))
@@ -1376,6 +1389,7 @@ def test_native_history_labels_attempt_without_claiming_sent_text(app):
 
 
 def test_unknown_reminders_aggregate_and_acknowledge_without_changing_send_state(app, monkeypatch):
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-04")
     monkeypatch.setattr(app_module, "detect_missed_schedule", Mock())
     show = Mock()
     monkeypatch.setattr(theme, "show_message", show)
@@ -1544,3 +1558,207 @@ def test_failed_unknown_presentation_keeps_pending_and_releases_reentry_guard(ap
     app._check_pending_actions()
     assert show.call_count == 2
     assert not app.database.list_pending_actions()
+
+
+@pytest.mark.parametrize("result_kind", ["complete", "error", "callback_error"])
+def test_task_result_survives_failed_pending_refresh(app, monkeypatch, result_kind):
+    original = RuntimeError("原始任务失败")
+    callback = Mock(side_effect=original if result_kind == "callback_error" else None)
+    show = Mock()
+    monkeypatch.setattr(theme, "show_message", show)
+    monkeypatch.setattr(
+        app.database, "list_pending_actions", Mock(side_effect=sqlite3.OperationalError("收尾读取失败"))
+    )
+    app.busy = True
+    if result_kind == "error":
+        app.messages.put(("error", "任务", original))
+    else:
+        app.messages.put(("complete", "任务", callback, "原始返回值"))
+    app._poll_messages()
+    app._poll_messages()
+    assert not app.busy
+    if result_kind == "error":
+        callback.assert_not_called()
+    else:
+        callback.assert_called_once_with("原始返回值")
+    if result_kind == "complete":
+        show.assert_not_called()
+    else:
+        show.assert_called_once()
+        assert "原始任务失败" in show.call_args.args[2]
+        assert "收尾读取失败" not in show.call_args.args[2]
+    assert "收尾读取失败" in app.logs_message.toPlainText()
+
+
+@pytest.mark.parametrize("action", ["save", "manual", "login"])
+def test_slow_scheduler_keeps_qt_responsive_and_operation_exclusive(
+    app, monkeypatch, blocked_reader, action
+):
+    reader, started, release, calls = blocked_reader(None)
+    monkeypatch.setattr(app.scheduler, "sync", lambda plan: reader())
+    monkeypatch.setattr(theme, "confirm", Mock(return_value=True))
+    show = Mock()
+    monkeypatch.setattr(theme, "show_message", show)
+    monkeypatch.setattr(app.service, "login", AsyncMock())
+    monkeypatch.setattr(app.service, "run_batch", AsyncMock())
+    completed = Mock()
+    monkeypatch.setattr(app, "_batch_complete", completed)
+    app.database.save_account("fixture-account", "测试账号")
+    save_targets(app, count=1)
+    app.message_text.setPlainText("已确认的消息")
+    getattr(app, {"save": "_save_plan", "manual": "_manual_send", "login": "_login"}[action])()
+    assert started.wait(10)
+    assert app.busy
+    assert not app.login_button.isEnabled()
+    assert all(not button.isEnabled() for button in app._task_buttons)
+    event_ran = []
+    QTimer.singleShot(0, lambda: event_ran.append(True))
+    wait_until(lambda: bool(event_ran))
+    app.message_text.setPlainText("主线程继续编辑")
+    app._manual_send()
+    app._save_plan()
+    app._login()
+    assert len(calls) == 1
+    app.service.run_batch.assert_not_called()
+    release.set()
+    wait_until(lambda: (app._poll_messages(), not app.busy)[1])
+    if action == "manual":
+        app.service.run_batch.assert_awaited_once()
+        assert app.service.run_batch.call_args.kwargs["message_text_override"] == "已确认的消息"
+        assert app.database.get_plan().message_text == "已确认的消息"
+        completed.assert_called_once()
+    elif action == "save":
+        assert app.database.get_plan().message_text == "已确认的消息"
+        show.assert_called_once()
+    else:
+        assert app.service.login.call_args.kwargs["cancel"] is app.cancel_event
+        show.assert_called_once()
+
+
+def test_scheduler_snapshot_is_async_and_stale_query_cannot_replace_newer_status(
+    app, monkeypatch, blocked_reader
+):
+    reader, started, release, calls = blocked_reader(False)
+    monkeypatch.setattr(app.scheduler, "exists", reader)
+    app._refresh_plan()
+    assert started.wait(10)
+    event_ran = []
+    QTimer.singleShot(0, lambda: event_ran.append(True))
+    wait_until(lambda: bool(event_ran))
+    app._refresh_plan()
+    assert len(calls) == 1
+    monkeypatch.setattr(app.scheduler, "exists", lambda: True)
+    app.message_text.setPlainText("未保存文本不被后台结果覆盖")
+    release.set()
+    wait_until(lambda: (app._poll_messages(), app._scheduler_read is None)[1])
+    assert app.scheduler_chip.text() == "系统任务已创建"
+    assert app.message_text.toPlainText() == "未保存文本不被后台结果覆盖"
+
+
+@pytest.mark.parametrize("cancel_by", ["button", "close"])
+def test_login_cancel_reaches_worker_and_is_not_success_or_error(app, monkeypatch, cancel_by):
+    entered, exited = threading.Event(), threading.Event()
+    show = Mock()
+    monkeypatch.setattr(theme, "show_message", show)
+    confirm = Mock(return_value=True)
+    monkeypatch.setattr(theme, "confirm", confirm)
+    sync = Mock()
+    monkeypatch.setattr(app.scheduler, "sync", sync)
+
+    async def login(status=None, *, cancel=None):
+        assert threading.current_thread() is not threading.main_thread()
+        assert cancel is app.cancel_event
+        entered.set()
+        try:
+            while not cancel.is_set():
+                await asyncio.sleep(0.01)
+            raise AutomationError(ErrorCode.CANCELLED, "登录已取消")
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(app.service, "login", login)
+    app._login()
+    assert entered.wait(10)
+    assert app.cancel_button.text() == "取消登录"
+    if cancel_by == "button":
+        app.cancel_button.click()
+    else:
+        app.close()
+        assert not app._closed
+        assert "取消登录" in confirm.call_args.args[2]
+    assert app.cancel_event.is_set()
+    assert "取消登录" in app.status_label.text()
+    wait_until(lambda: (app._poll_messages(), not app.busy)[1])
+    assert exited.is_set()
+    assert app.status_label.text() == "登录已取消"
+    show.assert_not_called()
+    sync.assert_not_called()
+
+
+def test_manual_cancel_during_scheduler_never_starts_batch(app, monkeypatch, blocked_reader):
+    reader, started, release, _ = blocked_reader(None)
+    monkeypatch.setattr(app.scheduler, "sync", lambda plan: reader())
+    monkeypatch.setattr(theme, "confirm", Mock(return_value=True))
+    monkeypatch.setattr(theme, "show_message", Mock())
+    monkeypatch.setattr(app.service, "run_batch", AsyncMock())
+    app.database.save_account("fixture-account", "测试账号")
+    save_targets(app, count=1)
+    app.message_text.setPlainText("不会发送")
+    app._manual_send()
+    assert started.wait(10)
+    app.cancel_button.click()
+    assert app.busy
+    release.set()
+    wait_until(lambda: (app._poll_messages(), not app.busy)[1])
+    app.service.run_batch.assert_not_called()
+    theme.show_message.assert_not_called()
+    assert app.status_label.text() == "任务已取消"
+
+
+def test_task_error_presentation_failure_preserves_original_without_recursive_dialog(app, monkeypatch):
+    original = RuntimeError("原始任务失败")
+    show = Mock(side_effect=RuntimeError("对话框失败"))
+    monkeypatch.setattr(theme, "show_message", show)
+    app.messages.put(("error", "任务", original))
+    app._poll_messages()
+    show.assert_called_once()
+    assert "原始任务失败" in app.logs_message.toPlainText()
+    assert "对话框失败" in app.logs_message.toPlainText()
+
+
+def test_manual_scheduler_rollback_holds_busy_and_never_starts_send(
+    app, monkeypatch, blocked_reader
+):
+    reader, started, release, _ = blocked_reader(None)
+    original = SchedulerError("计划同步失败")
+    calls = []
+
+    def sync(plan):
+        assert threading.current_thread() is not threading.main_thread()
+        calls.append(plan)
+        if len(calls) == 1:
+            raise original
+        return reader()
+
+    monkeypatch.setattr(app.scheduler, "sync", sync)
+    monkeypatch.setattr(theme, "confirm", Mock(return_value=True))
+    show = Mock()
+    monkeypatch.setattr(theme, "show_message", show)
+    monkeypatch.setattr(app.service, "run_batch", AsyncMock())
+    app.database.save_account("fixture-account", "测试账号")
+    save_targets(app, count=1)
+    previous = app.database.get_plan()
+    app.message_text.setPlainText("新的计划内容")
+    app._manual_send()
+    assert started.wait(10)
+    assert app.busy
+    assert all(not button.isEnabled() for button in app._task_buttons)
+    event_ran = []
+    QTimer.singleShot(0, lambda: event_ran.append(True))
+    wait_until(lambda: bool(event_ran))
+    assert app.database.get_plan().message_text == previous.message_text
+    release.set()
+    wait_until(lambda: (app._poll_messages(), not app.busy)[1])
+    app.service.run_batch.assert_not_called()
+    show.assert_called_once()
+    assert "计划同步失败" in show.call_args.args[2]

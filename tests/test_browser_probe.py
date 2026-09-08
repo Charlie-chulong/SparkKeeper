@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import pytest
 from playwright.async_api import async_playwright
 
+from spark_keeper.automation import douyin_chat
 from spark_keeper.automation.douyin_chat import DouyinChatAdapter, PageState
-from spark_keeper.automation.errors import TargetAmbiguous, TargetIdentityMismatch, TargetNotFound
+from spark_keeper.automation.errors import (
+    AutomationError,
+    SendFailed,
+    SendUnknown,
+    TargetAmbiguous,
+    TargetIdentityMismatch,
+    TargetNotFound,
+)
+from spark_keeper.automation.send_state import await_delivery_terminal
 from spark_keeper.logging_safe import format_error
-from spark_keeper.models import Target
+from spark_keeper.models import ErrorCode, Target
 
 
 @pytest.mark.asyncio
@@ -492,3 +502,240 @@ async def test_search_item_conversation_type_rejects_group_without_name_marker()
             assert await page.locator(".composer").inner_text() == ""
         finally:
             await browser.close()
+
+
+@asynccontextmanager
+async def text_delivery_page():
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1200, "height": 800})
+        try:
+            await page.route("**/*", lambda route: route.abort())
+            await page.set_content("""
+                <div class="RightPanelHeaderconvHeader">好友</div>
+                <div id="messages" style="margin-left:700px"></div>
+                <div id="editor" contenteditable="true"
+                     style="position:absolute;top:600px;left:700px;width:300px;height:80px"></div>
+                <button id="send">发送</button>
+            """)
+            await page.evaluate("""() => {
+                window.conversation = {id:'text-chat', type:1, lastMessageIndexV2:'10',
+                    maxIndexV2FromServer:'10'};
+                window.bind = (node, props) => {
+                    node.__reactFiber$textFixture = {stateNode:node, memoizedProps:{},
+                        return:{stateNode:null, memoizedProps:props, return:null}};
+                };
+                bind(document.querySelector('.RightPanelHeaderconvHeader'),
+                    {curConversation:conversation});
+                window.models = {};
+                window.clicks = 0;
+                window.addText = (changes = {}, body = '正文') => {
+                    const model = {clientId:'new-client', serverId:'101', flightStatus:3,
+                        conversationId:'text-chat', type:7, isFromMe:true, visible:true,
+                        isRefMessage:false, isRecalled:false, indexInConversationV2:'11',
+                        parsedContent:{text:body}, ...changes};
+                    models[model.clientId] = model;
+                    const row = document.createElement('div');
+                    row.className = 'messageMessageBoxmessageBox';
+                    const box = document.createElement('div');
+                    box.className = 'MessageItemTextcontainer MessageItemTextisFromMe';
+                    const bubble = document.createElement('div');
+                    bubble.className = 'MessageItemTextbubbleTextContent';
+                    bubble.textContent = body;
+                    // Deliberately status-looking BODY markup: never status evidence.
+                    bubble.title = '发送失败';
+                    bubble.setAttribute('aria-busy', 'true');
+                    bubble.classList.add('retry', 'loading');
+                    box.append(bubble);
+                    row.append(box);
+                    document.querySelector('#messages').append(row);
+                    bind(box, {message:Object.create(model)});
+                    return row;
+                };
+                document.querySelector('#send').onclick = () => {
+                    clicks++;
+                    addText(window.nextChanges || {}, document.querySelector('#editor').innerText);
+                    document.querySelector('#editor').innerText = '';
+                };
+            }""")
+            yield page
+        finally:
+            await browser.close()
+
+
+@pytest.fixture
+def fast_delivery(monkeypatch):
+    async def terminal(sample):
+        now = 0.0
+
+        async def sleep(seconds):
+            nonlocal now
+            now += seconds
+
+        return await await_delivery_terminal(
+            sample, timeout_seconds=1, poll_seconds=0.25,
+            stable_seconds=0.25, initial_clean_seconds=0.5,
+            clock=lambda: now, sleep=sleep,
+        )
+
+    monkeypatch.setattr(douyin_chat, "await_delivery_terminal", terminal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["发送失败", "重试", "发送失败后可以重试", "普通正文"])
+async def test_text_body_and_nearby_status_cannot_fail_delivery(fast_delivery, body) -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("""body => {
+            addText({clientId:'history', indexInConversationV2:'9', flightStatus:-1}, body);
+            addText({clientId:'unrelated', indexInConversationV2:'10', flightStatus:-2}, '其他正文');
+            const status = document.createElement('i');
+            status.className = 'retry loading';
+            status.title = '发送失败';
+            status.setAttribute('role', 'progressbar');
+            document.querySelector('#messages').append(status);
+        }""", body)
+        triggers = []
+        await DouyinChatAdapter(page).send_text_and_confirm(body, lambda: triggers.append("trigger"))
+        assert triggers == ["trigger"]
+        assert await page.evaluate("clicks") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [-1, -2])
+async def test_text_bound_sdk_failure_is_detected(fast_delivery, status) -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("status => window.nextChanges = {flightStatus:status}", status)
+        with pytest.raises(SendFailed):
+            await DouyinChatAdapter(page).send_text_and_confirm("正常正文", lambda: None)
+        assert await page.evaluate("clicks") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [
+    {"flightStatus": 0}, {"flightStatus": 1}, {"flightStatus": 2}, {"flightStatus": -3},
+    {"flightStatus": None}, {"flightStatus": -1, "indexInConversationV2": "0"},
+    {"indexInConversationV2": "9"}, {"serverId": "0"},
+    {"isFromMe": False}, {"isRefMessage": True}, {"isRecalled": True},
+    {"conversationId": "other-chat"}, {"type": 5},
+])
+async def test_text_insufficient_or_unrelated_message_evidence_is_unknown(
+    fast_delivery, changes
+) -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("changes => window.nextChanges = changes", changes)
+        with pytest.raises(SendUnknown):
+            await DouyinChatAdapter(page).send_text_and_confirm("正文", lambda: None)
+        assert await page.evaluate("clicks") == 1
+
+
+@pytest.mark.asyncio
+async def test_editor_and_preparation_arrival_cannot_become_this_send(
+    fast_delivery, monkeypatch
+) -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("""() => {
+            document.querySelector('#send').onclick = () => { clicks++; };
+        }""")
+
+        adapter = DouyinChatAdapter(page)
+        original = adapter._text_message_snapshot
+        snapshots = 0
+        triggered = False
+
+        async def snapshot(text):
+            nonlocal snapshots
+            snapshots += 1
+            if snapshots == 2:
+                await page.evaluate("() => addText({}, '正文')")
+            if triggered:
+                assert await page.evaluate("clicks") == 1
+            return await original(text)
+
+        def trigger():
+            nonlocal triggered
+            assert snapshots == 2
+            triggered = True
+
+        monkeypatch.setattr(adapter, "_text_message_snapshot", snapshot)
+        with pytest.raises(SendUnknown):
+            await adapter.send_text_and_confirm("正文", trigger)
+        assert await page.locator("#editor").inner_text() == "正文"
+        assert await page.evaluate("clicks") == 1
+
+
+@pytest.mark.asyncio
+async def test_text_pretrigger_rejection_remains_untriggered(fast_delivery) -> None:
+    async with text_delivery_page() as page:
+        rejection = AutomationError(ErrorCode.DUPLICATE_BLOCKED, "当日已发送")
+
+        def reject():
+            raise rejection
+
+        with pytest.raises(AutomationError) as caught:
+            await DouyinChatAdapter(page).send_text_and_confirm("正文", reject)
+        assert caught.value is rejection
+        assert caught.value.send_triggered is False
+        assert await page.evaluate("clicks") == 0
+
+
+@pytest.mark.asyncio
+async def test_text_snapshot_error_after_click_is_unknown(fast_delivery) -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("""() => {
+            document.querySelector('#send').onclick = () => {
+                clicks++;
+                document.querySelector('.RightPanelHeaderconvHeader').remove();
+            };
+        }""")
+        with pytest.raises(SendUnknown):
+            await DouyinChatAdapter(page).send_text_and_confirm("正文", lambda: None)
+        assert await page.evaluate("clicks") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_hydrated", [False, True])
+async def test_text_online_acknowledgement_and_server_hydration_succeed(
+    fast_delivery, server_hydrated
+) -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("""hydrated => {
+            window.nextChanges = hydrated
+                ? {flightStatus:undefined, isOffline:false, serverStatus:0}
+                : {flightStatus:4};
+        }""", server_hydrated)
+        await DouyinChatAdapter(page).send_text_and_confirm("正文", lambda: None)
+        assert await page.evaluate("clicks") == 1
+
+
+@pytest.mark.asyncio
+async def test_text_late_failure_is_bound_to_same_client(fast_delivery) -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("""() => {
+            document.querySelector('#send').onclick = () => {
+                clicks++;
+                addText({}, document.querySelector('#editor').innerText);
+                let samples = 0;
+                Object.defineProperty(models['new-client'], 'flightStatus', {
+                    get() { return samples++ === 0 ? 1 : -1; }
+                });
+            };
+        }""")
+        with pytest.raises(SendFailed):
+            await DouyinChatAdapter(page).send_text_and_confirm("正文", lambda: None)
+        assert await page.evaluate("clicks") == 1
+
+
+@pytest.mark.asyncio
+async def test_text_snapshot_excludes_unrelated_bodies_and_serializes_only_metadata() -> None:
+    async with text_delivery_page() as page:
+        await page.evaluate("""() => {
+            addText({}, 'private-current-body');
+            addText({clientId:'incoming', isFromMe:false}, 'private-incoming-body');
+            Object.defineProperty(models.incoming, 'parsedContent', {get() {
+                throw new Error('unrelated incoming body read');
+            }});
+        }""")
+        result = await DouyinChatAdapter(page)._text_message_snapshot("private-current-body")
+        assert [message["clientId"] for message in result["messages"]] == ["new-client"]
+        assert "private-current-body" not in repr(result)
+        assert "private-incoming-body" not in repr(result)

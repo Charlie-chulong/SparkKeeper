@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import inspect
 import json
 import re
+import threading
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -14,10 +15,11 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page
 
 from ..logging_safe import safe_url
-from ..models import Account, FriendCandidate, Target
+from ..models import Account, ErrorCode, FriendCandidate, Target
 from .browser import BrowserSession, BrowserSessionFactory
 from .errors import (
     AuthenticationRequired,
+    AutomationError,
     ComposerUnavailable,
     HumanVerificationRequired,
     PageNotReady,
@@ -44,10 +46,35 @@ class PageState(StrEnum):
 @dataclass(frozen=True, slots=True)
 class LoginResult:
     account: Account
+    storage_state: dict[str, Any] = field(repr=False)
 
 
-_TRIGGER_CALLBACK = Callable[[], None | Awaitable[None]]
+_TRIGGER_CALLBACK = Callable[[], None]
 _STATUS_CALLBACK = Callable[[str], None]
+
+
+async def _with_login_cancellation[T](
+    operation: Callable[[], Awaitable[T]], cancel: threading.Event | None
+) -> T:
+    def check_cancelled() -> None:
+        if cancel is not None and cancel.is_set():
+            raise AutomationError(ErrorCode.CANCELLED, "登录已取消")
+
+    check_cancelled()
+    if cancel is None:
+        return await operation()
+    task = asyncio.ensure_future(operation())
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=0.1)
+            check_cancelled()
+        check_cancelled()
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        # Await cleanup and retrieve any concurrent exception before exposing cancel.
+        await asyncio.gather(task, return_exceptions=True)
 
 
 _VISIBLE_JS = """element => {
@@ -148,9 +175,11 @@ _SPARK_ENTRY_SELECTOR = (
 
 # Public PC IM __federation_expose_default_export.0ccd0cf4.js:
 # Interactive items send BIG_EMOJI(5), aweType 507 immediately on click.
-# Read only the bound conversation and matching native message/item props;
-# never serialize unrelated messages, SDK stores, callbacks or credentials.
-_SPARK_STICKER_SNAPSHOT_JS = r"""({resourcePath, requirePanel}) => {
+# TEXT(7) uses parsedContent.text on .MessageItemTextcontainer (modules
+# 33618 and the nX/oF renderers). Both use the same SDK delivery state.
+# Read only bound conversation and matching message/item props; never serialize
+# message bodies, unrelated SDK stores, callbacks or credentials.
+_MESSAGE_DELIVERY_SNAPSHOT_JS = r"""({resourcePath, requirePanel, expectedText = null}) => {
     const visible = element => {
         const rect = element.getBoundingClientRect();
         const style = getComputedStyle(element);
@@ -243,17 +272,24 @@ _SPARK_STICKER_SNAPSHOT_JS = r"""({resourcePath, requirePanel}) => {
         }
     }
     const messages = [];
+    const textMode = typeof expectedText === 'string';
+    const normalize = value => value.replace(/[\s\u200B-\u200D\uFEFF]+/g, ' ').trim();
+    const selector = textMode ? '.MessageItemTextcontainer' : '.MessageItemEmojiemojiBox';
     const ids = new Set();
-    for (const box of document.querySelectorAll('.MessageItemEmojiemojiBox')) {
-        if (!visible(box) || ![...box.querySelectorAll('img')].some(image =>
+    for (const box of document.querySelectorAll(selector)) {
+        if (!visible(box) || box.closest('[contenteditable="true"], textarea')) continue;
+        if (!textMode && ![...box.querySelectorAll('img')].some(image =>
             resourceMatches(image.currentSrc || image.src))) continue;
         const message = boundProp(box, 'message');
-        if (!message) return {error: 'native_message_binding_unavailable'};
-        if (message.isFromMe !== true || message.type !== 5 || message.isRefMessage
+        if (!message) return {error: 'message_binding_unavailable'};
+        if (message.isFromMe !== true || message.type !== (textMode ? 7 : 5) || message.isRefMessage
             || message.isRecalled || message.visible !== true
             || message.conversationId !== conversation.id) continue;
         const content = message.parsedContent;
-        if (content?.display_name !== '续火花' || content.image_id !== 0
+        if (textMode) {
+            if (typeof content?.text !== 'string'
+                || normalize(content.text) !== normalize(expectedText)) continue;
+        } else if (content?.display_name !== '续火花' || content.image_id !== 0
             || content.aweType !== 507 || content.resource_type !== 4
             || !resourceMatches(content.url?.uri)
             || !content.url?.url_list?.some(resourceMatches)) continue;
@@ -282,6 +318,56 @@ _SPARK_STICKER_SNAPSHOT_JS = r"""({resourcePath, requirePanel}) => {
     }
     return {conversationId: conversation.id, watermark, messages};
 }"""
+
+
+class _DeliveryTracker:
+    """Bind one click to one fresh SDK client, never to a rendered text count."""
+
+    def __init__(self, baseline: dict[str, Any]) -> None:
+        self.conversation_id = baseline["conversationId"]
+        self.previous_ids = {message["clientId"] for message in baseline["messages"]}
+        self.watermark = int(baseline["watermark"])
+        self.tracked_id: str | None = None
+        self.ambiguous = False
+
+    def exclude_before_click(self, snapshot: dict[str, Any]) -> None:
+        if snapshot["conversationId"] != self.conversation_id:
+            raise TargetIdentityMismatch()
+        self.previous_ids.update(message["clientId"] for message in snapshot["messages"])
+        self.watermark = max(self.watermark, int(snapshot["watermark"]))
+
+    def _check_conversation(self, snapshot: dict[str, Any]) -> None:
+        if snapshot["conversationId"] != self.conversation_id:
+            raise SendUnknown()
+
+    def _newer(self, message: dict[str, Any]) -> bool:
+        value = message["indexV2"]
+        return isinstance(value, str) and value.isdecimal() and int(value) > self.watermark
+
+    def sample(self, snapshot: dict[str, Any]) -> DeliverySample:
+        self._check_conversation(snapshot)
+        messages = [
+            message for message in snapshot["messages"]
+            if message["clientId"] not in self.previous_ids
+        ]
+        # The SDK sequence proves freshness even if a fast send is terminal at
+        # the first poll. Virtualized history and local wall-clock time cannot.
+        if self.tracked_id is None:
+            candidates = [message for message in messages if self._newer(message)]
+            if len(candidates) > 1:
+                self.ambiguous = True
+            elif len(candidates) == 1:
+                self.tracked_id = candidates[0]["clientId"]
+        matches = [message for message in messages if message["clientId"] == self.tracked_id]
+        if self.ambiguous or len(matches) != 1:
+            return DeliverySample(False, False, False)
+        message = matches[0]
+        status = message["flightStatus"]
+        # SDK Received(4) is the online self acknowledgement, not pending.
+        # Undefined flightStatus requires the snapshot's server-hydrated proof.
+        terminal = status in (3, 4) or (status is None and message["serverHydrated"])
+        succeeded = terminal and self._newer(message) and message["serverId"] not in ("", "0")
+        return DeliverySample(True, not succeeded, status in (-1, -2))
 
 
 class DouyinChatAdapter:
@@ -348,7 +434,12 @@ class DouyinChatAdapter:
             raise PageNotReady()
         raise PageStructureChanged()
 
-    async def wait_for_interactive_login(self, status: _STATUS_CALLBACK | None = None) -> None:
+    async def wait_for_interactive_login(
+        self, status: _STATUS_CALLBACK | None = None, *, cancel: threading.Event | None = None
+    ) -> None:
+        await _with_login_cancellation(lambda: self._wait_for_login(status), cancel)
+
+    async def _wait_for_login(self, status: _STATUS_CALLBACK | None) -> None:
         await self.page.goto(CHAT_URL, wait_until="domcontentloaded")
         loop = __import__("asyncio").get_running_loop()
         deadline = loop.time() + LOGIN_TIMEOUT_SECONDS
@@ -359,7 +450,7 @@ class DouyinChatAdapter:
             current = await self.classify_page()
             if current is PageState.READY:
                 if status:
-                    status("登录成功，正在安全保存登录状态")
+                    status("登录成功，正在读取账号状态")
                 return
             if status and current is not last_state:
                 if current is PageState.HUMAN_VERIFICATION:
@@ -830,7 +921,7 @@ class DouyinChatAdapter:
         if not text.strip():
             raise ComposerUnavailable()
         composer = await self._composer()
-        before_count = await self._matching_outgoing_count(text)
+        tracker = _DeliveryTracker(await self._text_message_snapshot(text))
         try:
             await composer.click()
             await composer.fill(text)
@@ -842,33 +933,35 @@ class DouyinChatAdapter:
         if self._normalize_text(str(current)) != self._normalize_text(text):
             raise ComposerUnavailable()
 
-        callback_result = on_trigger()
-        if inspect.isawaitable(callback_result):
-            await callback_result
+        send_button = self.page.get_by_role("button", name="发送", exact=True)
+        visible_button = None
+        for index in range(await send_button.count()):
+            candidate = send_button.nth(index)
+            if await candidate.is_visible():
+                visible_button = candidate
+                break
+        action = await (visible_button if visible_button is not None else composer).element_handle()
+        if action is None:
+            raise ComposerUnavailable()
         try:
-            send_button = self.page.get_by_role("button", name="发送", exact=True)
-            visible_button = None
-            for index in range(await send_button.count()):
-                candidate = send_button.nth(index)
-                if await candidate.is_visible():
-                    visible_button = candidate
-                    break
-            if visible_button is not None:
-                await visible_button.click()
-            else:
-                await composer.press("Enter")
-        except Exception as exc:
-            raise SendUnknown() from exc
+            tracker.exclude_before_click(await self._text_message_snapshot(text))
+            # The synchronous transaction must run after every preparation await:
+            # no navigation, lookup or snapshot may move the day after this gate.
+            on_trigger()
+            try:
+                if visible_button is not None:
+                    await action.click()
+                else:
+                    await action.press("Enter")
 
-        async def sample() -> DeliverySample:
-            raw = await self._sample_delivery(text, before_count)
-            return DeliverySample(
-                new_matching_outgoing=bool(raw["newMatchingOutgoing"]),
-                pending=bool(raw["pending"]),
-                failed=bool(raw["failed"]),
-            )
+                async def sample() -> DeliverySample:
+                    return tracker.sample(await self._text_message_snapshot(text))
 
-        outcome = await await_delivery_terminal(sample)
+                outcome = await await_delivery_terminal(sample)
+            except Exception as exc:
+                raise SendUnknown() from exc
+        finally:
+            await action.dispose()
         if outcome is DeliveryOutcome.FAILED:
             raise SendFailed()
         if outcome is DeliveryOutcome.UNKNOWN:
@@ -876,7 +969,7 @@ class DouyinChatAdapter:
 
     async def _spark_sticker_snapshot(self, *, require_panel: bool = False) -> dict[str, Any]:
         snapshot = await self.page.evaluate(
-            _SPARK_STICKER_SNAPSHOT_JS,
+            _MESSAGE_DELIVERY_SNAPSHOT_JS,
             {"resourcePath": SPARK_STICKER_RESOURCE_PATH, "requirePanel": require_panel},
         )
         if not isinstance(snapshot, dict) or snapshot.get("error"):
@@ -924,73 +1017,25 @@ class DouyinChatAdapter:
         self, target: Target, on_trigger: _TRIGGER_CALLBACK
     ) -> None:
         item, baseline = await self._prepare_spark_sticker(target)
-        previous_ids = {message["clientId"] for message in baseline["messages"]}
-        conversation_id = baseline["conversationId"]
-        watermark = int(baseline["watermark"])
-        tracked_id: str | None = None
-        ambiguous = False
+        tracker = _DeliveryTracker(baseline)
         action = await item.element_handle()
         if action is None:
             raise PageStructureChanged()
         try:
-            callback_result = on_trigger()
-            if inspect.isawaitable(callback_result):
-                await callback_result
-        except Exception:
-            await action.dispose()
-            raise
-        try:
             await self.verify_recipient(target)
-            ready = await self._spark_sticker_snapshot(require_panel=True)
-            if ready["conversationId"] != conversation_id:
-                raise SendUnknown()
-            previous_ids.update(message["clientId"] for message in ready["messages"])
-            watermark = max(watermark, int(ready["watermark"]))
-            # The item itself is the irreversible action: one click, no Enter,
-            # no second send button and no retry after an uncertain result.
-            await action.click()
+            tracker.exclude_before_click(await self._spark_sticker_snapshot(require_panel=True))
+            # The date/duplicate transaction is synchronous and immediately
+            # precedes the fixed element's sole irreversible click.
+            on_trigger()
+            try:
+                await action.click()
 
-            async def sample() -> DeliverySample:
-                nonlocal tracked_id, ambiguous
-                snapshot = await self._spark_sticker_snapshot()
-                if snapshot["conversationId"] != conversation_id:
-                    raise SendUnknown()
-                messages = [
-                    message for message in snapshot["messages"]
-                    if message["clientId"] not in previous_ids
-                ]
-                # A higher SDK sequence also proves freshness when a fast send
-                # completes before the first poll. Never use local wall-clock
-                # time: SDK creation times include a server clock offset.
-                def newer(message: dict[str, Any]) -> bool:
-                    value = message["indexV2"]
-                    return isinstance(value, str) and value.isdecimal() and int(value) > watermark
+                async def sample() -> DeliverySample:
+                    return tracker.sample(await self._spark_sticker_snapshot())
 
-                if tracked_id is None:
-                    candidates = [message for message in messages if newer(message)]
-                    if len(candidates) > 1:
-                        ambiguous = True
-                    elif len(candidates) == 1:
-                        tracked_id = candidates[0]["clientId"]
-                matches = [message for message in messages if message["clientId"] == tracked_id]
-                if ambiguous or len(matches) != 1:
-                    return DeliverySample(False, False, False)
-                message = matches[0]
-                status = message["flightStatus"]
-                # SDK Received(4) is the online self-message acknowledgement,
-                # not a pending state. Server-hydrated messages omit flightStatus.
-                # Neither terminal shape bypasses the per-click V2/client guards.
-                terminal = status in (3, 4) or (status is None and message["serverHydrated"])
-                succeeded = terminal and newer(message) and message["serverId"] not in ("", "0")
-                return DeliverySample(
-                    new_matching_outgoing=True,
-                    pending=not succeeded,
-                    failed=status in (-1, -2),
-                )
-
-            outcome = await await_delivery_terminal(sample)
-        except Exception as exc:
-            raise SendUnknown() from exc
+                outcome = await await_delivery_terminal(sample)
+            except Exception as exc:
+                raise SendUnknown() from exc
         finally:
             await action.dispose()
         if outcome is DeliveryOutcome.FAILED:
@@ -1376,63 +1421,14 @@ class DouyinChatAdapter:
             or bool(target.douyin_id and candidate.douyin_id == target.douyin_id)
         )
 
-    async def _matching_outgoing_count(self, text: str) -> int:
-        return int(
-            await self.page.evaluate(
-                r"""expected => {
-                    const normalize = value => (value || '').replace(/[\s\u200B-\u200D\uFEFF]+/g, ' ').trim();
-                    const visible = element => {
-                        const r = element.getBoundingClientRect();
-                        const s = getComputedStyle(element);
-                        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-                    };
-                    return [...document.querySelectorAll('div,span,p')].filter(element => {
-                        if (!visible(element) || element.children.length > 3) return false;
-                        const r = element.getBoundingClientRect();
-                        return r.left + r.width / 2 > window.innerWidth * 0.55 && normalize(element.innerText) === normalize(expected);
-                    }).length;
-                }""",
-                text,
-            )
+    async def _text_message_snapshot(self, text: str) -> dict[str, Any]:
+        snapshot = await self.page.evaluate(
+            _MESSAGE_DELIVERY_SNAPSHOT_JS,
+            {"resourcePath": SPARK_STICKER_RESOURCE_PATH, "requirePanel": False, "expectedText": text},
         )
-
-    async def _sample_delivery(self, text: str, before_count: int) -> dict[str, bool]:
-        return await self.page.evaluate(
-            r"""({expected, beforeCount}) => {
-                const normalize = value => (value || '').replace(/[\s\u200B-\u200D\uFEFF]+/g, ' ').trim();
-                const visible = element => {
-                    const r = element.getBoundingClientRect();
-                    const s = getComputedStyle(element);
-                    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-                };
-                const matches = [...document.querySelectorAll('div,span,p')].filter(element => {
-                    if (!visible(element) || element.children.length > 3) return false;
-                    const r = element.getBoundingClientRect();
-                    return r.left + r.width / 2 > window.innerWidth * 0.55 && normalize(element.innerText) === normalize(expected);
-                });
-                if (matches.length <= beforeCount) return {newMatchingOutgoing:false, pending:false, failed:false};
-                let scope = matches[matches.length - 1];
-                for (let i = 0; i < 6 && scope.parentElement; i++) {
-                    const parent = scope.parentElement;
-                    const rect = parent.getBoundingClientRect();
-                    if (rect.height > 260 || rect.width > window.innerWidth * 0.75) break;
-                    scope = parent;
-                }
-                const failure = [...scope.querySelectorAll('*')].some(element => {
-                    if (!visible(element)) return false;
-                    const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''} ${element.innerText || ''}`;
-                    const classes = String(element.className || '');
-                    return /发送失败|重试/.test(label) || /(send.?fail|retry)/i.test(classes);
-                });
-                const pending = [...scope.querySelectorAll('*')].some(element => {
-                    if (!visible(element)) return false;
-                    const classes = String(element.className || '');
-                    return element.getAttribute('role') === 'progressbar' || element.getAttribute('aria-busy') === 'true' || /(spin|loading|pending)/i.test(classes);
-                });
-                return {newMatchingOutgoing:true, pending, failed:failure};
-            }""",
-            {"expected": text, "beforeCount": before_count},
-        )
+        if not isinstance(snapshot, dict) or snapshot.get("error"):
+            raise PageStructureChanged()
+        return snapshot
 
     @staticmethod
     def _normalize_text(value: str) -> str:
@@ -1450,14 +1446,18 @@ async def interactive_login(
     factory: BrowserSessionFactory,
     *,
     status: _STATUS_CALLBACK | None = None,
+    cancel: threading.Event | None = None,
 ) -> LoginResult:
-    async with factory.open(headless=False, use_saved_state=False) as session:
-        adapter = DouyinChatAdapter(session.page)
-        await adapter.wait_for_interactive_login(status)
-        state = await session.context.storage_state()
-        account = await _derive_account(session, state)
-        await factory.save_state(session.context)
-        return LoginResult(account)
+    async def login() -> LoginResult:
+        async with factory.open(headless=False, use_saved_state=False) as session:
+            adapter = DouyinChatAdapter(session.page)
+            await adapter.wait_for_interactive_login(status)
+            state = await session.context.storage_state()
+            account = await _derive_account(session, state)
+            result = LoginResult(account, state)
+        return result
+
+    return await _with_login_cancellation(login, cancel)
 
 
 async def _derive_account(session: BrowserSession, state: dict[str, Any]) -> Account:
@@ -1476,13 +1476,15 @@ async def _derive_account(session: BrowserSession, state: dict[str, Any]) -> Acc
             str(cookie.get("value"))
             for cookie in cookies
             if isinstance(cookie, dict)
-            and str(cookie.get("name", "")).casefold() in {"uid_tt", "uid_tt_ss", "sid_tt"}
+            and str(cookie.get("name", "")).casefold() in {"uid_tt", "uid_tt_ss"}
             and cookie.get("value")
         ]
         identity_material = "|".join(sorted(account_cookie_values))
     if not identity_material:
-        identity_material = json.dumps(
-            state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        raise AutomationError(
+            ErrorCode.CONFIGURATION_INVALID,
+            "无法确认稳定账号身份，请重新扫码登录",
+            fatal=True,
         )
     platform_user_id = hashlib.sha256(identity_material.encode("utf-8")).hexdigest()
     return Account(platform_user_id=platform_user_id, display_name="已登录账号", logged_in_at="")

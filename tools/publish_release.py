@@ -18,6 +18,7 @@ project_version = _build["project_version"]
 release_version = _build["release_version"]
 sha256_file = _build["sha256_file"]
 is_sensitive_path = _build["is_sensitive_path"]
+validate_provenance = _build["validate_provenance"]
 _installer = runpy.run_path(str(ROOT / "tools" / "build_installer.py"))
 validate_member = _installer["validate_member"]
 unique_object = _installer["unique_object"]
@@ -105,6 +106,8 @@ def validate_archive(archive: Path, version: str, *, root: Path = ROOT) -> Path:
         if manifest_name not in members:
             raise RuntimeError("发行包缺少 release-manifest.json")
         files = validate_manifest(bundle.read(manifest_name), version)
+        manifest = json.loads(bundle.read(manifest_name), object_pairs_hook=unique_object)
+        validate_provenance(manifest.get("build_provenance"), root=root)
         expected = {"更新.cmd", "update.ps1", manifest_name}
         for name, digest in files.items():
             member = "SparkKeeper/" + name
@@ -196,8 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         checksum = validate_archive(archive, version, root=ROOT)
         installer = (args.installer or archive.with_name(f"SparkKeeper-{public_version}-Setup.exe")).resolve()
         with zipfile.ZipFile(archive) as bundle:
-            manifest_digest = hashlib.sha256(bundle.read("SparkKeeper/release-manifest.json")).hexdigest()
-        installer_checksum = validate_installer(installer, version, manifest_digest, root=ROOT)
+            manifest_content = bundle.read("SparkKeeper/release-manifest.json")
+        installer_checksum = validate_installer(installer, version, manifest_content, root=ROOT)
         source_assets = validate_qt_sources(archive, args.qt_sources, root=ROOT)
         command = ["gh", "release", "create", tag, str(installer), str(installer_checksum),
                    str(archive), str(checksum), *map(str, source_assets), "--repo", repo,
@@ -218,8 +221,8 @@ def main(argv: list[str] | None = None) -> int:
         validate_archive(archive, version, root=ROOT)
         validate_qt_sources(archive, args.qt_sources, root=ROOT)
         with zipfile.ZipFile(archive) as bundle:
-            current_manifest_digest = hashlib.sha256(bundle.read("SparkKeeper/release-manifest.json")).hexdigest()
-        validate_installer(installer, version, current_manifest_digest, root=ROOT)
+            current_manifest = bundle.read("SparkKeeper/release-manifest.json")
+        validate_installer(installer, version, current_manifest, root=ROOT)
         remote_ref = checked(["gh", "api", f"repos/{repo}/commits/refs/tags/{tag}", "--jq", ".sha"], root=ROOT)
         if remote_ref != head:
             raise RuntimeError("GitHub 远端 tag 与本地提交不一致；请人工核对并推送正确 tag")

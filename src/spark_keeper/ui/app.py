@@ -8,6 +8,7 @@ import sys
 import threading
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -47,6 +48,7 @@ from ..maintenance import MaintenanceLease, assert_maintenance_clear
 from ..models import (
     BatchMode,
     BatchResult,
+    ErrorCode,
     FriendCandidate,
     MessageKind,
     Plan,
@@ -59,6 +61,16 @@ from ..scheduler import SchedulerError, TaskScheduler, detect_missed_schedule
 from . import theme
 from .single_instance import GuiSingleInstance, activate_window
 from .spark_preview import SparkImportPreview
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanInput:
+    enabled: bool
+    send_time: str
+    message_text: str
+    message_kind: MessageKind
+    delay_min_seconds: int
+    delay_max_seconds: int
 
 
 class _ProgramDirectoryLabel(QLabel):
@@ -126,6 +138,9 @@ class SparkKeeperApp(QMainWindow):
         self._page_epoch = 0
         self._page_versions = dict.fromkeys(("friends", "history", "logs"), 0)
         self._page_reads: dict[str, tuple[int, int]] = {}
+        self._scheduler_version = 0
+        self._scheduler_read: int | None = None
+        self._login_running = False
         self.busy = False
         self._task_buttons_enabled = True
         self._target_enabled: dict[str, bool] = {}
@@ -721,10 +736,37 @@ class SparkKeeperApp(QMainWindow):
         self.text_mode_button.setChecked(plan.message_kind == MessageKind.TEXT)
         self.delay_min_input.setText(str(plan.delay_min_seconds))
         self.delay_max_input.setText(str(plan.delay_max_seconds))
-        try:
-            exists = self.scheduler.exists()
-        except SchedulerError:
-            exists = False
+        self._scheduler_version += 1
+        self._request_scheduler_snapshot()
+
+    def _request_scheduler_snapshot(self) -> None:
+        if self._closed or self._scheduler_read is not None:
+            return
+        token = self._scheduler_version
+        self._scheduler_read = token
+        scheduler, messages = self.scheduler, self.messages
+
+        def read_snapshot() -> None:
+            try:
+                exists = scheduler.exists()
+            except Exception as exc:  # noqa: BLE001 - return read diagnostics to Qt
+                messages.put(("scheduler_snapshot", token, None, format_error(exc)))
+            else:
+                messages.put(("scheduler_snapshot", token, exists, None))
+
+        threading.Thread(target=read_snapshot, name="spark-keeper-scheduler", daemon=True).start()
+
+    def _accept_scheduler_snapshot(self, token: int, exists: bool | None, error: str | None) -> None:
+        if self._scheduler_read != token:
+            return
+        self._scheduler_read = None
+        if token != self._scheduler_version:
+            self._request_scheduler_snapshot()
+            return
+        if error is not None:
+            theme.set_chip(self.scheduler_chip, "系统任务状态读取失败", "warning")
+            self.logs_message.setPlainText(self._record_ui_error("schedule_read_failed", error))
+            return
         theme.set_chip(
             self.scheduler_chip,
             "系统任务已创建" if exists else "系统任务未创建",
@@ -800,8 +842,13 @@ class SparkKeeperApp(QMainWindow):
                 item = self.messages.get_nowait()
                 kind = item[0]
                 try:
+                    if kind in {"error", "complete"}:
+                        self._accept_task_result(item)
+                        continue
                     if kind == "page_snapshot":
                         self._accept_page_snapshot(*item[1:])
+                    elif kind == "scheduler_snapshot":
+                        self._accept_scheduler_snapshot(*item[1:])
                     elif kind == "status":
                         self._set_status(str(item[1]), "busy")
                     elif kind == "progress":
@@ -822,16 +869,39 @@ class SparkKeeperApp(QMainWindow):
                             rows.append((alias, (alias, state), ()))
                         self._update_tree(self.progress_tree, rows)
                         self._sync_empty_hint(self.progress_tree, self.progress_hint)
-                    elif kind == "error":
-                        self._finish_busy()
-                        self._show_error(item[2])
-                    elif kind == "complete":
-                        self._finish_busy()
-                        item[2](item[3])
                 except Exception as exc:  # noqa: BLE001 - final UI callback boundary
                     self._show_error(exc)
         except queue.Empty:
             pass
+
+    def _accept_task_result(self, item: tuple[Any, ...]) -> None:
+        self._finish_busy()
+        error = item[2] if item[0] == "error" else None
+        if error is None:
+            try:
+                item[2](item[3])
+            except Exception as exc:  # noqa: BLE001 - invoke completion exactly once
+                error = exc
+        if isinstance(error, AutomationError) and error.code == ErrorCode.CANCELLED:
+            self._set_status("登录已取消" if item[1] == "扫码登录" else "任务已取消", "warn")
+        elif error is not None:
+            try:
+                self._show_error(error)
+            except Exception as presentation_error:  # noqa: BLE001 - never recursively show errors
+                error.add_note("错误提示未完成：\n" + format_error(presentation_error))
+                self.logs_message.setPlainText(format_error(error))
+        self._refresh_task_views(self._refresh_pending_indicator)
+        if item[1] == "扫码登录" and error is not None:
+            self._refresh_task_views(self._refresh_account, self._refresh_plan)
+
+    def _refresh_task_views(self, *refreshers: Callable[[], None]) -> None:
+        """Secondary reads never replace a completed task's result or open another dialog."""
+        for refresh in refreshers:
+            try:
+                refresh()
+            except Exception as exc:  # noqa: BLE001 - independent best-effort display refresh
+                detail = self._record_ui_error("task_refresh_failed", format_error(exc))
+                self.logs_message.setPlainText(detail)
 
     def _on_close(self) -> None:
         self.close()
@@ -842,7 +912,12 @@ class SparkKeeperApp(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.busy:
-            if theme.confirm(self, APP_NAME, "任务仍在运行。停止后续目标并等待当前步骤结束？"):
+            prompt = (
+                "登录仍在进行。取消登录并等待浏览器安全关闭？"
+                if self._login_running
+                else "任务仍在运行。停止后续目标并等待当前步骤结束？"
+            )
+            if theme.confirm(self, APP_NAME, prompt):
                 self._cancel_current()
             event.ignore()
             return
@@ -1008,21 +1083,24 @@ class SparkKeeperApp(QMainWindow):
         self.pending_label.setText(f"待处理事项：{count} 项" if count else "")
 
     def _login(self) -> None:
+        if self.busy or self._closed:
+            return
+        service, database, scheduler = self.service, self.database, self.scheduler
+        messages, cancel = self.messages, self.cancel_event
 
         async def operation() -> None:
-            await self.service.login(status=lambda value: self.messages.put(("status", value)))
+            await service.login(status=lambda value: messages.put(("status", value)), cancel=cancel)
+            for action in database.list_pending_actions("login_required"):
+                database.resolve_pending_action(str(action["id"]), "completed")
+            scheduler.sync(database.get_plan())
 
         def complete(_: None) -> None:
-            for action in self.database.list_pending_actions("login_required"):
-                self.database.resolve_pending_action(str(action["id"]), "completed")
-            try:
-                self.scheduler.sync(self.database.get_plan())
-            except SchedulerError as exc:
-                self._show_error(exc)
-            self.refresh_all()
             theme.show_message(self, APP_NAME, "登录状态已使用 Windows DPAPI 安全保存。")
+            self._refresh_task_views(self.refresh_all)
 
+        self._login_running = True
         self._start_async("扫码登录", operation, complete)
+        self.cancel_button.setText("取消登录")
 
     def _logout(self) -> None:
         if self.busy or self._closed:
@@ -1365,20 +1443,28 @@ class SparkKeeperApp(QMainWindow):
         self.database.validate_delay_range(minimum, maximum)
         return (minimum, maximum)
 
-    def _persist_plan(self, *, require_confirmation: bool) -> Plan:
-        enabled = bool(self.schedule_enabled.isChecked())
-        send_time = self.schedule_time_input.text().strip()
-        message = self._current_message()
-        delay_min_seconds, delay_max_seconds = self._current_delay_range()
+    def _snapshot_plan(self) -> _PlanInput:
+        minimum, maximum = self._current_delay_range()
+        return _PlanInput(
+            self.schedule_enabled.isChecked(),
+            self.schedule_time_input.text().strip(),
+            self._current_message(),
+            self._current_message_kind(),
+            minimum,
+            maximum,
+        )
+
+    def _persist_plan(self, inputs: _PlanInput, *, require_confirmation: bool) -> Plan:
+        """Worker-only persistence; inputs were captured on the Qt thread before dispatch."""
         previous = self.database.get_plan()
         saved = self.database.save_plan(
-            enabled=enabled,
-            send_time=send_time,
-            message_text=message,
-            message_kind=self._current_message_kind(),
-            delay_min_seconds=delay_min_seconds,
-            delay_max_seconds=delay_max_seconds,
-            confirmed=require_confirmation or not enabled,
+            enabled=inputs.enabled,
+            send_time=inputs.send_time,
+            message_text=inputs.message_text,
+            message_kind=inputs.message_kind,
+            delay_min_seconds=inputs.delay_min_seconds,
+            delay_max_seconds=inputs.delay_max_seconds,
+            confirmed=require_confirmation or not inputs.enabled,
         )
         try:
             self.scheduler.sync(saved)
@@ -1412,15 +1498,17 @@ class SparkKeeperApp(QMainWindow):
         if self.busy or self._closed:
             return
         targets = self.database.list_targets(enabled_only=True)
-        message = self._current_message()
         try:
-            delay_min_seconds, delay_max_seconds = self._current_delay_range()
+            inputs = self._snapshot_plan()
+            message = inputs.message_text
+            delay_min_seconds = inputs.delay_min_seconds
+            delay_max_seconds = inputs.delay_max_seconds
         except ValueError as exc:
             self._show_error(exc)
             return
-        if self.schedule_enabled.isChecked():
-            content = self._message_preview(self._current_message_kind(), message)
-            preview = f"每天 {self.schedule_time_input.text().strip()} 自动发送\n目标：{len(targets)} 位启用好友\n好友间随机等待：{delay_min_seconds}–{delay_max_seconds} 秒\n{content}\n\n保存后到点无需再次确认，是否继续？"
+        if inputs.enabled:
+            content = self._message_preview(inputs.message_kind, message)
+            preview = f"每天 {inputs.send_time} 自动发送\n目标：{len(targets)} 位启用好友\n好友间随机等待：{delay_min_seconds}–{delay_max_seconds} 秒\n{content}\n\n保存后到点无需再次确认，是否继续？"
             if not targets:
                 theme.show_message(
                     self, APP_NAME, "启用计划前至少需要一位好友。", icon=QMessageBox.Icon.Warning
@@ -1430,13 +1518,15 @@ class SparkKeeperApp(QMainWindow):
                 return
         if self.busy or self._closed:
             return
-        try:
-            self._persist_plan(require_confirmation=True)
-        except (OSError, SchedulerError, ValueError, sqlite3.Error) as exc:
-            self._show_error(exc)
-            return
-        self.refresh_all()
-        theme.show_message(self, APP_NAME, "计划已保存并同步到 Windows 计划任务。")
+
+        async def operation() -> Plan:
+            return self._persist_plan(inputs, require_confirmation=True)
+
+        def complete(_: Plan) -> None:
+            theme.show_message(self, APP_NAME, "计划已保存并同步到 Windows 计划任务。")
+            self._refresh_task_views(self.refresh_all)
+
+        self._start_async("保存计划", operation, complete)
 
     def _validate(self) -> None:
         if self.busy or self._closed:
@@ -1459,10 +1549,11 @@ class SparkKeeperApp(QMainWindow):
         if self.busy or self._closed:
             return
         targets = self.database.list_targets(enabled_only=True)
-        message = self._current_message()
-        message_kind = self._current_message_kind()
         try:
-            delay_min_seconds, delay_max_seconds = self._current_delay_range()
+            inputs = self._snapshot_plan()
+            message, message_kind = inputs.message_text, inputs.message_kind
+            delay_min_seconds = inputs.delay_min_seconds
+            delay_max_seconds = inputs.delay_max_seconds
         except ValueError as exc:
             self._show_error(exc)
             return
@@ -1483,11 +1574,6 @@ class SparkKeeperApp(QMainWindow):
         ):
             return
         if self.busy or self._closed:
-            return
-        try:
-            self._persist_plan(require_confirmation=True)
-        except (OSError, SchedulerError, ValueError, sqlite3.Error) as exc:
-            self._show_error(exc)
             return
         account = self.database.get_account()
         if account is None:
@@ -1513,15 +1599,20 @@ class SparkKeeperApp(QMainWindow):
         if self.busy or self._closed:
             return
         self._clear_progress()
+        target_ids = tuple(target.id for target in targets)
+        override_ids = frozenset(overrides)
 
         async def operation() -> BatchResult:
+            self._persist_plan(inputs, require_confirmation=True)
+            if self.cancel_event.is_set():
+                raise AutomationError(ErrorCode.CANCELLED, "手动发送已取消")
             return await self.service.run_batch(
                 BatchMode.MANUAL,
-                target_ids=[target.id for target in targets],
+                target_ids=target_ids,
                 message_kind_override=message_kind,
                 message_text_override=message,
                 inter_target_delay_override=(delay_min_seconds, delay_max_seconds),
-                manual_override_target_ids=overrides,
+                manual_override_target_ids=override_ids,
                 progress=self._progress_callback,
                 cancel=self.cancel_event,
             )
@@ -1529,14 +1620,13 @@ class SparkKeeperApp(QMainWindow):
         self._start_async("手动发送", operation, self._batch_complete)
 
     def _batch_complete(self, result: BatchResult) -> None:
-        self._refresh_history()
-        self._refresh_logs()
         counts = result.counts
         theme.show_message(
             self,
             APP_NAME,
             f"批次状态：{result.status.value}\n成功：{counts['success']}\n失败：{counts['failed']}\n结果不确定：{counts['unknown']}\n重复跳过：{counts['duplicate']}",
         )
+        self._refresh_task_views(self._refresh_history, self._refresh_logs)
 
     def _progress_callback(self, alias: str, state: str) -> None:
         self.messages.put(("progress", alias, state))
@@ -1586,6 +1676,7 @@ class SparkKeeperApp(QMainWindow):
     def _finish_busy(self) -> None:
         self.busy = False
         self._spark_scan_running = False
+        self._login_running = False
         self.cancel_button.setEnabled(False)
         self.cancel_button.setText("停止后续目标")
         if self._spark_preview is not None:
@@ -1597,7 +1688,6 @@ class SparkKeeperApp(QMainWindow):
         self.capture_browser_ready_event.clear()
         self.capture_requested_event.clear()
         self._set_status("就绪", "ready")
-        self._refresh_pending_indicator()
 
     def _record_ui_error(self, category: str, detail: str) -> str:
         try:
@@ -1617,7 +1707,9 @@ class SparkKeeperApp(QMainWindow):
 
     def _cancel_current(self) -> None:
         self.cancel_event.set()
-        if self._spark_scan_running:
+        if self._login_running:
+            self._set_status("已请求取消登录；请等待浏览器安全关闭", "warn")
+        elif self._spark_scan_running:
             self._set_status("已请求取消扫描；不会发送消息，请等待当前只读步骤结束", "warn")
         else:
             self._set_status("已请求停止；当前已触发的发送会先完成确认", "warn")

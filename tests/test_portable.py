@@ -150,13 +150,29 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
     (qt_source / "manifest.json").write_text('{"version":"6.11.2"}', encoding="utf-8")
     monkeypatch.setitem(copy_licenses.__globals__, "ROOT", root)
     monkeypatch.setitem(copy_licenses.__globals__, "VENV", root)
-    monkeypatch.setitem(copy_licenses.__globals__, "sys", SimpleNamespace(base_prefix=root))
+    monkeypatch.setitem(
+        copy_licenses.__globals__, "sys", SimpleNamespace(base_prefix=root, version="3.12.0 fixture")
+    )
     monkeypatch.setitem(
         copy_licenses.__globals__, "distribution_license", lambda *_args: dependency_license
     )
     monkeypatch.setitem(
         copy_licenses.__globals__, "distribution", lambda _name: SimpleNamespace(version="6.11.2")
     )
+    monkeypatch.setitem(
+        copy_licenses.__globals__, "distributions",
+        lambda: [SimpleNamespace(metadata={"Name": name}, version=version) for name, version in (
+            ("PyInstaller", "6.15.0"), ("playwright", "1.50.0"),
+            ("PySide6-Essentials", "6.11.2"), ("windows-toasts", "1.3.0"),
+        )],
+    )
+    for name in ("pyproject.toml", "THIRD_PARTY_NOTICES.txt", "tools/build_portable.py",
+                 "tools/portable_entry.py", "tools/update.cmd", "tools/update.ps1",
+                 "src/spark_keeper/__init__.py"):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"isolated build input")
+    provenance = build_portable["build_provenance"](root)
 
     release = tmp_path / "release"
     copy_licenses(release)
@@ -171,7 +187,9 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
         "licenses/Qt/GPL-3.0-only.txt": qt_source / "GPL-3.0-only.txt",
         "licenses/Qt/manifest.json": qt_source / "manifest.json",
     }
-    manifest_path = build_portable["write_release_manifest"](release, "3.0.0")
+    manifest_path = build_portable["write_release_manifest"](
+        release, "3.0.0", provenance=provenance
+    )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     for name, source in expected.items():
         assert (release / name).read_bytes() == source.read_bytes()

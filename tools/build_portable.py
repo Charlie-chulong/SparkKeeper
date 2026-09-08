@@ -4,12 +4,13 @@ import ast
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import zipfile
-from importlib.metadata import distribution
+from importlib.metadata import distribution, distributions
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,7 +69,118 @@ def is_sensitive_path(name: str) -> bool:
     )
 
 
-def write_release_manifest(release_directory: Path, version: str) -> Path:
+def portable_command(root: Path, python: Path) -> list[str]:
+    build_root = root / "work" / "pyinstaller"
+    return [
+        str(python), "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
+        "--onedir", "--name", "SparkKeeper",
+        "--icon", str(root / "src" / "spark_keeper" / "assets" / "app-icon.ico"),
+        "--paths", str(root / "src"),
+        "--add-data", f"{root / 'src' / 'spark_keeper' / 'assets'}{os.pathsep}spark_keeper/assets",
+        "--distpath", str(build_root / "dist"), "--workpath", str(build_root / "build"),
+        "--specpath", str(build_root),
+        "--collect-all", "playwright", "--collect-all", "windows_toasts",
+        "--exclude-module", "pytest", "--exclude-module", "ruff",
+        "--exclude-module", "tkinter", "--exclude-module", "PySide6.QtPdf",
+        "--exclude-module", "PySide6.QtPdfWidgets", "--exclude-module", "PySide6.QtSvg",
+        "--exclude-module", "PySide6.QtSvgWidgets", "--exclude-module", "PySide6.QtTest",
+        str(root / "tools" / "portable_entry.py"),
+    ]
+
+
+def portable_configuration(root: Path) -> dict:
+    # Normalize locations, not options: relocating a checkout is not a source change.
+    command = portable_command(root, root / ".venv" / "Scripts" / "python.exe")
+    return {
+        "command": [argument.replace(str(root), "${ROOT}") for argument in command],
+        "environment": {"PLAYWRIGHT_BROWSERS_PATH": "0"},
+        "browser_install": ["install", "chromium"],
+    }
+
+
+def source_snapshot(root: Path, qt_version: str) -> dict:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", qt_version):
+        raise ValueError("构建来源 Qt 版本无效")
+    names = {
+        "pyproject.toml", "LICENSE", "THIRD_PARTY_NOTICES.txt",
+        "tools/build_portable.py", "tools/portable_entry.py",
+        "tools/update.cmd", "tools/update.ps1", "tools/installer/LICENSE.txt",
+    }
+    # These are exactly the project trees consumed by PyInstaller/copy_licenses.
+    # Never scan the checkout root (outputs, caches and user data are not inputs).
+    for directory in (root / "src" / "spark_keeper", root / "third_party" / f"qt-{qt_version}"):
+        if not directory.is_dir():
+            raise FileNotFoundError(f"缺少构建来源目录：{directory}")
+        if directory.is_symlink() or directory.is_junction() or directory.parent.is_symlink() or directory.parent.is_junction():
+            raise ValueError(f"构建来源目录不能是链接：{directory}")
+        for parent, directories, filenames in os.walk(directory, followlinks=False):
+            directories[:] = sorted(name for name in directories if name != "__pycache__")
+            for name in [*directories, *filenames]:
+                path = Path(parent) / name
+                if path.is_symlink() or path.is_junction():
+                    raise ValueError(f"构建来源不能是链接：{path}")
+            for name in filenames:
+                path = Path(parent) / name
+                relative = path.relative_to(root)
+                packaged = (relative.parts[0] == "third_party"
+                            or relative.parts[:3] == ("src", "spark_keeper", "assets")
+                            or path.suffix.lower() in {".py", ".pyd", ".dll"})
+                if packaged and path.suffix.lower() not in {".pyc", ".pyo"}:
+                    names.add(relative.as_posix())
+    files = {}
+    for name in sorted(names):
+        path = root / name
+        if path.is_symlink() or path.is_junction() or not path.is_file():
+            raise ValueError(f"构建来源必须是普通文件：{name}")
+        files[name] = sha256_file(path)
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {"sha256": digest, "files": files}
+
+
+def build_provenance(root: Path) -> dict:
+    qt_version = distribution("PySide6-Essentials").version
+    return {
+        "format": 1,
+        "qt_version": qt_version,
+        "source": source_snapshot(root, qt_version),
+        "configuration": portable_configuration(root),
+        "toolchain": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "distributions": dict(sorted(
+                (package.metadata["Name"], package.version) for package in distributions()
+            )),
+        },
+    }
+
+
+def validate_provenance(provenance: object, *, root: Path) -> dict:
+    if not isinstance(provenance, dict) or type(provenance.get("format")) is not int or provenance.get("format") != 1:
+        raise RuntimeError("缺少有效构建来源；请重新构建便携包")
+    qt_version = provenance.get("qt_version")
+    toolchain = provenance.get("toolchain")
+    if (not isinstance(qt_version, str) or not isinstance(toolchain, dict)
+            or not isinstance(toolchain.get("python"), str) or not toolchain["python"]
+            or not isinstance(toolchain.get("platform"), str) or not toolchain["platform"]
+            or not isinstance(toolchain.get("distributions"), dict)
+            or not all(isinstance(name, str) and isinstance(version, str) and name and version
+                       for name, version in toolchain["distributions"].items())
+            or not {"pyinstaller", "playwright", "pyside6-essentials", "windows-toasts"} <= {
+                name.lower().replace("_", "-") for name in toolchain["distributions"]
+            }):
+        raise RuntimeError("构建来源缺少依赖或构建工具版本")
+    if (provenance.get("source") != source_snapshot(root, qt_version)
+            or provenance.get("configuration") != portable_configuration(root)):
+        raise RuntimeError("构建来源与当前业务源码、资源或构建配置不一致；请重新构建便携包")
+    return provenance
+
+
+def verify_build_unchanged(provenance: dict, *, root: Path) -> None:
+    if build_provenance(root) != provenance:
+        raise RuntimeError("构建期间源码、配置或依赖发生变化；拒绝生成发行清单")
+
+
+def write_release_manifest(release_directory: Path, version: str, *, provenance: dict) -> Path:
     reject_sensitive_files(release_directory)
     files = {
         path.relative_to(release_directory).as_posix(): sha256_file(path)
@@ -78,7 +190,8 @@ def write_release_manifest(release_directory: Path, version: str) -> Path:
     destination = release_directory / "release-manifest.json"
     destination.write_text(
         json.dumps(
-            {"format": 1, "product": "SparkKeeper", "version": validate_version(version), "files": files},
+            {"format": 1, "product": "SparkKeeper", "version": validate_version(version),
+             "files": files, "build_provenance": provenance},
             ensure_ascii=False,
             indent=2,
         ) + "\n",
@@ -248,9 +361,12 @@ def create_zip(release_directory: Path, archive: Path, *, updater_directory: Pat
 
 
 def main() -> None:
-    version = project_version()
     if not PYTHON.is_file() or not PLAYWRIGHT.is_file():
         raise RuntimeError("缺少项目虚拟环境，请先安装开发依赖")
+    if Path(sys.executable).resolve() != PYTHON.resolve():
+        raise RuntimeError("请使用项目 .venv/Scripts/python.exe 构建，以记录实际依赖版本")
+    provenance = build_provenance(ROOT)
+    version = project_version(ROOT)
     env = os.environ.copy()
     env["PLAYWRIGHT_BROWSERS_PATH"] = "0"
     run([str(PLAYWRIGHT), "install", "chromium"], env=env)
@@ -260,7 +376,7 @@ def main() -> None:
     release_root = ROOT / "outputs" / "release"
     build_root = ROOT / "work" / "pyinstaller"
     pyinstaller_dist = build_root / "dist"
-    pyinstaller_work = build_root / "build"
+    command = portable_command(ROOT, PYTHON)
     release_name = f"SparkKeeper-{release_version(version)}-win64"
     release_directory = release_root / "SparkKeeper"
     archive = release_root / f"{release_name}.zip"
@@ -272,53 +388,7 @@ def main() -> None:
     archive.with_suffix(archive.suffix + ".sha256").unlink(missing_ok=True)
     build_root.mkdir(parents=True, exist_ok=True)
 
-    run(
-        [
-            str(PYTHON),
-            "-m",
-            "PyInstaller",
-            "--noconfirm",
-            "--clean",
-            "--windowed",
-            "--onedir",
-            "--name",
-            "SparkKeeper",
-            "--icon",
-            str(ROOT / "src" / "spark_keeper" / "assets" / "app-icon.ico"),
-            "--paths",
-            str(ROOT / "src"),
-            "--add-data",
-            f"{ROOT / 'src' / 'spark_keeper' / 'assets'}{os.pathsep}spark_keeper/assets",
-            "--distpath",
-            str(pyinstaller_dist),
-            "--workpath",
-            str(pyinstaller_work),
-            "--specpath",
-            str(build_root),
-            "--collect-all",
-            "playwright",
-            "--collect-all",
-            "windows_toasts",
-            "--exclude-module",
-            "pytest",
-            "--exclude-module",
-            "ruff",
-            "--exclude-module",
-            "tkinter",
-            "--exclude-module",
-            "PySide6.QtPdf",
-            "--exclude-module",
-            "PySide6.QtPdfWidgets",
-            "--exclude-module",
-            "PySide6.QtSvg",
-            "--exclude-module",
-            "PySide6.QtSvgWidgets",
-            "--exclude-module",
-            "PySide6.QtTest",
-            str(ROOT / "tools" / "portable_entry.py"),
-        ],
-        env=env,
-    )
+    run(command, env=env)
 
     built_directory = pyinstaller_dist / "SparkKeeper"
     if not (built_directory / "SparkKeeper.exe").is_file():
@@ -338,8 +408,15 @@ def main() -> None:
     copy_licenses(release_directory)
     write_user_guide(release_directory / "使用说明.txt", version)
     reject_sensitive_files(release_directory)
-    write_release_manifest(release_directory, version)
-    create_zip(release_directory, archive)
+    verify_build_unchanged(provenance, root=ROOT)
+    write_release_manifest(release_directory, version, provenance=provenance)
+    create_zip(release_directory, archive, updater_directory=ROOT / "tools")
+    try:
+        verify_build_unchanged(provenance, root=ROOT)
+    except (OSError, ValueError, RuntimeError):
+        archive.unlink(missing_ok=True)
+        (release_directory / "release-manifest.json").unlink(missing_ok=True)
+        raise
 
     digest = sha256_file(archive)
     archive.with_suffix(archive.suffix + ".sha256").write_text(

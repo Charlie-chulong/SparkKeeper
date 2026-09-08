@@ -57,13 +57,25 @@ class BatchService:
         self.delay_sampler = delay_sampler
         self.delay_waiter = delay_waiter
 
-    async def login(self, status: StatusCallback | None = None) -> None:
+    async def login(
+        self,
+        status: StatusCallback | None = None,
+        *,
+        cancel: threading.Event | None = None,
+    ) -> None:
         with WindowsTaskMutex():
-            result = await interactive_login(self.browser_factory, status=status)
+            if cancel is not None and cancel.is_set():
+                raise AutomationError(ErrorCode.CANCELLED, "登录已取消")
+            result = await interactive_login(self.browser_factory, status=status, cancel=cancel)
+            if cancel is not None and cancel.is_set():
+                raise AutomationError(ErrorCode.CANCELLED, "登录已取消")
+            # Commit without suspension: never pair new credentials with an old account.
+            self.state_store.delete()
             self.database.save_account(
                 result.account.platform_user_id,
                 result.account.display_name,
             )
+            self.state_store.save(result.storage_state)
             self.database.record_event("INFO", "login", "扫码登录状态已安全保存")
 
     def logout(self) -> None:
@@ -227,38 +239,6 @@ class BatchService:
         inter_target_delay_override: tuple[int, int] | None = None,
         cancel: threading.Event | None = None,
     ) -> BatchResult:
-        account = self.database.get_account()
-        if account is None or not self.state_store.exists():
-            raise ValueError("请先扫码登录")
-        plan = self.database.get_plan()
-        if (message_text_override is None) != (message_kind_override is None):
-            raise ValueError("补跑消息快照必须同时提供消息类型与文本")
-        message_kind = MessageKind(
-            plan.message_kind if message_kind_override is None else message_kind_override
-        )
-        message_text = plan.message_text if message_text_override is None else message_text_override
-        if message_kind is MessageKind.SPARK_STICKER:
-            message_text = ""
-        targets = self._select_targets(target_ids)
-        if not targets:
-            raise ValueError("至少需要启用一位好友")
-        if inter_target_delay_override is None:
-            delay_min_seconds = plan.delay_min_seconds
-            delay_max_seconds = plan.delay_max_seconds
-        else:
-            delay_min_seconds, delay_max_seconds = inter_target_delay_override
-        self.database.validate_delay_range(delay_min_seconds, delay_max_seconds)
-        if (
-            mode is not BatchMode.VALIDATION
-            and message_kind is MessageKind.TEXT
-            and not message_text.strip()
-        ):
-            raise ValueError("请先填写固定消息文本")
-        overrides = {int(value) for value in manual_override_target_ids}
-        if mode is BatchMode.SCHEDULED and overrides:
-            raise ValueError("定时任务不能覆盖当天防重复")
-        if not overrides.issubset({target.id for target in targets}):
-            raise ValueError("人工覆盖目标不在本批次中")
 
         try:
             mutex = WindowsTaskMutex()
@@ -266,7 +246,7 @@ class BatchService:
         except AlreadyRunningError as exc:
             batch_id = self.database.start_batch(
                 mode,
-                target_count=len(targets),
+                target_count=0,
                 scheduled_for=scheduled_for,
             )
             self.database.record_event(
@@ -289,6 +269,38 @@ class BatchService:
             )
 
         try:
+            account = self.database.get_account()
+            if account is None or not self.state_store.exists():
+                raise ValueError("请先扫码登录")
+            plan = self.database.get_plan()
+            if (message_text_override is None) != (message_kind_override is None):
+                raise ValueError("补跑消息快照必须同时提供消息类型与文本")
+            message_kind = MessageKind(
+                plan.message_kind if message_kind_override is None else message_kind_override
+            )
+            message_text = plan.message_text if message_text_override is None else message_text_override
+            if message_kind is MessageKind.SPARK_STICKER:
+                message_text = ""
+            targets = self._select_targets(target_ids)
+            if not targets:
+                raise ValueError("至少需要启用一位好友")
+            if inter_target_delay_override is None:
+                delay_min_seconds = plan.delay_min_seconds
+                delay_max_seconds = plan.delay_max_seconds
+            else:
+                delay_min_seconds, delay_max_seconds = inter_target_delay_override
+            self.database.validate_delay_range(delay_min_seconds, delay_max_seconds)
+            if (
+                mode is not BatchMode.VALIDATION
+                and message_kind is MessageKind.TEXT
+                and not message_text.strip()
+            ):
+                raise ValueError("请先填写固定消息文本")
+            overrides = {int(value) for value in manual_override_target_ids}
+            if mode is BatchMode.SCHEDULED and overrides:
+                raise ValueError("定时任务不能覆盖当天防重复")
+            if not overrides.issubset({target.id for target in targets}):
+                raise ValueError("人工覆盖目标不在本批次中")
             batch_id = self.database.start_batch(
                 mode,
                 target_count=len(targets),
@@ -296,6 +308,7 @@ class BatchService:
             )
             results: list[TargetResult] = []
             fatal_error: ErrorCode | None = None
+            batch_date = today_iso()
             self.database.record_event(
                 "INFO",
                 "batch_started",
@@ -309,9 +322,17 @@ class BatchService:
             async with self.browser_factory.open(headless=True, use_saved_state=True) as session:
                 adapter = DouyinChatAdapter(session.page)
                 await adapter.open_chat()
+                visible_account = await derive_account_identity(session)
+                if visible_account.platform_user_id != account.platform_user_id:
+                    raise AutomationError(
+                        ErrorCode.CONFIGURATION_INVALID,
+                        "发送浏览器账号与应用保存账号不一致，请重新扫码登录",
+                        fatal=True,
+                    )
                 previous_send_attempt = False
                 for index, target in enumerate(targets):
                     label = target_label(target)
+                    override_date = batch_date if target.id in overrides else None
                     run_date = today_iso()
                     will_attempt_send = mode is not BatchMode.VALIDATION and (
                         target.id in overrides
@@ -363,6 +384,8 @@ class BatchService:
                                 progress(label, "验证成功")
                             continue
 
+                        # Override consent is scoped to the day the batch was requested.
+                        run_date = override_date or today_iso()
                         reservation = self.database.reserve_attempt(
                             batch_id=batch_id,
                             account_key=account.platform_user_id,
@@ -399,7 +422,11 @@ class BatchService:
                             progress(label, "正在发送")
 
                         def on_trigger(attempt_id: str = attempt_id) -> None:
-                            self.database.mark_attempt_triggered(attempt_id)
+                            if not self.database.mark_attempt_triggered(attempt_id):
+                                raise AutomationError(
+                                    ErrorCode.DUPLICATE_BLOCKED,
+                                    "当天防重复冲突或人工覆盖授权已跨日，请重新确认",
+                                )
 
                         if message_kind is MessageKind.SPARK_STICKER:
                             await adapter.send_spark_sticker_and_confirm(target, on_trigger)
@@ -436,7 +463,7 @@ class BatchService:
                                     run_date=run_date,
                                     message_text=message_text,
                                     message_kind=message_kind,
-                                    status=AttemptStatus.FAILED,
+                                    status=result_status,
                                     error_code=exc.code,
                                 )
                         else:
@@ -570,6 +597,8 @@ class BatchService:
             )
             return AttemptStatus.FAILED
         attempt = self.database.get_attempt(attempt_id)
+        if attempt and attempt["status"] == AttemptStatus.DUPLICATE.value:
+            return AttemptStatus.DUPLICATE
         if (
             isinstance(error, SendUnknown)
             or error.send_triggered

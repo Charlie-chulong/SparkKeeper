@@ -17,6 +17,7 @@ from .paths import AppPaths
 
 TASK_NAME = "SparkKeeperLocalDaily"
 TASK_XML_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+SCHEDULER_COMMAND_TIMEOUT_SECONDS = 30
 ET.register_namespace("", TASK_XML_NAMESPACE)
 
 
@@ -57,15 +58,19 @@ def current_user_sid() -> str:
     executable = shutil.which("whoami")
     if not executable:
         raise SchedulerError("系统缺少 whoami，无法确定当前用户")
-    completed = subprocess.run(
-        [executable, "/user", "/fo", "csv", "/nh"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        completed = subprocess.run(
+            [executable, "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SchedulerError("读取 Windows 用户 SID 失败或超时（30 秒）") from exc
     if completed.returncode != 0:
         raise SchedulerError("无法读取当前 Windows 用户 SID")
     rows = list(csv.reader(io.StringIO(completed.stdout.strip())))
@@ -120,7 +125,7 @@ def build_task_xml(
     _child(settings, "Hidden", "true")
     _child(settings, "RunOnlyIfIdle", "false")
     _child(settings, "WakeToRun", "true")
-    _child(settings, "ExecutionTimeLimit", "PT30M")
+    _child(settings, "ExecutionTimeLimit", "PT0S")
     _child(settings, "Priority", "7")
 
     actions = _child(root, "Actions", Context="Author")
@@ -185,15 +190,21 @@ class TaskScheduler:
         executable = shutil.which("schtasks")
         if not executable:
             raise SchedulerError("系统缺少 schtasks，无法管理计划任务")
-        return subprocess.run(
-            [executable, *arguments],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        try:
+            return subprocess.run(
+                [executable, *arguments],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SchedulerError(
+                f"Windows 计划任务命令 {arguments[0]} 失败或超时（30 秒）"
+            ) from exc
 
 
 def scheduled_datetime(plan: Plan, on_date: date) -> datetime:

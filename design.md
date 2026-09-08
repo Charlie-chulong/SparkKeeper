@@ -89,6 +89,8 @@ tools/
 
 Playwright 操作在后台线程中运行，结果通过线程安全队列回传 Qt 主线程，由 `QTimer` 消费；窗口关闭后停止定时器并忽略迟到结果。
 
+计划查询采用带版本令牌的后台读取；计划保存、失败回滚、手动发送前同步及登录后同步在同一后台操作内完成，忙态覆盖完整链路。后台只接收冻结的配置输入，不读写 Qt 控件。忙态复位不访问数据库；待办刷新失败独立记录，不能抢占原任务结果。
+
 ### 4.2 worker 进程
 
 由 Windows 计划任务启动：
@@ -223,7 +225,7 @@ worker 只调用共享 `BatchService`，不能直接调用页面发送函数，�
 3. 不创建持久 Chromium 用户目录。
 4. 任务结束关闭 context；不把解密内容写入临时 JSON。
 
-扫码登录完成后从 context 读取 Storage State，在内存序列化并立即 DPAPI 加密保存。
+扫码登录只在内存形成 `LoginResult(account, storage_state)`，凭据不参与对象展示；浏览器清理完成并再次检查取消后，服务在互斥内同步删除旧凭据、保存账号、原子加密保存新状态。交互取消不动原凭据；提交任何一步失败不恢复可能错配的旧状态。批次在互斥内读取账号、计划和目标，打开页面后核对稳定发件账号；不能以会话级 Cookie 或整个 Storage State 的摘要猜测账号身份。
 
 
 ## 7. 跨进程互斥
@@ -325,19 +327,20 @@ PREPARED
             │    ├─ 明确失败标记 → FAILED
             │    ├─ 发送中 → PENDING
             │    │    ├─ 明确失败标记 → FAILED
-            │    │    └─ 发送中消失且稳定 → SUCCESS
-            │    └─ 全程稳定且无失败 → SUCCESS
+            │    │    └─ SDK 成功终态与新服务端证据稳定 → SUCCESS
+            │    └─ SDK 成功终态与新服务端证据稳定 → SUCCESS
             └─ 超时/页面丢失/进程异常 → UNKNOWN
 ```
 
-- 发送前记录旧的最新己方消息身份或内容摘要。
+- 发送前记录当前会话的己方消息 `clientId` 集合及 V2 水位；最终网页准备完成后刷新基线，再同步事务标记触发并紧邻唯一点击/按键。事务内按实际日重查 guard；跨日冲突和过期人工覆盖在点击前返回 `duplicate`，不改动其他 guard。
 - 文本输入后验证编辑器内容与期望文本等价；原生“续火花”不输入文本，点击准确表情项即触发一次发送。
 - 只确认新产生且内容匹配的己方消息。
-- 新气泡刚出现时不是成功，必须观察发送中和失败标记的终态。
+- 新气泡刚出现时不是成功；文本与原生共用客户端身份绑定和 SDK 终态观察，不扫描正文或任意祖先全文来判断失败。多个新候选、未知状态或消息证据不足均保守处理。
 - `TRIGGERED` 后所有无法证明失败的异常都按 `unknown` 处理。
 - 不自动重试。
 - `plan` 与 `send_attempts` 保存 `message_kind`；schema v3 将旧行确定为 `text`。补跑冻结类型和内容，旧 JSON 快照缺少类型时按文本处理；改变类型不改变当天去重键。
 - 原生资源依据当前网页互动表情配置：名称“续火花”，稳定路径 `/obj/im-resource/1687263281313-ts-e7bbade781abe88ab12e706e67`。签名域名和参数不固定；它不同于小表情“[续火花吧]”。
+- 文本字段依据同一公开 PC IM [消息组件源码](https://lf3-social.iesdouyin.com/obj/douyin-social-cdn/pcim/static/js/async/__federation_expose_default_export.0ccd0cf4.js)：`type=7`、`parsedContent.text`、`.MessageItemTextcontainer`；只读取绑定消息的最小状态字段，排除引用和编辑器，不导出无关消息正文。
 - 原生发送必须先核对唯一可见资源、当前聊天身份并采样旧消息，再持久化触发标记并点击一次。消息证据要求当前会话的己方新消息、`type=5`、`aweType=507` 及一致资源，不能以面板图片或所有新图片计数判定成功。
 - 原生终态识别 SDK `Succeeded(3)`、服务器回收的 `Received(4)`，以及严格的服务器加载形态：`flightStatus` 为 JS `undefined`（不含 `null`）、`isOffline=false`、`serverStatus=0`、正十进制服务端 ID 和 V2。所有形态仍要求唯一新 clientId、V2 超过点击前水位及持续稳定；不把旧气泡、缺字段或对端已读状态当作本次成功。
 - 准备完成的快照直接作为首次基线，点击前完整快照由三次减为两次；服务层不重复执行原生适配器已承担的核验。保留面板准备前后及触发回调后紧邻点击的身份检查，文本路径不变。15 秒上限、1.5/0.75 秒稳定窗口和默认好友间等待不变。
@@ -378,6 +381,8 @@ PREPARED
 - `StartWhenAvailable=false`，防止系统恢复后擅自补发。
 - `MultipleInstancesPolicy=IgnoreNew`。
 - `RunOnlyIfNetworkAvailable=true`。
+- `ExecutionTimeLimit=PT0S`，不因固定 30 分钟截止中断合法长批次；既有任务由用户重新保存计划更新，不在启动查询时自动重写。
+- `whoami` 与 `schtasks` 命令设置 30 秒超时并保留原因链；超时不是允许强杀发送 worker。
 - 源码模式使用绝对 Python、模块参数和项目工作目录。
 - 冻结程序使用固定程序目录中的 `SparkKeeper.exe --scheduled` 和该目录作为工作目录；首次从便携目录迁入安装目录后重新保存计划以更新绝对路径。
 
@@ -385,6 +390,7 @@ PREPARED
 
 - PyInstaller `onedir` 打包 Python、PySide6/Qt Widgets、Playwright 驱动和 Windows-Toasts；Qt 使用可替换的动态库，发行包附开源许可及来源说明，不捆绑 Tk。
 - 仅捆绑实际使用的 Chromium、Headless Shell、FFmpeg 和 Playwright 辅助组件。
+- 程序清单附 `build_provenance`，记录源码/资源/实际构建输入内容摘要、配置及工具版本，并在构建前后核对。安装器凭据绑定该来源和编译器，发布预检比较当前源码；无关文档及提交号变化不改变源码摘要，旧版运行期清单读取不变。
 - 冻结程序把 `PLAYWRIGHT_BROWSERS_PATH` 指向 EXE 同级 `browsers`，缺失时以固定安全错误拒绝启动网页任务。
 - `SparkKeeper.exe` 同时承载桌面入口和隐藏的 `--scheduled` worker 入口。
 - 分发构建前扫描并拒绝数据库、登录 DPAPI 密文、任务 XML 及 `local-data`。

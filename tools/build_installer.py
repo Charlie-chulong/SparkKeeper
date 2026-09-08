@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ release_version = _build["release_version"]
 sha256_file = _build["sha256_file"]
 is_sensitive_path = _build["is_sensitive_path"]
 reject_sensitive_files = _build["reject_sensitive_files"]
+validate_provenance = _build["validate_provenance"]
 
 
 def validate_member(name: str) -> None:
@@ -157,6 +159,14 @@ def read_installer_metadata(installer: Path) -> dict[str, str]:
             raise RuntimeError("安装器必须声明 asInvoker 且不能请求 uiAccess")
     finally:
         kernel.FreeLibrary(module)
+    return {"execution_level": "asInvoker", **read_pe_version(installer)}
+
+
+def read_pe_version(installer: Path) -> dict[str, str]:
+    if sys.platform != "win32":
+        raise RuntimeError("PE 编译器版本资源读取需要 Windows")
+    from ctypes import wintypes
+
 
     version_api = ctypes.WinDLL("version", use_last_error=True)
     version_api.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
@@ -184,7 +194,7 @@ def read_installer_metadata(installer: Path) -> dict[str, str]:
         raise RuntimeError("安装器版本资源语言表无效")
     translation = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_ushort))
     prefix = f"\\StringFileInfo\\{translation[0]:04x}{translation[1]:04x}\\"
-    result = {"execution_level": "asInvoker"}
+    result = {}
     for name in ("ProductName", "ProductVersion", "FileDescription"):
         pointer, length = query(prefix + name)
         result[name] = ctypes.wstring_at(pointer, length).rstrip(" \0")
@@ -205,11 +215,15 @@ def receipt_path(installer: Path) -> Path:
 
 def installer_inputs(root: Path) -> dict[str, str]:
     return {name: sha256_file(root / "tools" / name)
-            for name in ("installer.iss", "installer_guard.ps1", "update.ps1",
+            for name in ("build_installer.py", "installer.iss", "installer_guard.ps1", "update.ps1",
                          "installer/ChineseSimplified.isl", "installer/LICENSE.txt", "maintenance_tasks.ps1")}
 
 
-def validate_installer(installer: Path, version: str, manifest_digest: str, *, root: Path = ROOT) -> Path:
+def compiler_identity(compiler: Path) -> dict[str, str]:
+    return {"sha256": sha256_file(compiler), "version": read_pe_version(compiler)["ProductVersion"]}
+
+
+def validate_installer(installer: Path, version: str, manifest_content: bytes, *, root: Path = ROOT) -> Path:
     if installer.name != f"SparkKeeper-{release_version(version)}-Setup.exe":
         raise ValueError("安装器文件名与版本不一致")
     checksum = installer.with_suffix(".exe.sha256")
@@ -217,9 +231,21 @@ def validate_installer(installer: Path, version: str, manifest_digest: str, *, r
     if checksum.read_text("ascii").strip() != f"{digest}  {installer.name}":
         raise RuntimeError("安装器 EXE.sha256 校验失败")
     receipt = json.loads(receipt_path(installer).read_bytes(), object_pairs_hook=unique_object)
-    expected = {"format": 1, "version": version, "installer_sha256": digest,
+    if not isinstance(receipt, dict):
+        raise TypeError("安装器构建凭据必须是对象")
+    validate_manifest(manifest_content, version)
+    manifest = json.loads(manifest_content, object_pairs_hook=unique_object)
+    provenance = validate_provenance(manifest.get("build_provenance"), root=root)
+    compiler = receipt.get("compiler")
+    if (not isinstance(compiler, dict) or set(compiler) != {"sha256", "version"}
+            or not isinstance(compiler.get("version"), str) or not compiler["version"]
+            or not isinstance(compiler.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", compiler["sha256"])):
+        raise RuntimeError("安装器构建凭据缺少编译器版本或摘要")
+    expected = {"format": 2, "version": version, "installer_sha256": digest,
                 "inputs_sha256": installer_inputs(root),
-                "payload_manifest_sha256": manifest_digest}
+                "payload_manifest_sha256": hashlib.sha256(manifest_content).hexdigest(),
+                "payload_build_provenance": provenance, "compiler": compiler}
     if receipt != expected:
         raise RuntimeError("安装器构建凭据与 EXE、当前安装脚本或 ZIP payload 不一致；请重新构建安装器")
     validate_installer_metadata(installer, version)
@@ -238,7 +264,12 @@ def main(argv: list[str] | None = None) -> int:
         output = (args.output_dir or ROOT / "outputs" / "release").resolve()
         manifest = validate_payload(payload, version)
         manifest_digest = sha256_file(manifest)
+        provenance = validate_provenance(
+            json.loads(manifest.read_bytes(), object_pairs_hook=unique_object).get("build_provenance"),
+            root=ROOT,
+        )
         compiler = find_iscc(args.iscc)
+        compiler_info = compiler_identity(compiler)
         script = ROOT / "tools" / "installer.iss"
         inputs = installer_inputs(ROOT)
         base = f"SparkKeeper-{release_version(version)}-Setup"
@@ -257,15 +288,20 @@ def main(argv: list[str] | None = None) -> int:
             if not installer.is_file():
                 raise RuntimeError("ISCC 未生成预期的 Setup.exe")
             validate_payload(payload, version)
-            if sha256_file(manifest) != manifest_digest or installer_inputs(ROOT) != inputs or project_version(ROOT) != version:
+            validate_provenance(provenance, root=ROOT)
+            if (sha256_file(manifest) != manifest_digest or installer_inputs(ROOT) != inputs
+                    or project_version(ROOT) != version or compiler_identity(compiler) != compiler_info):
                 raise RuntimeError("编译期间版本、payload 或安装脚本发生变化")
             validate_installer_metadata(installer, version)
             digest = sha256_file(installer)
             checksum = installer.with_suffix(".exe.sha256")
             checksum.write_text(f"{digest}  {installer.name}\n", encoding="ascii")
             receipt = receipt_path(installer)
-            receipt.write_text(json.dumps({"format": 1, "version": version, "installer_sha256": digest,
-                                          "inputs_sha256": inputs, "payload_manifest_sha256": manifest_digest}, indent=2) + "\n", encoding="utf-8")
+            receipt.write_text(json.dumps({
+                "format": 2, "version": version, "installer_sha256": digest,
+                "inputs_sha256": inputs, "payload_manifest_sha256": manifest_digest,
+                "payload_build_provenance": provenance, "compiler": compiler_info,
+            }, indent=2) + "\n", encoding="utf-8")
             for artifact in (installer, checksum, receipt):
                 artifact.replace(output / artifact.name)
         print(output / f"{base}.exe")

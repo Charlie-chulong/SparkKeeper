@@ -74,6 +74,7 @@ def app(monkeypatch: pytest.MonkeyPatch, scan: SparkScanResult, qapp):
     instance.busy = False
     instance._spark_preview = None
     instance._spark_scan_running = False
+    instance._login_running = False
     instance.cancel_event = threading.Event()
     instance.cancel_button = QPushButton(instance)
     instance.messages = queue.Queue()
@@ -90,6 +91,7 @@ def app(monkeypatch: pytest.MonkeyPatch, scan: SparkScanResult, qapp):
     instance._set_status = Mock()
     instance._refresh_targets = Mock()
     instance._refresh_logs = Mock()
+    instance._refresh_pending_indicator = Mock()
     monkeypatch.setattr(theme, "confirm", Mock(return_value=True))
     monkeypatch.setattr(theme, "show_message", Mock())
     try:

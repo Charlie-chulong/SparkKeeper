@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import xml.etree.ElementTree as ET
 from datetime import date, datetime
 from unittest.mock import Mock
@@ -7,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 from PySide6.QtWidgets import QCheckBox, QLineEdit, QMainWindow
 
+from spark_keeper import scheduler as scheduler_module
 from spark_keeper.database import Database
 from spark_keeper.models import BatchMode, FriendCandidate, MessageKind, Plan
 from spark_keeper.scheduler import (
@@ -35,6 +37,7 @@ def test_task_xml_uses_interactive_user_and_wake_without_catchup(tmp_path) -> No
     assert document.findtext(".//t:WakeToRun", namespaces=namespace) == "true"
     assert document.findtext(".//t:StartWhenAvailable", namespaces=namespace) == "false"
     assert document.findtext(".//t:MultipleInstancesPolicy", namespaces=namespace) == "IgnoreNew"
+    assert document.findtext(".//t:ExecutionTimeLimit", namespaces=namespace) == "PT0S"
     assert document.findtext(".//t:Command", namespaces=namespace) == str(python.resolve())
     assert document.findtext(".//t:WorkingDirectory", namespaces=namespace) == str(root.resolve())
 
@@ -130,7 +133,7 @@ def test_plan_scheduler_rollback_failure_preserves_original_diagnostics(
 
     try:
         with pytest.raises(SchedulerError, match="包含敏感系统详情") as error:
-            app._persist_plan(require_confirmation=True)
+            app._persist_plan(app._snapshot_plan(), require_confirmation=True)
         assert error.value is original_error
         if event_store_unavailable:
             assert "事件存储不可写" in "\n".join(error.value.__notes__)
@@ -145,3 +148,24 @@ def test_plan_scheduler_rollback_failure_preserves_original_diagnostics(
     assert "SchedulerError: 仍包含敏感系统详情" in event[2]
     assert "Traceback" in event[2]
     assert "私密正文" not in event[2]
+
+
+@pytest.mark.parametrize("command", ["whoami", "schtasks"])
+@pytest.mark.parametrize("failure", ["timeout", "oserror"])
+def test_scheduler_commands_are_bounded_and_preserve_diagnostics(monkeypatch, command, failure):
+    monkeypatch.setattr(scheduler_module.shutil, "which", lambda name: name)
+    cause = (
+        subprocess.TimeoutExpired(command, 30, output="系统诊断")
+        if failure == "timeout"
+        else OSError("系统命令启动失败")
+    )
+    run = Mock(side_effect=cause)
+    monkeypatch.setattr(scheduler_module.subprocess, "run", run)
+    with pytest.raises(SchedulerError) as error:
+        if command == "whoami":
+            scheduler_module.current_user_sid()
+        else:
+            scheduler_module.TaskScheduler._run(["/Query", "/TN", "fixture"])
+    assert error.value.__cause__ is cause
+    assert "30 秒" in str(error.value)
+    assert run.call_args.kwargs["timeout"] == 30

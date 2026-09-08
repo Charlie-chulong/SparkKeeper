@@ -14,6 +14,12 @@ from spark_keeper.models import AttemptStatus, BatchMode, BatchStatus, FriendCan
 from spark_keeper.mutex import AlreadyRunningError, WindowsTaskMutex
 
 
+@pytest.fixture(autouse=True)
+def fixed_send_day(monkeypatch):
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-04")
+
+
+
 def candidate(key: str, name: str = "测试好友") -> FriendCandidate:
     return FriendCandidate(
         stable_key=key,
@@ -702,3 +708,106 @@ def test_maintenance_lock_normalizes_aliases_without_holding_automation_lock(
     with WindowsTaskMutex(), pytest.raises(AlreadyRunningError), WindowsTaskMutex():
         pass
     assert database.get_meta("schema_version") == "3"
+
+
+@pytest.mark.parametrize("outcome", [AttemptStatus.SUCCESS, AttemptStatus.UNKNOWN, AttemptStatus.FAILED])
+def test_trigger_migrates_only_own_reservation_to_actual_day(tmp_path, monkeypatch, outcome):
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    reservation = database.reserve_attempt(
+        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
+        run_date="2026-09-04", message_text="跨日", manual_override=False,
+    )
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-05")
+    assert database.mark_attempt_triggered(reservation.attempt_id)
+    assert not database.has_daily_guard(account.platform_user_id, target.id, "2026-09-04")
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-05")
+    assert database.get_attempt(reservation.attempt_id)["run_date"] == "2026-09-05"
+    database.finish_attempt(reservation.attempt_id, outcome)
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-05") == (
+        outcome is not AttemptStatus.FAILED
+    )
+
+
+@pytest.mark.parametrize("existing_status", [
+    AttemptStatus.SENDING, AttemptStatus.SUCCESS, AttemptStatus.UNKNOWN,
+])
+@pytest.mark.parametrize("manual_override", [False, True])
+def test_cross_day_guard_conflict_rejects_without_changing_existing_audit(
+    tmp_path, monkeypatch, existing_status, manual_override,
+):
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    common = {
+        "batch_id": batch,
+        "account_key": account.platform_user_id,
+        "target_id": target.id,
+        "message_text": "跨日",
+    }
+    old = database.reserve_attempt(**common, run_date="2026-09-04", manual_override=False)
+    if manual_override:
+        assert database.mark_attempt_triggered(old.attempt_id)
+        database.finish_attempt(old.attempt_id, AttemptStatus.UNKNOWN)
+        reservation = database.reserve_attempt(
+            **common, run_date="2026-09-04", manual_override=True,
+        )
+    else:
+        reservation = old
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-05")
+    existing = database.reserve_attempt(
+        **common, run_date="2026-09-05", manual_override=False,
+    )
+    if existing_status is not AttemptStatus.SENDING:
+        assert database.mark_attempt_triggered(existing.attempt_id)
+        database.finish_attempt(existing.attempt_id, existing_status)
+    previous = database.get_attempt(existing.attempt_id)
+    assert not database.mark_attempt_triggered(reservation.attempt_id)
+    rejected = database.get_attempt(reservation.attempt_id)
+    assert rejected["status"] == AttemptStatus.DUPLICATE.value
+    assert rejected["triggered_at"] is None
+    assert rejected["manual_override"] == int(manual_override)
+    assert rejected["override_of"] == (
+        old.attempt_id if manual_override else existing.attempt_id
+    )
+    assert database.get_attempt(existing.attempt_id) == previous
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-05")
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-04") == manual_override
+
+
+def test_manual_override_without_existing_guard_expires_at_midnight(tmp_path, monkeypatch):
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    reservation = database.reserve_attempt(
+        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
+        run_date="2026-09-04", message_text="跨日", manual_override=True,
+    )
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-05")
+    assert not database.mark_attempt_triggered(reservation.attempt_id)
+    assert database.get_attempt(reservation.attempt_id)["triggered_at"] is None
+    assert database.count_rows("daily_send_guards") == 0
+
+
+def test_trigger_day_migration_rolls_back_if_trigger_write_fails(tmp_path, monkeypatch):
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    reservation = database.reserve_attempt(
+        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
+        run_date="2026-09-04", message_text="跨日", manual_override=False,
+    )
+    with database.connect(immediate=True) as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_trigger BEFORE UPDATE OF triggered_at ON send_attempts "
+            "BEGIN SELECT RAISE(ABORT, 'trigger write failure'); END"
+        )
+    monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-05")
+    with pytest.raises(sqlite3.IntegrityError, match="trigger write failure"):
+        database.mark_attempt_triggered(reservation.attempt_id)
+    row = database.get_attempt(reservation.attempt_id)
+    assert row["run_date"] == "2026-09-04"
+    assert row["triggered_at"] is None
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-04")
+    assert not database.has_daily_guard(account.platform_user_id, target.id, "2026-09-05")

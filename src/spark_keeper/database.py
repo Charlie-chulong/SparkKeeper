@@ -882,14 +882,87 @@ class Database:
                 )
         return Reservation(attempt_id, True, override_of)
 
-    def mark_attempt_triggered(self, attempt_id: str) -> None:
+    def mark_attempt_triggered(self, attempt_id: str) -> bool:
+        """Atomically claim the actual send day; False means rejected before sending."""
         with self.connect(immediate=True) as connection:
-            cursor = connection.execute(
-                "UPDATE send_attempts SET triggered_at = ? WHERE id = ? AND status = ?",
-                (now_iso(), attempt_id, AttemptStatus.SENDING.value),
-            )
-            if cursor.rowcount != 1:
+            row = connection.execute(
+                """
+                SELECT account_key, target_id, run_date, status, triggered_at,
+                       manual_override, override_of
+                FROM send_attempts WHERE id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != AttemptStatus.SENDING.value
+                or row["triggered_at"] is not None
+            ):
                 raise ValueError("发送尝试不在可触发状态")
+            run_date = today_iso()
+            timestamp = now_iso()
+            guard = connection.execute(
+                """
+                SELECT source_attempt_id FROM daily_send_guards
+                WHERE account_key = ? AND target_id = ? AND run_date = ?
+                """,
+                (row["account_key"], row["target_id"], run_date),
+            ).fetchone()
+            changed_day = run_date != row["run_date"]
+            owns_guard = guard is not None and guard["source_attempt_id"] == attempt_id
+            authorized_override = (
+                not changed_day
+                and row["manual_override"]
+                and guard is not None
+                and guard["source_attempt_id"] == row["override_of"]
+            )
+            rejected = (changed_day and row["manual_override"]) or (
+                guard is not None and not owns_guard and not authorized_override
+            )
+            if rejected:
+                # Preserve override_of and its authorization day for the audit trail.
+                connection.execute(
+                    """
+                    UPDATE send_attempts SET status = ?, finished_at = ?, error_code = ?,
+                        run_date = ?, override_of = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        AttemptStatus.DUPLICATE.value, timestamp,
+                        ErrorCode.DUPLICATE_BLOCKED.value,
+                        row["run_date"] if row["manual_override"] else run_date,
+                        row["override_of"] if row["manual_override"] else guard["source_attempt_id"],
+                        attempt_id,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM daily_send_guards WHERE source_attempt_id = ? AND status = ?",
+                    (attempt_id, AttemptStatus.SENDING.value),
+                )
+                return False
+            if changed_day:
+                connection.execute(
+                    "DELETE FROM daily_send_guards WHERE source_attempt_id = ? AND status = ?",
+                    (attempt_id, AttemptStatus.SENDING.value),
+                )
+            if guard is None:
+                connection.execute(
+                    """
+                    INSERT INTO daily_send_guards(
+                        account_key, target_id, run_date, source_attempt_id, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["account_key"], row["target_id"], run_date, attempt_id,
+                        AttemptStatus.SENDING.value, timestamp, timestamp,
+                    ),
+                )
+            connection.execute(
+                "UPDATE send_attempts SET run_date = ?, triggered_at = ? WHERE id = ?",
+                (run_date, timestamp, attempt_id),
+            )
+        return True
 
     def finish_attempt(
         self,

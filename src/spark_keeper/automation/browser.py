@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from collections.abc import AsyncIterator
@@ -71,13 +72,21 @@ class BrowserSessionFactory:
             page = await context.new_page()
             yield BrowserSession(page=page, context=context)
         finally:
-            if context is not None:
-                await context.close()
-            if browser is not None:
-                await browser.close()
-            if playwright is not None:
-                await playwright.stop()
+            async def close_session() -> None:
+                try:
+                    if context is not None:
+                        await context.close()
+                finally:
+                    try:
+                        if browser is not None:
+                            await browser.close()
+                    finally:
+                        if playwright is not None:
+                            await playwright.stop()
 
-    async def save_state(self, context: BrowserContext) -> None:
-        state = await context.storage_state()
-        self.state_store.save(state)
+            cleanup = asyncio.create_task(close_session())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+                raise

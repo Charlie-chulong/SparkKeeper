@@ -393,8 +393,8 @@ class NativeTimeline:
         self.index = 0
         self.samples = 0
         self.click_error: Exception | None = None
-        self.post_trigger_identity_error: Exception | None = None
-        self.post_trigger_panel: dict[str, Any] | Exception = self.baseline
+        self.final_identity_error: Exception | None = None
+        self.final_panel: dict[str, Any] | Exception = self.baseline
         # No browser can be reached: all adapter boundaries below are local fakes.
         self.adapter = DouyinChatAdapter(None)  # type: ignore[arg-type]
         monkeypatch.setattr(self.adapter, "_prepare_spark_sticker", self.prepare)
@@ -419,16 +419,16 @@ class NativeTimeline:
     async def verify(self, target: Target) -> None:
         assert target == native_target()
         self.events.append("verify")
-        if "trigger" in self.events and self.post_trigger_identity_error is not None:
-            raise self.post_trigger_identity_error
+        if "capture-element" in self.events and self.final_identity_error is not None:
+            raise self.final_identity_error
 
     async def take_snapshot(self, *, require_panel: bool = False) -> dict[str, Any]:
         if require_panel:
-            if "trigger" in self.events:
+            if "capture-element" in self.events:
                 self.events.append("recheck-panel")
-                if isinstance(self.post_trigger_panel, Exception):
-                    raise self.post_trigger_panel
-                return self.post_trigger_panel
+                if isinstance(self.final_panel, Exception):
+                    raise self.final_panel
+                return self.final_panel
             self.events.append("baseline")
             return self.baseline
         self.events.append("sample")
@@ -460,7 +460,7 @@ class NativeTimeline:
     def assert_single_trigger(self) -> None:
         actions = [event for event in self.events if event != "capture-element"]
         assert actions[:8] == [
-            "prepare", "verify", "baseline", "trigger", "verify", "recheck-panel", "click", "await",
+            "prepare", "verify", "baseline", "verify", "recheck-panel", "trigger", "click", "await",
         ]
         assert self.events.count("capture-element") == 1
         assert self.events.index("capture-element") < self.events.index("trigger")
@@ -497,10 +497,7 @@ async def test_pending_with_new_server_index_binds_client_until_stable_success(
         snapshot(message(status=terminal_status, server_hydrated=server_hydrated)),
     ])
 
-    async def async_trigger() -> None:
-        timeline.events.append("trigger")
-
-    await timeline.adapter.send_spark_sticker_and_confirm(native_target(), async_trigger)
+    await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
     assert timeline.now >= 1.0
     assert timeline.samples > 2
@@ -577,7 +574,7 @@ async def test_multiple_new_candidates_cannot_be_rebound_to_later_single_success
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ["prepare", "verify", "baseline", "callback", "async-callback"])
+@pytest.mark.parametrize("stage", ["prepare", "verify", "baseline", "callback"])
 async def test_pretrigger_failure_never_clicks_or_samples(
     monkeypatch: pytest.MonkeyPatch, stage: str,
 ) -> None:
@@ -591,14 +588,9 @@ async def test_pretrigger_failure_never_clicks_or_samples(
         timeline.events.append("trigger")
         raise rejection
 
-    async def reject_async_callback() -> None:
-        reject_callback()
-
-    callback: Callable[[], None | Awaitable[None]] = timeline.trigger
+    callback: Callable[[], None] = timeline.trigger
     if stage == "callback":
         callback = reject_callback
-    elif stage == "async-callback":
-        callback = reject_async_callback
     else:
         attribute = {"prepare": "_prepare_spark_sticker", "verify": "verify_recipient",
                      "baseline": "_spark_sticker_snapshot"}[stage]
@@ -629,7 +621,7 @@ async def test_posttrigger_exceptions_are_unknown_and_never_retried(
     assert unknown.value.send_triggered
     actions = [event for event in timeline.events if event != "capture-element"]
     assert actions[:7] == [
-        "prepare", "verify", "baseline", "trigger", "verify", "recheck-panel", "click",
+        "prepare", "verify", "baseline", "verify", "recheck-panel", "trigger", "click",
     ]
     assert timeline.events.count("click") == 1
     assert timeline.events.count("trigger") == 1
@@ -681,24 +673,23 @@ async def test_unindexed_pending_then_failure_cannot_prove_this_send_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["identity", "panel-conversation", "panel-unavailable"])
-async def test_callback_time_recipient_or_panel_change_is_unknown_without_click(
+async def test_final_preparation_recipient_or_panel_change_rejects_before_trigger(
     monkeypatch: pytest.MonkeyPatch, change: str,
 ) -> None:
     timeline = NativeTimeline(monkeypatch, [snapshot(message())])
 
-    async def change_during_callback() -> None:
-        timeline.trigger()
-        if change == "identity":
-            timeline.post_trigger_identity_error = TargetIdentityMismatch()
-        elif change == "panel-conversation":
-            timeline.post_trigger_panel = snapshot(conversation_id="other-conversation")
-        else:
-            timeline.post_trigger_panel = PageStructureChanged()
+    if change == "identity":
+        timeline.final_identity_error = TargetIdentityMismatch()
+    elif change == "panel-conversation":
+        timeline.final_panel = snapshot(conversation_id="other-conversation")
+    else:
+        timeline.final_panel = PageStructureChanged()
 
-    with pytest.raises(SendUnknown) as unknown:
-        await timeline.adapter.send_spark_sticker_and_confirm(native_target(), change_during_callback)
-    assert unknown.value.send_triggered
-    assert timeline.events.count("trigger") == 1
+    expected = PageStructureChanged if change == "panel-unavailable" else TargetIdentityMismatch
+    with pytest.raises(expected) as rejected:
+        await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
+    assert rejected.value.send_triggered is False
+    assert "trigger" not in timeline.events
     assert timeline.events.count("capture-element") == 1
     assert timeline.events.count("verify") == 2
     assert "click" not in timeline.events
@@ -725,7 +716,7 @@ async def test_missing_fixed_element_is_rejected_before_callback(monkeypatch: py
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status,server_hydrated", [(4, False), (None, True)])
-@pytest.mark.parametrize("stale", ["equal-index", "old-client", "callback-arrival"])
+@pytest.mark.parametrize("stale", ["equal-index", "old-client", "preparation-arrival"])
 async def test_server_confirmed_history_never_becomes_this_click(
     monkeypatch: pytest.MonkeyPatch, status: int | None, server_hydrated: bool, stale: str,
 ) -> None:
@@ -733,8 +724,8 @@ async def test_server_confirmed_history_never_becomes_this_click(
                         index=WATERMARK if stale == "equal-index" else NEXT_INDEX)
     baseline = snapshot(candidate) if stale == "old-client" else snapshot()
     timeline = NativeTimeline(monkeypatch, [snapshot(candidate)], baseline=baseline)
-    if stale == "callback-arrival":
-        timeline.post_trigger_panel = snapshot(candidate)
+    if stale == "preparation-arrival":
+        timeline.final_panel = snapshot(candidate)
     with pytest.raises(SendUnknown):
         await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
@@ -760,7 +751,7 @@ async def test_identity_change_while_loading_panel_is_rejected_before_trigger() 
 
 
 @pytest.mark.asyncio
-async def test_preparation_reuses_one_snapshot_without_duplicate_ready_check(
+async def test_final_preparation_rechecks_before_trigger_without_clicking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with native_page() as page:
@@ -779,8 +770,8 @@ async def test_preparation_reuses_one_snapshot_without_duplicate_ready_check(
             return await original_snapshot(require_panel=require_panel)
 
         def abort_before_click() -> None:
-            assert readiness == [True, True]  # Before opening and after loading.
-            assert snapshots == [True]  # Preparation is also the send baseline.
+            assert readiness == [True, True, True]  # Open, load, and final identity check.
+            assert snapshots == [True, True]  # Preparation and final pre-trigger baseline.
             raise RuntimeError("stop before any native trigger")
 
         monkeypatch.setattr(adapter, "_require_ready", ready)

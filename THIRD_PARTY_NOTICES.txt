@@ -1,4 +1,19 @@
-Third-party components used by the Windows preview version:
+Project license and scope
+
+SparkKeeper's own code is source-available under the PolyForm Noncommercial License 1.0.0.
+The full, unmodified terms and project Required Notice are in the root LICENSE file.
+Official terms: https://polyformproject.org/licenses/noncommercial/1.0.0
+This is a noncommercial license, not an OSI-approved open-source license.
+It applies from the commit that first adds the root LICENSE file; older tags and already
+published release assets retain their licensing state at the time of publication.
+
+The project license does not relicense or impose noncommercial restrictions on third-party
+libraries, tools, notices, or Douyin's native emoji assets. Their original licenses and
+rights remain with their respective owners. No separate reuse rights to Douyin's native
+emoji assets are granted by the project license.
+In particular, the LGPL replacement and debugging rights described below remain intact.
+
+Third-party components used by the Windows version:
 
 Playwright for Python
 License: Apache License 2.0

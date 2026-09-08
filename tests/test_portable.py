@@ -21,6 +21,7 @@ build_portable = runpy.run_path(
     str(Path(__file__).resolve().parents[1] / "tools" / "build_portable.py")
 )
 reject_sensitive_files = build_portable["reject_sensitive_files"]
+copy_licenses = build_portable["copy_licenses"]
 copy_qt_licenses = build_portable["copy_qt_licenses"]
 trim_unused_qt_plugins = build_portable["trim_unused_qt_plugins"]
 
@@ -121,6 +122,62 @@ def test_release_audit_rejects_runtime_data(tmp_path) -> None:
     (release / "auth-state.bin").write_bytes(b"must-not-ship")
     with pytest.raises(RuntimeError, match="发行目录含运行数据"):
         reject_sensitive_files(release)
+
+
+def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    root.mkdir()
+    project_license = root / "LICENSE"
+    project_license.write_bytes(
+        b"Project license\r\nRequired Notice: Copyright 2026 Example contributors\r\n"
+    )
+    python_license = root / "LICENSE.txt"
+    python_license.write_bytes(b"Python license\r\n")
+    playwright_license = (
+        root / "Lib" / "site-packages" / "playwright" / "driver" / "LICENSE"
+    )
+    playwright_license.parent.mkdir(parents=True)
+    playwright_license.write_bytes(b"Playwright license\n")
+    dependency_license = root / "dependency-LICENSE.txt"
+    dependency_license.write_bytes(b"Dependency license\n")
+    qt_source = root / "third_party" / "qt-6.11.2"
+    qt_source.mkdir(parents=True)
+    for filename in ("LGPL-3.0-only.txt", "GPL-3.0-only.txt"):
+        (qt_source / filename).write_bytes(b"Unmodified Qt license\n")
+    (qt_source / "manifest.json").write_text('{"version":"6.11.2"}', encoding="utf-8")
+    monkeypatch.setitem(copy_licenses.__globals__, "ROOT", root)
+    monkeypatch.setitem(copy_licenses.__globals__, "VENV", root)
+    monkeypatch.setitem(copy_licenses.__globals__, "sys", SimpleNamespace(base_prefix=root))
+    monkeypatch.setitem(
+        copy_licenses.__globals__, "distribution_license", lambda *_args: dependency_license
+    )
+    monkeypatch.setitem(
+        copy_licenses.__globals__, "distribution", lambda _name: SimpleNamespace(version="6.11.2")
+    )
+
+    release = tmp_path / "release"
+    copy_licenses(release)
+    expected = {
+        "LICENSE": project_license,
+        "licenses/Python-LICENSE.txt": python_license,
+        "licenses/Playwright-LICENSE.txt": playwright_license,
+        "licenses/Windows-Toasts-LICENSE.txt": dependency_license,
+        "licenses/PyInstaller-COPYING.txt": dependency_license,
+        "licenses/Qt/LGPL-3.0-only.txt": qt_source / "LGPL-3.0-only.txt",
+        "licenses/Qt/GPL-3.0-only.txt": qt_source / "GPL-3.0-only.txt",
+        "licenses/Qt/manifest.json": qt_source / "manifest.json",
+    }
+    manifest_path = build_portable["write_release_manifest"](release, "3.0.0")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for name, source in expected.items():
+        assert (release / name).read_bytes() == source.read_bytes()
+        assert manifest["files"][name] == build_portable["sha256_file"](source)
+
+
+def test_license_copy_rejects_missing_project_license(tmp_path, monkeypatch):
+    monkeypatch.setitem(copy_licenses.__globals__, "ROOT", tmp_path)
+    with pytest.raises(FileNotFoundError):
+        copy_licenses(tmp_path / "release")
 
 
 def test_qt_license_copy_requires_matching_version_and_preserves_notices(tmp_path, monkeypatch):

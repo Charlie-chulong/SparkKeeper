@@ -155,8 +155,10 @@ def distribution_license(distribution_name: str, suffix: str) -> Path:
     return Path(package.locate_file(matches[0]))
 
 
-def copy_licenses(destination: Path) -> None:
+def copy_licenses(release_directory: Path) -> None:
+    destination = release_directory / "licenses"
     destination.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "LICENSE", release_directory / "LICENSE")
     sources = {
         "Python-LICENSE.txt": Path(sys.base_prefix) / "LICENSE.txt",
         "Playwright-LICENSE.txt": (
@@ -321,7 +323,7 @@ def main() -> None:
     shutil.move(str(built_directory), release_directory)
     trim_unused_qt_plugins(release_directory)
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.txt", release_directory)
-    copy_licenses(release_directory / "licenses")
+    copy_licenses(release_directory)
     write_user_guide(release_directory / "使用说明.txt", version)
     reject_sensitive_files(release_directory)
     write_release_manifest(release_directory, version)

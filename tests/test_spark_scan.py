@@ -391,15 +391,78 @@ async def test_preview_metadata_cannot_supply_identity_type_badge_or_list_end() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "list_tag,list_role,row_tag,row_role",
+    [("ul", "list", "li", "listitem"), ("div", "listbox", "div", "option")],
+)
+async def test_semantic_lists_ignore_nested_rows_but_keep_nameless_conversations(
+    list_tag, list_role, row_tag, row_role
+) -> None:
+    content = f"""<style>
+        aside {{width:360px;height:760px}} input {{width:300px;height:30px}}
+        #list {{height:360px;overflow:auto}}
+        .row {{height:80px}}
+        .avatar {{display:inline-block;width:30px;height:30px}}
+    </style><aside><input placeholder="搜索好友">
+      <{list_tag} id="list" role="{list_role}" aria-label="会话列表">
+        <{row_tag} class="row" role="{row_role}">
+          <div data-role="conversation-header">
+            <span data-role="conversation-name">真实好友</span>
+            <span class="avatar" role="listitem"><span role="option">头像</span></span>
+          </div>
+        </{row_tag}>
+        <{row_tag} class="row" role="{row_role}">
+          <span class="avatar" role="listitem">头像</span>
+        </{row_tag}>
+        {END}
+      </{list_tag}>
+    </aside>"""
+    async with fixture_page(content) as page:
+        snapshot = await page.evaluate(_SNAPSHOT_JS, {"operation": "read", "limit": 2})
+        assert [item["name"] for item in snapshot["rows"]] == ["真实好友", ""]
+        assert not snapshot["overflow"]
+        result = await scan(page, max_contacts=2)
+        assert result.status is SparkScanStatus.COMPLETE
+        assert result.scanned_count == 2
+        assert [contact.candidate.display_name for contact in result.contacts] == [
+            "真实好友",
+            "名称待确认",
+        ]
+        assert all(not contact.importable for contact in result.contacts)
+
+
+@pytest.mark.asyncio
+async def test_nested_list_items_do_not_hide_the_conversation_scroll_viewport() -> None:
+    content = html(
+        '<div id="viewport" style="height:100px;overflow-y:auto">'
+        + row("first", extra='<span role="listitem">头像</span>')
+        + row("second")
+        + END
+        + '</div><ul><li>非会话的嵌套列表项</li></ul>'
+    )
+    async with fixture_page(content) as page:
+        await page.locator("#viewport").evaluate("node => node.scrollTop = 40")
+        await page.evaluate(_SNAPSHOT_JS, {"operation": "reset", "limit": 10})
+        assert await page.locator("#viewport").evaluate("node => node.scrollTop") == 0
+        snapshot = await page.evaluate(_SNAPSHOT_JS, {"operation": "read", "limit": 10})
+        assert len(snapshot["rows"]) == 2
+        assert not snapshot["end"]
+        await page.evaluate(_SNAPSHOT_JS, {"operation": "scroll", "limit": 10})
+        assert await page.locator("#viewport").evaluate("node => node.scrollTop") > 0
+
+
+@pytest.mark.asyncio
 async def test_observed_class_list_is_scanned_without_synthetic_aria_or_data_roles() -> None:
     # Structure from the authorized metadata-only probe; all values are invented.
     content = """<style>
         .conversationConversationListwrapper {height:360px;width:350px;overflow:auto}
         .conversationConversationItemwrapper {height:80px}
         .commonStreakicon {width:20px;height:20px}
+        .semi-avatar {display:inline-block;width:30px;height:30px}
     </style><input placeholder="搜索好友">
     <div class="conversationConversationListwrapper">
       <div class="conversationConversationItemwrapper">
+        <span class="semi-avatar" role="listitem">头像</span>
         <div class="conversationConversationItemtitleWrapper">
           <div class="conversationConversationItemtitle"><span>待确认好友</span></div>
           <div class="ConversationItemTagNextToTitlewrapper">
@@ -411,16 +474,22 @@ async def test_observed_class_list_is_scanned_without_synthetic_aria_or_data_rol
         </div>
         <div class="ConversationItemDescwrapper"><pre class="ConversationItemHinttextBox">private-preview 🔥</pre></div>
       </div>
+      <div class="conversationConversationItemwrapper">
+        <span class="semi-avatar" role="listitem">头像</span>
+      </div>
     </div>"""
     async with fixture_page(content) as page:
         result = await scan(page)
         assert result.status is SparkScanStatus.PARTIAL
-        assert len(result.contacts) == 1
+        assert result.scanned_count == 2
+        assert len(result.contacts) == 2
         contact = result.contacts[0]
         assert contact.candidate.display_name == "待确认好友"
         assert contact.spark_state is SparkState.UNKNOWN
         assert not contact.importable
         assert "private-preview" not in repr(result)
+        assert result.contacts[1].candidate.display_name == "名称待确认"
+        assert not result.contacts[1].importable
 
 
 @pytest.mark.asyncio

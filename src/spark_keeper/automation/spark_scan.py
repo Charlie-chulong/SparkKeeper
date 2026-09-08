@@ -73,7 +73,11 @@ _SNAPSHOT_JS = r"""({operation, limit}) => {
         }
     }
     // Virtual lists can put their scroll viewport below the semantic list root.
-    const mountedRows = [...list.querySelectorAll(rowSelector)];
+    const mountedRows = [...list.querySelectorAll(rowSelector)].filter(row => {
+        // Avatar components can also expose listitem roles inside a real conversation row.
+        const parentRow = row.parentElement.closest(rowSelector);
+        return row.closest(listSelector) === list && (!parentRow || !list.contains(parentRow));
+    });
     const nestedScrollers = [...list.querySelectorAll('*')].filter(node =>
         visible(node) && node.scrollHeight > node.clientHeight
         && /(auto|scroll)/.test(getComputedStyle(node).overflowY)
@@ -93,8 +97,7 @@ _SNAPSHOT_JS = r"""({operation, limit}) => {
         return visible(element) && r.bottom > box.top && r.top < box.bottom
             && r.bottom > 0 && r.top < innerHeight;
     };
-    const rows = [...list.querySelectorAll(rowSelector)]
-        .filter(row => row.closest(listSelector) === list && inView(row));
+    const rows = mountedRows.filter(inView);
     const identityAttributes = ['data-uid', 'data-user-id', 'data-conversation-id'];
     const result = rows.slice(0, limit).map((row, index) => {
         // Names/identities must be in a dedicated header/name node, never the whole row.

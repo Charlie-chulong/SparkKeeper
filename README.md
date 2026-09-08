@@ -36,7 +36,7 @@
 | 账号与网络 | 本人完成扫码登录；网页操作需要能够正常访问抖音 |
 | 程序目录 | 当前用户可写的固定目录，避免需要管理员权限的位置 |
 
-1. 打开 [最新 Release](https://github.com/Charlie-chulong/SparkKeeper/releases/latest)，**推荐下载 `SparkKeeper-3.0.3-Setup.exe`**（以后选择对应新版的 `Setup.exe`），并取得同页 SHA-256 校验文件。**不要把 GitHub 的 `Source code` 压缩包当作 Windows 程序。**
+1. 打开 [最新 Release](https://github.com/Charlie-chulong/SparkKeeper/releases/latest)，**推荐下载 `SparkKeeper-3.0.4-Setup.exe`**（以后选择对应新版的 `Setup.exe`），并取得同页 SHA-256 校验文件。**不要把 GitHub 的 `Source code` 压缩包当作 Windows 程序。**
 2. 双击安装 EXE，按向导安装到当前用户目录；默认是 `%LOCALAPPDATA%\Programs\SparkKeeper`，不需要管理员权限。已有安装会识别原安装路径；不要另建带版本号的目录。
 3. 从安装目录运行 `SparkKeeper.exe`；如果在向导中勾选了快捷方式，也可从开始菜单或桌面启动。由本人完成扫码登录和可能出现的人工验证。
 4. 在“好友管理”中搜索确认好友，或先“扫描火花好友（不发送）”再预览导入。扫描导入的新好友默认停用，核对后再启用。
@@ -45,7 +45,7 @@
 
 原生“续火花”不是小表情“[续火花吧]”。界面中的预览图不代表已经发送。发送结果不确定也不代表未发送，请先人工核对，不要直接覆盖重发。
 
-**ZIP 备用方案：** 下载 `SparkKeeper-3.0.3-win64.zip`，完整解压，将包内 `SparkKeeper` 文件夹放到当前用户可写的固定目录，再运行其中的 `SparkKeeper.exe`。不要只复制 EXE，也不要直接把 ZIP 合并覆盖到安装器管理的目录。
+**ZIP 备用方案：** 下载 `SparkKeeper-3.0.4-win64.zip`，完整解压，将包内 `SparkKeeper` 文件夹放到当前用户可写的固定目录，再运行其中的 `SparkKeeper.exe`。不要只复制 EXE，也不要直接把 ZIP 合并覆盖到安装器管理的目录。
 
 安装包目前**没有代码签名**，Windows SmartScreen 可能提示“未知发布者”或阻止运行。先核对仓库、Release 版本及校验值；来源或告警有疑问时停止安装并反馈。SHA-256 只能检测文件变化，不能代替发布者签名。不要关闭杀毒软件、SmartScreen 或绕过组织安全策略。
 
@@ -144,7 +144,7 @@ python -m venv .venv
 
 先运行 `build_portable.py` 生成 `outputs/release/SparkKeeper` 和备用 ZIP，再运行 `build_installer.py` 包装同一程序目录；构建工具不会执行安装器。它自动查找 `Program Files`、`Program Files (x86)` 或 `%LOCALAPPDATA%\Programs` 下的 `Inno Setup 6\ISCC.exe`，也可用 `--iscc` 指定编译器完整路径；`--payload`、`--output-dir` 可指定程序目录和输出目录。
 
-默认输出 `outputs/release/SparkKeeper-3.0.2-Setup.exe`、`SparkKeeper-3.0.2-Setup.exe.sha256` 和本地构建凭据 `SparkKeeper-3.0.2-Setup.exe.build.json`。构建凭据绑定安装 EXE、安装脚本/安全辅助脚本和程序清单，发布预检需要保留它，但不上传到 Release；程序目录、版本或安装脚本变化后应重新构建。PE 产品/版本与 `asInvoker` 检查不是代码签名认证，也不替代实际安装验收。
+默认输出 `outputs/release/SparkKeeper-3.0.4-Setup.exe`、`SparkKeeper-3.0.4-Setup.exe.sha256` 和本地构建凭据 `SparkKeeper-3.0.4-Setup.exe.build.json`。构建凭据绑定安装 EXE、安装脚本/安全辅助脚本和程序清单，发布预检需要保留它，但不上传到 Release；程序目录、版本或安装脚本变化后应重新构建。PE 产品/版本与 `asInvoker` 检查不是代码签名认证，也不替代实际安装验收。
 
 测试和复现必须使用临时目录、合成数据，不访问真实登录态或触发真实发送。`--smoke` 使用临时数据检查当前构建的独立窗口，不用于正常单实例验收。
 

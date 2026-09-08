@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 
 import pytest
 
 import spark_keeper.worker as worker_module
+from spark_keeper import maintenance
 from spark_keeper.database import Database
 from spark_keeper.models import AttemptStatus, BatchMode, BatchResult, BatchStatus, TargetResult
 from spark_keeper.mutex import WindowsTaskMutex
 from spark_keeper.notifications import notify_batch
 from spark_keeper.paths import AppPaths
 from spark_keeper.worker import main
+
+
+@pytest.fixture(autouse=True)
+def isolated_maintenance_gate(tmp_path, monkeypatch):
+    name = rf"Global\SparkKeeper.Maintenance.Test.{uuid.uuid4().hex}"
+    monkeypatch.setattr(maintenance, "maintenance_mutex_name", lambda: name)
+    monkeypatch.setenv("SPARK_KEEPER_ROOT", str(tmp_path))
 
 
 def test_batch_notification_contains_counts_not_private_content(monkeypatch) -> None:

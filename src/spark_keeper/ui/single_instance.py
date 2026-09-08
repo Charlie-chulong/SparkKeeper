@@ -12,6 +12,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QWidget
 
 from ..mutex import AlreadyRunningError, WindowsTaskMutex
+from ..windows_identity import current_user_sid
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,49 +26,9 @@ def current_instance_names() -> InstanceNames:
     if os.name != "nt":
         raise RuntimeError("界面单实例仅支持 Windows")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-    kernel32.LocalFree.restype = wintypes.HLOCAL
+    user_sid = current_user_sid()
     kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
     kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [
-        wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)
-    ]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    token = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        length = wintypes.DWORD()
-        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(length))
-        if not length.value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        buffer = ctypes.create_string_buffer(length.value)
-        if not advapi32.GetTokenInformation(token, 1, buffer, length, ctypes.byref(length)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        # TOKEN_USER begins with SID_AND_ATTRIBUTES, whose first member is PSID.
-        sid = ctypes.cast(buffer, ctypes.POINTER(wintypes.LPVOID))[0]
-        sid_text = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            user_sid = sid_text.value
-        finally:
-            kernel32.LocalFree(ctypes.cast(sid_text, wintypes.HLOCAL))
-    finally:
-        kernel32.CloseHandle(token)
     session = wintypes.DWORD()
     if not kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
         raise ctypes.WinError(ctypes.get_last_error())

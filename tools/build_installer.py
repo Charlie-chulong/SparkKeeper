@@ -206,7 +206,7 @@ def receipt_path(installer: Path) -> Path:
 def installer_inputs(root: Path) -> dict[str, str]:
     return {name: sha256_file(root / "tools" / name)
             for name in ("installer.iss", "installer_guard.ps1", "update.ps1",
-                         "installer/ChineseSimplified.isl", "installer/LICENSE.txt")}
+                         "installer/ChineseSimplified.isl", "installer/LICENSE.txt", "maintenance_tasks.ps1")}
 
 
 def validate_installer(installer: Path, version: str, manifest_digest: str, *, root: Path = ROOT) -> Path:

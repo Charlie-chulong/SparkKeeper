@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         command = ["gh", "release", "create", tag, str(installer), str(installer_checksum),
                    str(archive), str(checksum), *map(str, source_assets), "--repo", repo,
                    "--verify-tag", "--draft", "--title", f"SparkKeeper {public_version}",
-                   "--notes", "人工预发布草稿：请核对安装/升级与便携说明、SHA256、用户数据保留策略后，在 GitHub 手动发布。"]
+                   "--notes", "人工预发布草稿：请核对安装/升级与便携说明、SHA256、卸载数据清理策略后，在 GitHub 手动发布。"]
         if "rc" in version:
             command.append("--prerelease")
         print(f"本地预检通过：{repo} {tag} HEAD={head}\n{shlex.join(command)}")

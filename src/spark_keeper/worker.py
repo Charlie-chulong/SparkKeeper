@@ -9,13 +9,56 @@ from .automation.service import BatchService
 from .database import Database
 from .dpapi import DpapiJsonStore
 from .logging_safe import format_error
+from .maintenance import (
+    MaintenanceBusy,
+    MaintenanceLease,
+    MaintenanceRequired,
+    assert_maintenance_clear,
+)
 from .models import BatchMode, BatchStatus, ErrorCode
 from .notifications import notify_batch
 from .paths import AppPaths
 from .scheduler import scheduled_datetime
 
+_MAINTENANCE_WAIT_SECONDS = 5.0
+
+
+async def _acquire_maintenance_lease(lease: MaintenanceLease) -> None:
+    # Restoring Enabled may trigger this worker just before the installer releases
+    # its gate. Wait briefly for that handoff, never retry the batch itself.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _MAINTENANCE_WAIT_SECONDS
+    while True:
+        try:
+            lease.acquire()
+            return
+        except MaintenanceBusy:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise
+        await asyncio.sleep(min(0.1, remaining))
+
 
 async def run_scheduled() -> int:
+    try:
+        lease = MaintenanceLease()
+        await _acquire_maintenance_lease(lease)
+    except Exception as exc:  # noqa: BLE001
+        print(f"定时任务启动失败，未执行发送：{format_error(exc)}", file=sys.stderr)
+        return 2
+    try:
+        try:
+            assert_maintenance_clear()
+        except MaintenanceRequired as exc:
+            print(f"定时任务启动失败，未执行发送：{format_error(exc)}", file=sys.stderr)
+            return 2
+        return await _run_scheduled_under_maintenance()
+    finally:
+        # Keep the gate through recovery, batch finalization, notification and error logging.
+        lease.release()
+
+
+async def _run_scheduled_under_maintenance() -> int:
     try:
         paths = AppPaths.discover()
         paths.ensure_runtime_dirs()

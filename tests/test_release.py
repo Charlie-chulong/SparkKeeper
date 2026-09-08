@@ -54,7 +54,7 @@ def release_bundle(tmp_path, monkeypatch):
     tools.mkdir()
     (tools / "update.cmd").write_bytes(b"@echo off\r\n")
     (tools / "update.ps1").write_bytes(b"Write-Output fixture\r\n")
-    for name in ("installer.iss", "installer_guard.ps1"):
+    for name in ("installer.iss", "installer_guard.ps1", "maintenance_tasks.ps1"):
         (tools / name).write_text("isolated installer source fixture", "utf-8")
     (tools / "installer").mkdir()
     (tools / "installer" / "ChineseSimplified.isl").write_text("isolated language fixture", "utf-8")
@@ -366,7 +366,7 @@ def test_compiler_standard_user_location_and_explicit_override(tmp_path, monkeyp
     assert installer_build["find_iscc"](other) == other.resolve()
 
 
-@pytest.mark.parametrize("change", ["missing", "hash", "receipt", "payload", "script", "guard", "updater", "language", "language_license", "version", "privileges", "product"])
+@pytest.mark.parametrize("change", ["missing", "hash", "receipt", "payload", "script", "guard", "updater", "language", "language_license", "maintenance_helper", "version", "privileges", "product"])
 def test_publish_rejects_invalid_installer(release_bundle, monkeypatch, change):
     root, program, _ = release_bundle
     installer = root / "SparkKeeper-3.0.0-Setup.exe"
@@ -379,9 +379,10 @@ def test_publish_rejects_invalid_installer(release_bundle, monkeypatch, change):
         installer_build["receipt_path"](installer).unlink()
     elif change == "payload":
         manifest_digest = "0" * 64
-    elif change in {"script", "guard", "updater", "language", "language_license"}:
+    elif change in {"script", "guard", "updater", "language", "language_license", "maintenance_helper"}:
         name = {"script": "installer.iss", "guard": "installer_guard.ps1", "updater": "update.ps1",
-                "language": "installer/ChineseSimplified.isl", "language_license": "installer/LICENSE.txt"}[change]
+                "language": "installer/ChineseSimplified.isl", "language_license": "installer/LICENSE.txt",
+                "maintenance_helper": "maintenance_tasks.ps1"}[change]
         (root / "tools" / name).write_bytes(b"changed source")
     else:
         metadata = setup_metadata()

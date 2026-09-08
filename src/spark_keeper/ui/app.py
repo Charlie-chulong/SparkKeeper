@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import threading
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -42,6 +43,7 @@ from ..automation.service import BatchService
 from ..database import Database, today_iso
 from ..dpapi import DpapiJsonStore
 from ..logging_safe import format_error
+from ..maintenance import MaintenanceLease, assert_maintenance_clear
 from ..models import (
     BatchMode,
     BatchResult,
@@ -1742,7 +1744,10 @@ def run(*, smoke_mode: bool = False) -> int:
             guard = GuiSingleInstance()
             if not guard.start_or_activate():
                 return 0
-        window = SparkKeeperApp(smoke_mode=smoke_mode)
+        # Smoke uses only its temporary root, independently of production maintenance.
+        with nullcontext() if smoke_mode else MaintenanceLease():
+            assert_maintenance_clear()
+            window = SparkKeeperApp(smoke_mode=smoke_mode)
         window.show()
         if guard is not None:
             guard.set_activate_callback(window.activate_existing_window)

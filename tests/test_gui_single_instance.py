@@ -11,6 +11,7 @@ import pytest
 from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtWidgets import QDialog, QWidget
 
+from spark_keeper import maintenance
 from spark_keeper.ui import app as app_module
 from spark_keeper.ui.single_instance import (
     GuiSingleInstance,
@@ -20,6 +21,13 @@ from spark_keeper.ui.single_instance import (
 )
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows named mutex and local pipe")
+
+
+@pytest.fixture(autouse=True)
+def isolated_maintenance_gate(tmp_path, monkeypatch):
+    name = rf"Global\SparkKeeper.Maintenance.Test.{uuid.uuid4().hex}"
+    monkeypatch.setattr(maintenance, "maintenance_mutex_name", lambda: name)
+    monkeypatch.setenv("SPARK_KEEPER_ROOT", str(tmp_path))
 
 
 def unique_names():

@@ -3,3 +3,4 @@
 *.png -text
 *.ico -text
 third_party/** -text
+tools/installer/** -text

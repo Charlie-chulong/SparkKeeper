@@ -11,8 +11,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from PySide6.QtCore import QSignalBlocker, Qt, QTimer
-from PySide6.QtGui import QCloseEvent, QColor, QPalette, QPixmap
+from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTimer
+from PySide6.QtGui import QCloseEvent, QColor, QPalette, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -56,6 +57,41 @@ from ..scheduler import SchedulerError, TaskScheduler, detect_missed_schedule
 from . import theme
 from .single_instance import GuiSingleInstance, activate_window
 from .spark_preview import SparkImportPreview
+
+
+class _ProgramDirectoryLabel(QLabel):
+    """Keep the footer path on one line without using its text as a layout constraint."""
+
+    def __init__(self, directory: Path) -> None:
+        self._full_text = f"程序目录：{directory}"
+        super().__init__(self._full_text)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.setToolTip(str(directory))
+        self.setMaximumWidth(440)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(self.fontMetrics().horizontalAdvance("程序目录：…"))
+        self._update_elision()
+
+    def _update_elision(self) -> None:
+        metrics = self.fontMetrics()
+        text = metrics.elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, self.contentsRect().width()
+        )
+        if text != self.text():
+            self.setText(text)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self._update_elision()
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange:
+            self.setMinimumWidth(self.fontMetrics().horizontalAdvance("程序目录：…"))
+            self._update_elision()
 
 
 class SparkKeeperApp(QMainWindow):
@@ -243,10 +279,8 @@ class SparkKeeperApp(QMainWindow):
             if getattr(sys, "frozen", False)
             else Path(__file__).resolve().parents[3]
         )
-        self.program_path_label = self._label(layout, f"程序目录：{program_directory}")
-        self.program_path_label.setMaximumWidth(440)
-        self.program_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.program_path_label.setToolTip(str(program_directory))
+        self.program_path_label = _ProgramDirectoryLabel(program_directory)
+        layout.addWidget(self.program_path_label, 1)
         self.pending_label = self._label(layout, "")
         self.pending_label.setProperty("role", "warning")
         self.status_progress = QProgressBar()

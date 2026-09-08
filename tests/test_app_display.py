@@ -546,6 +546,84 @@ def test_visible_version_and_program_directory_do_not_follow_data_override(app):
     assert str(app.paths.root) not in app.program_path_label.text()
 
 
+@pytest.fixture
+def app_with_long_program_directory(tmp_path, monkeypatch, request):
+    directory = tmp_path / ("很长的中文 程序安装目录 " * 6) / "续火花助手"
+    monkeypatch.setattr(app_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(app_module.sys, "executable", str(directory / "SparkKeeper.exe"))
+    return request.getfixturevalue("app"), directory
+
+
+@pytest.mark.parametrize("working", [False, True])
+def test_program_directory_stays_on_one_line_through_window_resizes(
+    app_with_long_program_directory, working
+):
+    app, directory = app_with_long_program_directory
+    label = app.program_path_label
+    full_text = f"程序目录：{directory}"
+    app.status_label.setText("正在执行测试任务" if working else "就绪")
+    app.pending_label.setText("等待确认" if working else "")
+    app.status_progress.setVisible(working)
+    app.cancel_button.setEnabled(working)
+    show_app(app)
+    displayed = []
+    for size in ((940, 650), (1120, 780), None, (940, 650)):
+        if size is None:
+            app.showMaximized()
+        else:
+            app.showNormal()
+            app.resize(*size)
+        QApplication.processEvents()
+        if size is not None:
+            assert (app.width(), app.height()) == size
+        assert (app.minimumWidth(), app.minimumHeight()) == (940, 650)
+        assert not label.wordWrap()
+        assert not label.hasHeightForWidth()
+        assert label.textFormat() == Qt.TextFormat.PlainText
+        assert label.toolTip() == str(directory)
+        assert label.text().startswith("程序目录：")
+        assert label.text().endswith("…")
+        assert label.text() == label.fontMetrics().elidedText(
+            full_text, Qt.TextElideMode.ElideRight, label.contentsRect().width()
+        )
+        assert label.fontMetrics().horizontalAdvance(label.text()) <= label.contentsRect().width()
+        assert label.sizeHint().height() <= label.height()
+        for other in (app.status_label, app.pending_label, app.status_progress, app.cancel_button):
+            if other.isVisible():
+                assert not label.geometry().intersects(other.geometry())
+                assert other.parentWidget().rect().contains(other.geometry())
+        assert app.cancel_button.width() >= app.cancel_button.sizeHint().width()
+        assert app.status_label.width() >= app.status_label.sizeHint().width()
+        assert app.pending_label.width() >= app.pending_label.sizeHint().width()
+        displayed.append(label.text())
+    assert displayed[0] == displayed[-1]
+    assert len(displayed[1]) > len(displayed[0])
+
+
+def test_program_directory_reappears_in_full_when_space_becomes_available(qapp, tmp_path):
+    directory = app_module.Path(tmp_path.anchor) / "中文 空格目录"
+    label = app_module._ProgramDirectoryLabel(directory)
+    try:
+        label.resize(label.minimumWidth(), 40)
+        label.show()
+        qapp.processEvents()
+        assert label.text().endswith("…")
+        label.resize(440, 40)
+        qapp.processEvents()
+        assert label.text() == f"程序目录：{directory}"
+        font = label.font()
+        font.setPointSize(font.pointSize() + 2)
+        label.setFont(font)
+        qapp.processEvents()
+        assert label.minimumWidth() == label.fontMetrics().horizontalAdvance("程序目录：…")
+        assert label.text() == f"程序目录：{directory}"
+        assert label.toolTip() == str(directory)
+    finally:
+        label.close()
+        label.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize(
     ("callback", "args"),
     [

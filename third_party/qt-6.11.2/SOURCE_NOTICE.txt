@@ -1,0 +1,16 @@
+Qt / Qt for Python 6.11.2 - source and license materials
+
+Scope
+This directory preserves original license texts, copyright notices, qt_attribution.json files and supporting license context from the official QtBase and PySide/Shiboken 6.11.2 source archives. It deliberately covers all QtBase and PySide source attribution entries, including build tools, examples and non-Windows platforms. Inclusion here does not assert that every listed component is linked into the Windows application. The intended application runtime scope is QtBase Core/Gui/Widgets and PySide/Shiboken; separate Qt SVG, Qt Image Formats and Qt PDF/PDFium modules are not covered.
+
+LGPL and commercial alternatives
+LGPL-3.0-only.txt and GPL-3.0-only.txt contain the complete, unchanged upstream texts. GPLv3 is included because LGPLv3 supplements GPLv3. Upstream LicenseRef-Qt-Commercial.txt files are preserved as source material describing a distinct commercial option; they are not LGPL licenses and do not grant this distributor or the recipient a commercial Qt license. Individual third-party components retain their own licenses. This collection does not relicense those components or the application.
+
+How to read the materials
+THIRD_PARTY_ATTRIBUTIONS.txt is a readable index reproducing all upstream attribution fields, with paths to complete license/copyright files. Original qt_attribution.json files are preserved unmodified. All extracted original file contents are byte-for-byte unchanged. Original .md filenames gain a .txt suffix to avoid creating Markdown files; manifest.json records this filename-only change, original archive member paths, destination paths, sizes and SHA256 hashes. Relative LicenseFile references inside unchanged upstream JSON remain source-relative; consult the index/manifest where a filename was renamed.
+
+Python 3.7.0 / PSF
+Both upstream Python 3.7 attribution entries, the complete PSF-3.7.0.txt agreement, bufferprocs_py37.h (with its full PSF agreement), bufferprocs_py37.cpp and the signature package source files are preserved. These retain the Python Software Foundation 2001-2018 copyright, Qt's copied/adapted-code descriptions and original adaptation context. In particular, bufferprocs_py37.cpp identifies its copy from abstract.c, the Py_buffer-to-Pep_buffer replacement and omitted functions.
+
+Corresponding upstream sources
+The unmodified official archives are retained separately in qt-sources-6.11.2 next to the application's release artifacts, together with manifest.json and SHA256SUMS.txt. Distribute that directory through the same release channel as the binary and maintain recipients' access to it; do not distribute only this license directory and assume it supplies source. manifest.json records both official source URLs and official checksum URLs. These are upstream source archives, not a claim that all application packaging/build inputs are contained in them. No application account data is included.

@@ -1,0 +1,49 @@
+Third-party components used by the Windows preview version:
+
+Playwright for Python
+License: Apache License 2.0
+Source: https://github.com/microsoft/playwright-python
+
+Windows-Toasts
+License: Apache License 2.0
+Source: https://github.com/DatGuy1/Windows-Toasts
+
+PyInstaller
+License: GPL-2.0-or-later with the PyInstaller Bootloader Exception
+Source: https://github.com/pyinstaller/pyinstaller
+
+Runtime Python standard-library components remain subject to the Python Software Foundation License.
+
+PySide6-Essentials, shiboken6, and Qt Core/Gui/Widgets 6.11.2
+Distribution license chosen for these libraries: GNU Lesser General Public License v3 (LGPL-3.0-only).
+Full LGPL v3, GPL v3, upstream copyright notices, third-party notices and source provenance:
+  licenses/Qt/
+The attribution bundle conservatively includes upstream QtBase platform/module notices;
+this does not mean every listed optional component is present in this Windows application.
+Unused image-format/icon-engine plugins and QtPdf/QtSvg modules are not distributed.
+
+Corresponding unmodified upstream sources (version 6.11.2):
+  https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz
+  https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.2-src/pyside-setup-everywhere-src-6.11.2.tar.xz
+Source archives are also retained beside this release in qt-sources-6.11.2, with SHA-256 provenance.
+Upstream repositories: https://code.qt.io/cgit/qt/qtbase.git/
+                       https://code.qt.io/cgit/pyside/pyside-setup.git/
+
+Qt and its Python bindings remain separate dynamic DLL/.pyd files under _internal.
+With the program closed, users may replace these files with interface/ABI-compatible modified
+versions (matching Windows architecture and Python binding ABI); no signature/hash restriction
+is imposed at runtime. Retain the compatible Qt platform plugin and dependent libraries.
+This application imposes no prohibition on reverse engineering for debugging modifications
+to these LGPL-covered libraries. Library notices do not change the licenses of other components.
+
+The following Douyin automation repositories were reviewed as behavioral references:
+
+- DouYinSparkFlow, MIT: https://github.com/2061360308/DouYinSparkFlow
+- douyin-sparkflow, PolyForm Noncommercial 1.0.0:
+  https://github.com/halfwaystudent/douyin-sparkflow
+- douyin-auto-fire, PolyForm Noncommercial 1.0.0:
+  https://github.com/unmev/douyin-auto-fire
+
+No source code, selector collection, assets, templates, or configuration formats from those
+repositories are included. The unsupported-group rejection was independently hardened after
+reviewing how current Douyin chat titles can expose a numeric member-count suffix.

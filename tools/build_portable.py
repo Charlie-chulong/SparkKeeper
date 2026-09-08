@@ -1,0 +1,342 @@
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+from importlib.metadata import distribution
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV = ROOT / ".venv"
+PYTHON = VENV / "Scripts" / "python.exe"
+PLAYWRIGHT = VENV / "Scripts" / "playwright.exe"
+LOCAL_BROWSERS = (
+    VENV / "Lib" / "site-packages" / "playwright" / "driver" / "package" / ".local-browsers"
+)
+
+
+def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
+    completed = subprocess.run(command, cwd=ROOT, env=env, check=False)
+    if completed.returncode:
+        raise SystemExit(completed.returncode)
+
+
+def validate_version(version: str) -> str:
+    """Accept canonical PEP 440 final/rc releases, never development builds."""
+    if not re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:rc([1-9]\d*))?", version):
+        raise ValueError(f"发行版本须为规范的 X.Y.Z 或 X.Y.ZrcN（N>=1）：{version!r}")
+    return version
+
+
+def release_version(version: str) -> str:
+    """Derive public ZIP/tag spelling from the sole PEP 440 version source."""
+    return validate_version(version).replace("rc", "-rc.")
+
+
+def project_version(root: Path = ROOT) -> str:
+    tree = ast.parse((root / "src" / "spark_keeper" / "__init__.py").read_text("utf-8"))
+    values = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+    ]
+    if len(values) != 1 or not isinstance(values[0], ast.Constant) or not isinstance(values[0].value, str):
+        raise ValueError("__version__ 必须是唯一的字符串常量")
+    return validate_version(values[0].value)
+
+
+def sha256_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def is_sensitive_path(name: str) -> bool:
+    parts = name.replace("\\", "/").casefold().split("/")
+    filename = parts[-1]
+    return (
+        bool(set(parts) & {"local-data", "outputs", "backups", ".links", "__dirlock", ".venv"})
+        or filename in {"auth-state.bin", "spark-keeper-task.xml", ".env"}
+        or filename.startswith(".env.")
+        or filename.endswith((".sqlite", ".sqlite3", ".db", ".sqlite3-wal", ".sqlite3-shm"))
+    )
+
+
+def write_release_manifest(release_directory: Path, version: str) -> Path:
+    reject_sensitive_files(release_directory)
+    files = {
+        path.relative_to(release_directory).as_posix(): sha256_file(path)
+        for path in sorted(release_directory.rglob("*"))
+        if path.is_file() and path != release_directory / "release-manifest.json"
+    }
+    destination = release_directory / "release-manifest.json"
+    destination.write_text(
+        json.dumps(
+            {"format": 1, "product": "SparkKeeper", "version": validate_version(version), "files": files},
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
+def write_user_guide(destination: Path, version: str) -> None:
+    destination.write_text(
+        f"""续火花助手 Windows 本地自用版 {version}
+
+使用前提
+1. 仅操作本人账号，并只向明确同意接收测试消息的好友发送。
+2. 软件通过正常抖音网页操作，不绕过验证码、安全验证或平台风控。
+3. 本地自用版未进行代码签名，Windows SmartScreen 可能显示未知发布者提示。
+
+开始使用
+1. 将整个文件夹解压到固定位置，例如 D:\\SparkKeeper；不要直接在压缩包内运行。
+2. 双击 SparkKeeper.exe。
+3. 点击“扫码登录”，由本人完成扫码和可能出现的安全验证。
+4. 逐个添加好友，或在“好友管理”点击“扫描火花好友（不发送）”，预览并勾选后导入。
+5. 选择文本或“续火花（原生表情）”，设置每日时间与好友间随机等待范围，确认完整预览后再启用每日计划。
+
+重要说明
+- 原生“续火花”与文本互斥发送，不是同名文字或小表情“[续火花吧]”。预览图不是发送结果；请先“验证配置（不发送）”检查网页表情可用性。
+- 原生表情点击即发送，程序只触发一次；表情缺失或身份无法确认时拒绝发送，不自动退回文本。切换内容类型仍受同一天防重复限制；补跑使用原计划快照。
+- 软件不设固定好友数量上限；每批按顺序处理启用好友，停用好友不参与发送。
+- 已保存好友点击任意列选中整行，支持 Ctrl/Shift 多选；“全选”在全部选中后变为“取消选择”。选择后从“操作”菜单启用、停用或删除所选；菜单仅显示适用动作，部分选择时也可从菜单取消选择。选择本身不启用或发送。
+- 删除所选会先显示人数和名单供确认；有历史的好友仅停用并保留记录，其余删除，批量操作失败整组回滚。
+- 火花扫描只读当前网页可加载的聊天列表，导入仅要求可靠单聊身份，不以火花状态限制人工选择。
+- 扫描中断或没有明确末端证据时显示部分结果，不保证覆盖全部联系人；可以取消扫描。
+- 批量导入不发送消息，新好友默认停用，已有好友保持原状态；请核对并只启用获授权好友，再验证配置。
+- 默认勾选身份可靠的新有效火花（含GRAY）和RECOVER好友；待恢复仍可独立筛选。扫描后可任意勾选或取消，新增好友仍停用。
+- 账号或登录状态变化后必须重新扫描；选中群聊或身份未确认/冲突对象时会明确阻止导入，不会悄悄跳过。
+- 升级前先在旧版停用每日计划，等待所有任务完成并正常退出全部程序和浏览器；不要强杀进程。
+- 新版 ZIP 解压到旧程序目录之外，双击包根目录“更新.cmd”并选择原安装目录；更新按整目录替换，不要逐文件覆盖，也不要只替换 EXE。
+- 更新器验证文件 SHA256，保留旧程序旁路备份；不会修改计划、强杀进程或自动回滚数据库。校验值只能防损坏，不能代替可信下载来源。
+- 首次从 dev18 迁移须明确确认旧目录；更新后先核对版本、好友和配置，再人工重新启用并保存计划。已迁移数据库不得直接用旧程序/旧快照覆盖回退。
+- 设置了 SPARK_KEEPER_ROOT 时拒绝自动更新；正式用户数据默认外置于 AppData，不放在程序目录。
+- 默认在两次实际发送尝试之间随机等待 3–8 秒，可在任务台设置 0–120 秒；0–0 表示关闭。
+- 随机等待只能降低连续发送频率，不能保证避免平台限制或封禁。
+- 事件按用户要求保留真实对象、完整错误、原因链和调用栈，不再脱敏；请在“运行日志”的完整原文区域查看并妥善保管。
+- 登录态和数据库只保存在当前 Windows 用户的 %LOCALAPPDATA%\\SparkKeeper 中，登录态使用 DPAPI 保护。
+- 压缩包不包含制作者的账号、好友、消息、数据库、登录态或任务 XML。
+- 界面使用 PySide6 / Qt Widgets；相关开源许可与来源见 licenses\\Qt 和 THIRD_PARTY_NOTICES.txt。
+- 启用每日计划后不要移动或重命名解压文件夹；如需移动，先在软件中停用计划，移动后再启用。
+- 发送触发后不会自动重试；无法确认的结果会记录为 unknown，并阻止当天自动重发。
+- 好友查找只在首轮搜索结果为空时重新提交同一查询一次；身份核验仍严格，这不是发送重试。
+- 同一天重复发送默认拦截，只有桌面程序中的人工二次确认才能覆盖。
+- 若断网、登录失效或出现安全验证，定时任务会停止且不会继续发送。
+
+卸载
+1. 先打开软件并停用每日计划，确保 Windows 计划任务被移除。
+2. 删除解压目录。
+3. 如需同时清除登录态和历史，再删除 %LOCALAPPDATA%\\SparkKeeper。
+
+本版本仅供本人小规模测试，不提供平台风控绕过或批量营销能力。
+""",
+        encoding="utf-8-sig",
+    )
+
+
+def distribution_license(distribution_name: str, suffix: str) -> Path:
+    package = distribution(distribution_name)
+    normalized_suffix = suffix.replace("\\", "/").casefold()
+    matches = [
+        file
+        for file in package.files or ()
+        if str(file).replace("\\", "/").casefold().endswith(normalized_suffix)
+    ]
+    if len(matches) != 1:
+        raise FileNotFoundError(f"{distribution_name} 许可文件匹配数量异常：{len(matches)}")
+    return Path(package.locate_file(matches[0]))
+
+
+def copy_licenses(destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    sources = {
+        "Python-LICENSE.txt": Path(sys.base_prefix) / "LICENSE.txt",
+        "Playwright-LICENSE.txt": (
+            VENV / "Lib" / "site-packages" / "playwright" / "driver" / "LICENSE"
+        ),
+        "Windows-Toasts-LICENSE.txt": distribution_license(
+            "Windows-Toasts",
+            "licenses/LICENSE",
+        ),
+        "PyInstaller-COPYING.txt": distribution_license(
+            "pyinstaller",
+            "licenses/COPYING.txt",
+        ),
+    }
+    for name, source in sources.items():
+        if not source.is_file():
+            raise FileNotFoundError(f"缺少许可文件：{source}")
+        shutil.copy2(source, destination / name)
+    copy_qt_licenses(destination)
+
+
+def copy_qt_licenses(destination: Path) -> None:
+    qt_version = distribution("PySide6-Essentials").version
+    source = ROOT / "third_party" / f"qt-{qt_version}"
+    for filename in ("LGPL-3.0-only.txt", "GPL-3.0-only.txt", "manifest.json"):
+        if not (source / filename).is_file():
+            raise FileNotFoundError(f"缺少 Qt {qt_version} 许可资料：{filename}")
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("version") != qt_version:
+        raise RuntimeError("Qt 许可资料版本与已安装运行库不一致")
+    shutil.copytree(source, destination / "Qt")
+
+
+def trim_unused_qt_plugins(release_directory: Path) -> None:
+    """The UI uses QtGui's built-in PNG decoder, not external image/SVG/PDF plugins."""
+    internal = release_directory / "_internal"
+    qt = internal / "PySide6"
+    if not (qt / "plugins" / "platforms" / "qwindows.dll").is_file():
+        raise RuntimeError("发行目录缺少 Qt Windows 平台插件")
+    for name in ("imageformats", "iconengines"):
+        path = qt / "plugins" / name
+        if path.exists():
+            shutil.rmtree(path)
+    for pattern in ("Qt6Pdf*.dll", "Qt6Svg*.dll"):
+        for path in internal.rglob(pattern):
+            path.unlink()
+
+
+def reject_sensitive_files(release_directory: Path) -> None:
+    violations = []
+    for path in release_directory.rglob("*"):
+        if path.is_symlink() or path.is_junction():
+            raise RuntimeError(f"发行目录含链接或重解析目录：{path}")
+        if path.is_file() and is_sensitive_path(path.relative_to(release_directory).as_posix()):
+            violations.append(path)
+    if violations:
+        rendered = ", ".join(str(path.relative_to(release_directory)) for path in violations)
+        raise RuntimeError(f"发行目录含运行数据：{rendered}")
+
+
+def create_zip(release_directory: Path, archive: Path, *, updater_directory: Path = ROOT / "tools") -> None:
+    updater_files = {"更新.cmd": updater_directory / "update.cmd", "update.ps1": updater_directory / "update.ps1"}
+    for source in updater_files.values():
+        if not source.is_file():
+            raise FileNotFoundError(f"缺少离线更新器：{source}")
+    reject_sensitive_files(release_directory)
+    if archive.exists():
+        archive.unlink()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
+        for path in sorted(release_directory.rglob("*")):
+            if path.is_file():
+                output.write(path, "SparkKeeper/" + path.relative_to(release_directory).as_posix())
+        for name, source in updater_files.items():
+            output.write(source, name)
+
+
+def main() -> None:
+    version = project_version()
+    if not PYTHON.is_file() or not PLAYWRIGHT.is_file():
+        raise RuntimeError("缺少项目虚拟环境，请先安装开发依赖")
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+    run([str(PLAYWRIGHT), "install", "chromium"], env=env)
+    if not LOCAL_BROWSERS.is_dir():
+        raise RuntimeError("Playwright 本地 Chromium 未安装")
+
+    release_root = ROOT / "outputs" / "release"
+    build_root = ROOT / "work" / "pyinstaller"
+    pyinstaller_dist = build_root / "dist"
+    pyinstaller_work = build_root / "build"
+    release_name = f"SparkKeeper-{release_version(version)}-win64"
+    release_directory = release_root / "SparkKeeper"
+    archive = release_root / f"{release_name}.zip"
+
+    shutil.rmtree(build_root, ignore_errors=True)
+    shutil.rmtree(release_directory, ignore_errors=True)
+    release_root.mkdir(parents=True, exist_ok=True)
+    archive.unlink(missing_ok=True)
+    archive.with_suffix(archive.suffix + ".sha256").unlink(missing_ok=True)
+    build_root.mkdir(parents=True, exist_ok=True)
+
+    run(
+        [
+            str(PYTHON),
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--windowed",
+            "--onedir",
+            "--name",
+            "SparkKeeper",
+            "--icon",
+            str(ROOT / "src" / "spark_keeper" / "assets" / "app-icon.ico"),
+            "--paths",
+            str(ROOT / "src"),
+            "--add-data",
+            f"{ROOT / 'src' / 'spark_keeper' / 'assets'}{os.pathsep}spark_keeper/assets",
+            "--distpath",
+            str(pyinstaller_dist),
+            "--workpath",
+            str(pyinstaller_work),
+            "--specpath",
+            str(build_root),
+            "--collect-all",
+            "playwright",
+            "--collect-all",
+            "windows_toasts",
+            "--exclude-module",
+            "pytest",
+            "--exclude-module",
+            "ruff",
+            "--exclude-module",
+            "tkinter",
+            "--exclude-module",
+            "PySide6.QtPdf",
+            "--exclude-module",
+            "PySide6.QtPdfWidgets",
+            "--exclude-module",
+            "PySide6.QtSvg",
+            "--exclude-module",
+            "PySide6.QtSvgWidgets",
+            "--exclude-module",
+            "PySide6.QtTest",
+            str(ROOT / "tools" / "portable_entry.py"),
+        ],
+        env=env,
+    )
+
+    built_directory = pyinstaller_dist / "SparkKeeper"
+    if not (built_directory / "SparkKeeper.exe").is_file():
+        raise RuntimeError("PyInstaller 未生成 SparkKeeper.exe")
+    bundled_browser_source = (
+        built_directory / "_internal" / "playwright" / "driver" / "package" / ".local-browsers"
+    )
+    if not bundled_browser_source.is_dir():
+        raise RuntimeError("PyInstaller 产物缺少 Playwright Chromium")
+    bundled_browser_destination = built_directory / "browsers"
+    shutil.move(str(bundled_browser_source), bundled_browser_destination)
+    shutil.rmtree(bundled_browser_destination / ".links", ignore_errors=True)
+    shutil.rmtree(bundled_browser_destination / "__dirlock", ignore_errors=True)
+    shutil.move(str(built_directory), release_directory)
+    trim_unused_qt_plugins(release_directory)
+    shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.txt", release_directory)
+    copy_licenses(release_directory / "licenses")
+    write_user_guide(release_directory / "使用说明.txt", version)
+    reject_sensitive_files(release_directory)
+    write_release_manifest(release_directory, version)
+    create_zip(release_directory, archive)
+
+    digest = sha256_file(archive)
+    archive.with_suffix(archive.suffix + ".sha256").write_text(
+        f"{digest}  {archive.name}\n",
+        encoding="ascii",
+    )
+    shutil.rmtree(build_root, ignore_errors=True)
+    print(release_directory)
+    print(archive)
+    print(digest)
+
+
+if __name__ == "__main__":
+    main()

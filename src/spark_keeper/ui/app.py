@@ -20,7 +20,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -42,7 +44,17 @@ from .. import APP_NAME, __version__
 from ..automation.errors import AutomationError
 from ..automation.service import BatchService
 from ..database import Database, today_iso
+from ..display_labels import (
+    category_label,
+    error_label,
+    event_summary,
+    level_label,
+    mode_label,
+    status_label,
+    target_label,
+)
 from ..dpapi import DpapiJsonStore
+from ..identity import identities_match, identity_key
 from ..logging_safe import format_error
 from ..maintenance import MaintenanceLease, assert_maintenance_clear
 from ..models import (
@@ -55,12 +67,18 @@ from ..models import (
     SparkScanResult,
     SparkScanStatus,
     Target,
+    ThemeMode,
 )
 from ..paths import AppPaths
 from ..scheduler import SchedulerError, TaskScheduler, detect_missed_schedule
 from . import theme
 from .single_instance import GuiSingleInstance, activate_window
 from .spark_preview import SparkImportPreview
+
+_UNCONFIRMED_CANDIDATE_MESSAGE = (
+    "所选候选尚无可靠的好友主页或可信单聊身份，不能确认保存。"
+    "\n请打开正确聊天并重新读取身份，不要仅凭昵称确认。"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +89,49 @@ class _PlanInput:
     message_kind: MessageKind
     delay_min_seconds: int
     delay_max_seconds: int
+
+
+class _ThemePreferenceWriter:
+    """Serialize and coalesce preferences without occupying the business worker."""
+
+    def __init__(self, database: Database, messages: queue.Queue) -> None:
+        self._database = database
+        self._messages = messages
+        self._lock = threading.Lock()
+        self._pending: tuple[int, ThemeMode] | None = None
+        self._thread: threading.Thread | None = None
+
+    def submit(self, revision: int, mode: ThemeMode) -> None:
+        with self._lock:
+            self._pending = (revision, mode)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._write, name="spark-keeper-theme", daemon=False
+                )
+                self._thread.start()
+
+    def _write(self) -> None:
+        while True:
+            with self._lock:
+                request = self._pending
+                self._pending = None
+                if request is None:
+                    self._thread = None
+                    return
+            revision, mode = request
+            error = None
+            try:
+                self._database.set_meta("theme_mode", mode.value)
+            except Exception as exc:  # noqa: BLE001 - report the real persistence failure
+                error = format_error(exc)
+            self._messages.put(("theme_saved", revision, mode, error))
+
+    def wait(self) -> None:
+        """Called after the event loop exits, before temporary storage is released."""
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join()
 
 
 class _ProgramDirectoryLabel(QLabel):
@@ -134,6 +195,22 @@ class SparkKeeperApp(QMainWindow):
         self.scheduler = TaskScheduler(self.paths)
         self.messages: queue.Queue[tuple[Any, ...]] = queue.Queue()
         self._closed = False
+        self._theme_writer = _ThemePreferenceWriter(self.database, self.messages)
+        self._theme_revision = 0
+        self._theme_completed_revision = 0
+        self._theme_close_pending = False
+        self._status_tone = "ready"
+        try:
+            self.theme_preference = ThemeMode(self.database.get_meta("theme_mode", "light"))
+        except ValueError:
+            self.theme_preference = ThemeMode.LIGHT
+        self._saved_theme_preference = self.theme_preference
+        self.effective_theme: ThemeMode | None = None
+        self._theme_hints = QApplication.instance().styleHints()
+        self._system_scheme = self._theme_hints.colorScheme()
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.timeout.connect(self._apply_effective_theme)
         self._checking_pending_actions = False
         self._page_epoch = 0
         self._page_versions = dict.fromkeys(("friends", "history", "logs"), 0)
@@ -169,13 +246,84 @@ class SparkKeeperApp(QMainWindow):
         self._pending_timer.setSingleShot(True)
         self._pending_timer.timeout.connect(self._check_pending_actions)
         self._build_ui()
+        self._set_status("就绪", self._status_tone)
         self.refresh_all()
+        self._theme_hints.colorSchemeChanged.connect(self._system_theme_changed)
         self._poll_timer.start()
         if not smoke_mode:
             self._pending_timer.start(500)
 
     def _configure_style(self) -> None:
-        theme.apply_theme(QApplication.instance())
+        self._set_theme_override()
+        self._apply_effective_theme()
+
+    def _set_theme_override(self) -> None:
+        if self.theme_preference is ThemeMode.SYSTEM:
+            self._theme_hints.unsetColorScheme()
+            self._system_scheme = self._theme_hints.colorScheme()
+        else:
+            self._theme_hints.setColorScheme(
+                Qt.ColorScheme.Dark
+                if self.theme_preference is ThemeMode.DARK
+                else Qt.ColorScheme.Light
+            )
+
+    def _system_theme_changed(self, scheme: Qt.ColorScheme) -> None:
+        # Qt emits before updating its palette. Apply once after that update has returned.
+        if not self._closed and self.theme_preference is ThemeMode.SYSTEM:
+            self._theme_timer.start(0)
+            self._system_scheme = scheme
+
+    def _apply_effective_theme(self) -> None:
+        if self._closed:
+            return
+        mode = theme.resolve_mode(self.theme_preference, self._system_scheme)
+        if mode == self.effective_theme:
+            return
+        theme.apply_theme(QApplication.instance(), mode)
+        self.effective_theme = mode
+        for tree in self.findChildren(QTreeWidget):
+            theme.refresh_tree_tones(tree)
+        if hasattr(self, "status_label"):
+            self._set_status(self.status_label.text(), self._status_tone)
+
+    def _theme_selected(self, index: int) -> None:
+        if self._closed:
+            return
+        self.theme_preference = ThemeMode(self.theme_combo.itemData(index))
+        self._theme_revision += 1
+        self._set_theme_override()
+        self._apply_effective_theme()
+        self._theme_writer.submit(self._theme_revision, self.theme_preference)
+
+    def _accept_theme_saved(self, revision: int, mode: ThemeMode, error: str | None) -> None:
+        self._theme_completed_revision = revision
+        if error is None:
+            self._saved_theme_preference = mode
+        elif revision == self._theme_revision:
+            self.theme_preference = self._saved_theme_preference
+            with QSignalBlocker(self.theme_combo):
+                self.theme_combo.setCurrentIndex(
+                    self.theme_combo.findData(self.theme_preference.value)
+                )
+            self._set_theme_override()
+            self._apply_effective_theme()
+        if error is not None:
+            self._theme_close_pending = False
+            detail = (
+                "外观偏好保存失败，未写入本地设置。\n"
+                + (
+                    "已恢复上次成功保存的选项。"
+                    if revision == self._theme_revision
+                    else "较新的外观选择仍会继续保存。"
+                )
+                + "\n\n"
+                + error
+            )
+            self.logs_message.setPlainText(detail)
+            theme.show_message(self, APP_NAME, detail, icon=QMessageBox.Icon.Warning)
+        if self._theme_close_pending and revision == self._theme_revision:
+            self.close()
 
     def _button(self, layout, text, callback=None, *, name="", variant="", task=False):
         button = QPushButton(text)
@@ -261,6 +409,19 @@ class SparkKeeperApp(QMainWindow):
         for key, label in self.NAV_ITEMS:
             self._build_nav_item(layout, key, label)
         layout.addStretch()
+        self._label(layout, "外观")
+        self.theme_combo = QComboBox(rail)
+        self.theme_combo.setObjectName("combo-theme")
+        self.theme_combo.setAccessibleName("外观")
+        for label, mode in (
+            ("浅色模式", ThemeMode.LIGHT),
+            ("暗夜模式", ThemeMode.DARK),
+            ("跟随系统", ThemeMode.SYSTEM),
+        ):
+            self.theme_combo.addItem(label, mode.value)
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(self.theme_preference.value))
+        self.theme_combo.currentIndexChanged.connect(self._theme_selected)
+        layout.addWidget(self.theme_combo)
         self.mode_chip = theme.make_chip(rail, "本地自用")
         layout.addWidget(self.mode_chip)
         self._label(layout, "不绕过验证码与平台风控；网络仅用于正常访问抖音网页。", muted=True)
@@ -320,6 +481,7 @@ class SparkKeeperApp(QMainWindow):
         for button in self._task_buttons:
             button.setEnabled(enabled)
         self._update_target_selection()
+        self._update_candidate_selection()
 
     def _build_home_page(self, page: QWidget) -> None:
         layout = page.layout()
@@ -487,13 +649,13 @@ class SparkKeeperApp(QMainWindow):
             page, title="候选结果", description="同名候选需人工核对身份依据，不会自动选择。"
         )
         body.addWidget(candidates, 11)
-        self.candidate_tree = theme.make_tree(candidates, ("昵称", "抖音号", "依据", "标识摘要"))
+        self.candidate_tree = theme.make_tree(candidates, ("昵称", "依据", "标识摘要"))
         self.candidate_tree.setObjectName("tree-candidates")
         candidates.layout().addWidget(self.candidate_tree, 1)
         self.candidate_hint = self._label(
             candidates.layout(), "尚无候选；搜索已有会话或读取当前聊天。", muted=True
         )
-        self._button(
+        self.save_candidate_button = self._button(
             candidates.layout(),
             "确认并保存所选好友",
             self._save_selected_candidate,
@@ -501,12 +663,17 @@ class SparkKeeperApp(QMainWindow):
             variant="primary",
             task=True,
         )
+        self.candidate_tree.itemSelectionChanged.connect(self._update_candidate_selection)
+        self._update_candidate_selection()
         saved = theme.make_card(
             page, title="已保存好友", description="每次发送前会重新确认当前聊天对象。"
         )
         body.addWidget(saved, 10)
-        self.target_tree = theme.make_tree(saved, ("启用", "昵称", "抖音号", "搜索词", "确认时间"))
+        self.target_tree = theme.make_tree(saved, ("启用", "昵称"))
         self.target_tree.setObjectName("tree-targets")
+        self.target_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.target_tree.setColumnWidth(0, 58)
+        self.target_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.target_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         # QTreeView otherwise sends HasFocus to only the current cell's delegate.
         self.target_tree.setAllColumnsShowFocus(True)
@@ -525,9 +692,7 @@ class SparkKeeperApp(QMainWindow):
             name="btn-toggle-target-selection",
             task=True,
         )
-        self.target_actions_button = self._button(
-            row, "操作", name="btn-target-actions", task=True
-        )
+        self.target_actions_button = self._button(row, "操作", name="btn-target-actions", task=True)
         self.target_actions_menu = QMenu(self.target_actions_button)
         self.target_enable_action = self.target_actions_menu.addAction("启用所选")
         self.target_enable_action.triggered.connect(
@@ -603,7 +768,7 @@ class SparkKeeperApp(QMainWindow):
         )
         self._button(row, "刷新", self._refresh_logs, name="btn-refresh-logs")
         card = theme.make_card(
-            page, title="事件列表", description="选中事件查看完整原文；失败截图与 Trace 默认关闭。"
+            page, title="事件列表", description="选中事件查看完整原文；失败截图与跟踪记录默认关闭。"
         )
         layout.addWidget(card, 1)
         self.logs_tree = theme.make_tree(card, ("时间", "级别", "目标", "分类", "内容"))
@@ -622,8 +787,10 @@ class SparkKeeperApp(QMainWindow):
 
     def _set_status(self, text: str, tone: str = "ready") -> None:
         self.status_label.setText(text)
-        color = {"ready": theme.SUCCESS, "busy": theme.ACCENT, "warn": theme.WARNING}.get(
-            tone, theme.TEXT_MUTED
+        self._status_tone = tone
+        colors = theme.current_colors()
+        color = {"ready": colors.success, "busy": colors.accent, "warn": colors.warning}.get(
+            tone, colors.text_muted
         )
         palette = self.status_label.palette()
         palette.setColor(QPalette.ColorRole.WindowText, QColor(color))
@@ -692,7 +859,6 @@ class SparkKeeperApp(QMainWindow):
             )
             if item.data(0, theme.ROLE_ID + 1) != tone:
                 theme.set_tree_row_tone(item, tone)
-                item.setData(0, theme.ROLE_ID + 1, tone)
                 changed = True
         if changed:
             if current_key in desired:
@@ -756,7 +922,9 @@ class SparkKeeperApp(QMainWindow):
 
         threading.Thread(target=read_snapshot, name="spark-keeper-scheduler", daemon=True).start()
 
-    def _accept_scheduler_snapshot(self, token: int, exists: bool | None, error: str | None) -> None:
+    def _accept_scheduler_snapshot(
+        self, token: int, exists: bool | None, error: str | None
+    ) -> None:
         if self._scheduler_read != token:
             return
         self._scheduler_read = None
@@ -787,28 +955,40 @@ class SparkKeeperApp(QMainWindow):
         self._validate_spark_preview()
 
     def _show_candidates(self, candidates: list[FriendCandidate]) -> None:
-        self.candidates = {candidate.stable_key: candidate for candidate in candidates}
-        self._update_tree(
-            self.candidate_tree,
-            [
+        self.candidates = {}
+        rows = []
+        for index, candidate in enumerate(candidates):
+            candidate_identity = identity_key(candidate.profile_url, candidate.evidence)
+            # Unconfirmed observations are separate rows, never invented persisted identities.
+            key = candidate_identity or f"weak-row:{index}"
+            if key in self.candidates:
+                continue
+            self.candidates[key] = candidate
+            rows.append(
                 (
-                    candidate.stable_key,
+                    key,
                     (
                         candidate.display_name,
-                        candidate.douyin_id or "—",
-                        "强" if candidate.evidence.get("identity_strength") == "strong" else "弱",
-                        candidate.stable_key[:16],
+                        "强" if candidate_identity else "弱",
+                        candidate_identity[:16] if candidate_identity else "尚未确认",
                     ),
-                    (
-                        "strong"
-                        if candidate.evidence.get("identity_strength") == "strong"
-                        else "weak",
-                    ),
+                    ("strong" if candidate_identity else "weak",),
                 )
-                for candidate in candidates
-            ],
-        )
+            )
+        self._update_tree(self.candidate_tree, rows)
         self._sync_empty_hint(self.candidate_tree, self.candidate_hint)
+        self._update_candidate_selection()
+
+    def _update_candidate_selection(self) -> None:
+        selected = self._selected_keys(self.candidate_tree)
+        candidate = self.candidates.get(selected[0]) if len(selected) == 1 else None
+        reliable = candidate is not None and bool(
+            identity_key(candidate.profile_url, candidate.evidence)
+        )
+        self.save_candidate_button.setEnabled(
+            self._task_buttons_enabled and not self.busy and not self._closed and reliable
+        )
+        self.save_candidate_button.setToolTip("" if reliable else _UNCONFIRMED_CANDIDATE_MESSAGE)
 
     def _poll_capture_browser_ready(self) -> None:
         if self._closed or not self.busy:
@@ -849,6 +1029,8 @@ class SparkKeeperApp(QMainWindow):
                         self._accept_page_snapshot(*item[1:])
                     elif kind == "scheduler_snapshot":
                         self._accept_scheduler_snapshot(*item[1:])
+                    elif kind == "theme_saved":
+                        self._accept_theme_saved(*item[1:])
                     elif kind == "status":
                         self._set_status(str(item[1]), "busy")
                     elif kind == "progress":
@@ -863,10 +1045,10 @@ class SparkKeeperApp(QMainWindow):
                         ]
                         for index, (key, _values, _tags) in enumerate(rows):
                             if key == alias:
-                                rows[index] = (alias, (alias, state), ())
+                                rows[index] = (alias, (target_label(alias), state), ())
                                 break
                         else:
-                            rows.append((alias, (alias, state), ()))
+                            rows.append((alias, (target_label(alias), state), ()))
                         self._update_tree(self.progress_tree, rows)
                         self._sync_empty_hint(self.progress_tree, self.progress_hint)
                 except Exception as exc:  # noqa: BLE001 - final UI callback boundary
@@ -911,6 +1093,9 @@ class SparkKeeperApp(QMainWindow):
             activate_window(self)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closed:
+            event.accept()
+            return
         if self.busy:
             prompt = (
                 "登录仍在进行。取消登录并等待浏览器安全关闭？"
@@ -921,12 +1106,18 @@ class SparkKeeperApp(QMainWindow):
                 self._cancel_current()
             event.ignore()
             return
+        if self._theme_completed_revision != self._theme_revision:
+            self._theme_close_pending = True
+            event.ignore()
+            return
+        self._theme_hints.colorSchemeChanged.disconnect(self._system_theme_changed)
         self._closed = True
         for timer in (
             self._poll_timer,
             self._preview_timer,
             self._capture_timer,
             self._pending_timer,
+            self._theme_timer,
         ):
             timer.stop()
         self._close_spark_preview()
@@ -998,9 +1189,6 @@ class SparkKeeperApp(QMainWindow):
                     (
                         "是" if target.enabled else "否",
                         target.display_name,
-                        target.douyin_id or "—",
-                        target.search_query,
-                        target.confirmed_at,
                     ),
                     () if target.enabled else ("disabled",),
                 )
@@ -1036,10 +1224,10 @@ class SparkKeeperApp(QMainWindow):
                     (
                         row["started_at"],
                         row["target_name"],
-                        str(row["status"]),
-                        row["mode"],
+                        status_label(str(row["status"])),
+                        mode_label(str(row["mode"])),
                         "是" if row["manual_override"] else "否",
-                        row["error_code"] or "—",
+                        error_label(row["error_code"]),
                         "续火花（原生表情）"
                         if row.get("message_kind", "text") == MessageKind.SPARK_STICKER
                         else "文本",
@@ -1065,10 +1253,10 @@ class SparkKeeperApp(QMainWindow):
                     str(row["id"]),
                     (
                         row["created_at"],
-                        str(row["level"]),
-                        row["target_alias"] or "—",
-                        row["category"],
-                        " ".join(str(row["message"]).splitlines()),
+                        level_label(str(row["level"])),
+                        target_label(row["target_alias"]) if row["target_alias"] else "—",
+                        category_label(str(row["category"])),
+                        event_summary(row),
                     ),
                     (str(row["level"]),),
                 )
@@ -1156,13 +1344,19 @@ class SparkKeeperApp(QMainWindow):
                 raise ValueError("登录账号或登录会话已变化，扫描结果已失效，请重新扫描。")
             targets = self.database.list_targets()
             saved_keys = {target.stable_key for target in targets}
-            saved_profiles = {target.profile_url for target in targets if target.profile_url}
-            saved_ids = {target.douyin_id for target in targets if target.douyin_id}
             saved_keys.update(
                 contact.candidate.stable_key
                 for contact in scan.contacts
-                if contact.candidate.profile_url in saved_profiles
-                or contact.candidate.douyin_id in saved_ids
+                if contact.candidate.stable_key not in saved_keys
+                and any(
+                    identities_match(
+                        contact.candidate.profile_url,
+                        contact.candidate.evidence,
+                        target.profile_url,
+                        target.evidence,
+                    )
+                    for target in targets
+                )
             )
         except (ValueError, sqlite3.Error) as exc:
             self._show_error(exc)
@@ -1281,10 +1475,12 @@ class SparkKeeperApp(QMainWindow):
         self._set_status("正在只读核对当前聊天身份…", "busy")
 
     def _search(self) -> None:
+        if self.busy or self._closed:
+            return
         query = self.search_input.text().strip()
         if not query:
             theme.show_message(
-                self, APP_NAME, "请输入好友昵称或抖音号。", icon=QMessageBox.Icon.Warning
+                self, APP_NAME, "请输入好友备注名或昵称。", icon=QMessageBox.Icon.Warning
             )
             return
 
@@ -1310,16 +1506,27 @@ class SparkKeeperApp(QMainWindow):
             )
             return
         candidate = self.candidates[selected[0]]
-        strength = candidate.evidence.get("identity_strength")
-        detail = f"昵称：{candidate.display_name}\n抖音号：{candidate.douyin_id or '页面未显示'}\n身份依据：{('稳定标识' if strength == 'strong' else '昵称与头像组合（较弱）')}\n\n确认这是您同意接收测试消息的好友吗？"
+        if not identity_key(candidate.profile_url, candidate.evidence):
+            theme.show_message(
+                self, APP_NAME, _UNCONFIRMED_CANDIDATE_MESSAGE, icon=QMessageBox.Icon.Warning
+            )
+            return
+        detail = (
+            f"昵称：{candidate.display_name}\n主页链接：{candidate.profile_url or '页面未提供'}"
+            "\n身份依据：稳定好友主页或可信单聊标识"
+            "\n\n确认这是您同意接收测试消息的好友吗？"
+        )
         if not theme.confirm(self, APP_NAME, detail):
             return
+        if self.busy or self._closed:
+            return
         try:
-            self.service.save_friend(candidate, self.search_input.text())
-        except (ValueError, sqlite3.Error) as exc:
+            self.service.save_friend(candidate)
+        except (KeyError, ValueError, sqlite3.Error) as exc:
             self._show_error(exc)
             return
         self._refresh_targets()
+        self._show_candidates([])
 
     def _update_target_selection(self) -> None:
         selected = self.target_tree.selectedItems()
@@ -1393,7 +1600,7 @@ class SparkKeeperApp(QMainWindow):
             return
         target_ids = [int(item.data(0, theme.ROLE_ID)) for item in selected]
         names = "\n".join(
-            f"• {item.text(1)}（ID: {item.data(0, theme.ROLE_ID)}）" for item in selected
+            f"• {item.text(1)}（编号：{item.data(0, theme.ROLE_ID)}）" for item in selected
         )
         detail = (
             f"删除所选 {len(target_ids)} 位好友？\n\n{names}\n\n"
@@ -1411,9 +1618,7 @@ class SparkKeeperApp(QMainWindow):
 
     def _current_message_kind(self) -> MessageKind:
         return (
-            MessageKind.SPARK_STICKER
-            if self.sticker_mode_button.isChecked()
-            else MessageKind.TEXT
+            MessageKind.SPARK_STICKER if self.sticker_mode_button.isChecked() else MessageKind.TEXT
         )
 
     def _update_message_mode(self) -> None:
@@ -1624,7 +1829,7 @@ class SparkKeeperApp(QMainWindow):
         theme.show_message(
             self,
             APP_NAME,
-            f"批次状态：{result.status.value}\n成功：{counts['success']}\n失败：{counts['failed']}\n结果不确定：{counts['unknown']}\n重复跳过：{counts['duplicate']}",
+            f"批次状态：{status_label(result.status.value)}\n成功：{counts['success']}\n失败：{counts['failed']}\n结果不确定：{counts['unknown']}\n重复跳过：{counts['duplicate']}",
         )
         self._refresh_task_views(self._refresh_history, self._refresh_logs)
 
@@ -1823,9 +2028,9 @@ class SparkKeeperApp(QMainWindow):
 
 def run(*, smoke_mode: bool = False) -> int:
     application = QApplication.instance() or QApplication([])
-    theme.apply_theme(application)
     guard = None
     temporary_root = None
+    window = None
     previous_root = os.environ.get("SPARK_KEEPER_ROOT")
     try:
         # Smoke always opens this build, never activates another GUI or touches user data.
@@ -1848,6 +2053,8 @@ def run(*, smoke_mode: bool = False) -> int:
             QTimer.singleShot(750, application.quit)
         return application.exec()
     finally:
+        if window is not None:
+            window._theme_writer.wait()
         if guard is not None:
             guard.close()
         if temporary_root is not None:

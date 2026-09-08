@@ -137,7 +137,7 @@ def conversation_search_html() -> str:
         <div class="search-list">
           <div class="conversation">
             <img src="https://example.test/left-avatar.png">
-            <span>测试好友</span>
+            <a href="https://www.douyin.com/user/fixture-friend"><span>测试好友</span></a>
             <div class="chat-action" style="cursor: pointer" onclick="this.dataset.clicked='true'">
               发消息
             </div>
@@ -153,7 +153,7 @@ def conversation_search_html() -> str:
     <main class="right">
       <div class="header">
         <img src="https://example.test/right-avatar.png">
-        <span>测试好友</span>
+        <a href="https://www.douyin.com/user/fixture-friend"><span>测试好友</span></a>
       </div>
       <div class="composer" contenteditable="true"></div>
     </main>
@@ -211,16 +211,16 @@ async def test_open_target_clicks_visible_text_action_without_button_role() -> N
                 id=1,
                 stable_key=candidate.stable_key,
                 display_name=candidate.display_name,
-                douyin_id=candidate.douyin_id,
                 profile_url=candidate.profile_url,
                 avatar_url=candidate.avatar_url,
-                search_query="测试好友",
+                search_query="obsolete-number-query",
                 evidence=candidate.evidence,
                 enabled=True,
                 confirmed_at="now",
             )
             await adapter.open_confirmed_target(target)
             friend_action = page.locator(".conversation:not(.group-conversation) .chat-action")
+            assert await page.locator(".chat-search").input_value() == target.display_name
             group_action = page.locator(".group-conversation .chat-action")
             assert await friend_action.get_attribute("data-clicked") == "true"
             assert await group_action.get_attribute("data-clicked") is None
@@ -258,7 +258,6 @@ async def test_target_lookup_failure_notes_explain_branch_without_opening_or_sen
                 id=71,
                 stable_key=candidate.stable_key,
                 display_name=candidate.display_name,
-                douyin_id=candidate.douyin_id,
                 profile_url=candidate.profile_url,
                 avatar_url=candidate.avatar_url,
                 search_query="测试好友",
@@ -267,7 +266,7 @@ async def test_target_lookup_failure_notes_explain_branch_without_opening_or_sen
                 confirmed_at="now",
             )
             if reason == "no_candidates":
-                target = replace(target, search_query="不存在的好友")
+                target = replace(target, display_name="不存在的好友")
             elif reason == "identity_mismatch":
                 target = replace(
                     target,
@@ -320,9 +319,9 @@ async def test_target_lookup_failure_notes_explain_branch_without_opening_or_sen
             diagnostic = json.loads(caught.value.__notes__[0])
             assert diagnostic["reason"] == reason
             assert diagnostic["target"]["id"] == 71
-            assert diagnostic["target"]["display_name"] == "测试好友"
+            assert diagnostic["target"]["display_name"] == target.display_name
             assert diagnostic["target"]["stable_key"] == target.stable_key
-            assert diagnostic["target"]["search_query"] == target.search_query
+            assert diagnostic["target"]["search_query"] == target.display_name
             assert diagnostic["candidate_count"] == expected_candidates
             assert diagnostic["match_count"] == expected_matches
             assert diagnostic["page_url"] == "about:blank"
@@ -330,7 +329,7 @@ async def test_target_lookup_failure_notes_explain_branch_without_opening_or_sen
             extraction = diagnostic["extraction"]
             assert extraction["search"]["placeholder"] == "搜索已有会话"
             assert extraction["search"]["bounds"]["left"] == 40
-            assert extraction["search"]["value"] == target.search_query
+            assert extraction["search"]["value"] == target.display_name
             assert extraction["search"]["focused"] is True
             assert extraction["search"]["disabled"] is False
             assert extraction["document_state"] == "complete"
@@ -357,7 +356,7 @@ async def test_target_lookup_failure_notes_explain_branch_without_opening_or_sen
                 )
             detail = format_error(caught.value)
             assert reason in detail
-            assert "测试好友" in detail
+            assert target.display_name in detail
             assert "private-chat-message" not in detail
             assert "private-evidence-value" not in detail
             assert await page.evaluate("window.targetClicks") == 0
@@ -573,9 +572,13 @@ def fast_delivery(monkeypatch):
             now += seconds
 
         return await await_delivery_terminal(
-            sample, timeout_seconds=1, poll_seconds=0.25,
-            stable_seconds=0.25, initial_clean_seconds=0.5,
-            clock=lambda: now, sleep=sleep,
+            sample,
+            timeout_seconds=1,
+            poll_seconds=0.25,
+            stable_seconds=0.25,
+            initial_clean_seconds=0.5,
+            clock=lambda: now,
+            sleep=sleep,
         )
 
     monkeypatch.setattr(douyin_chat, "await_delivery_terminal", terminal)
@@ -585,7 +588,8 @@ def fast_delivery(monkeypatch):
 @pytest.mark.parametrize("body", ["发送失败", "重试", "发送失败后可以重试", "普通正文"])
 async def test_text_body_and_nearby_status_cannot_fail_delivery(fast_delivery, body) -> None:
     async with text_delivery_page() as page:
-        await page.evaluate("""body => {
+        await page.evaluate(
+            """body => {
             addText({clientId:'history', indexInConversationV2:'9', flightStatus:-1}, body);
             addText({clientId:'unrelated', indexInConversationV2:'10', flightStatus:-2}, '其他正文');
             const status = document.createElement('i');
@@ -593,9 +597,13 @@ async def test_text_body_and_nearby_status_cannot_fail_delivery(fast_delivery, b
             status.title = '发送失败';
             status.setAttribute('role', 'progressbar');
             document.querySelector('#messages').append(status);
-        }""", body)
+        }""",
+            body,
+        )
         triggers = []
-        await DouyinChatAdapter(page).send_text_and_confirm(body, lambda: triggers.append("trigger"))
+        await DouyinChatAdapter(page).send_text_and_confirm(
+            body, lambda: triggers.append("trigger")
+        )
         assert triggers == ["trigger"]
         assert await page.evaluate("clicks") == 1
 
@@ -611,13 +619,24 @@ async def test_text_bound_sdk_failure_is_detected(fast_delivery, status) -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changes", [
-    {"flightStatus": 0}, {"flightStatus": 1}, {"flightStatus": 2}, {"flightStatus": -3},
-    {"flightStatus": None}, {"flightStatus": -1, "indexInConversationV2": "0"},
-    {"indexInConversationV2": "9"}, {"serverId": "0"},
-    {"isFromMe": False}, {"isRefMessage": True}, {"isRecalled": True},
-    {"conversationId": "other-chat"}, {"type": 5},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"flightStatus": 0},
+        {"flightStatus": 1},
+        {"flightStatus": 2},
+        {"flightStatus": -3},
+        {"flightStatus": None},
+        {"flightStatus": -1, "indexInConversationV2": "0"},
+        {"indexInConversationV2": "9"},
+        {"serverId": "0"},
+        {"isFromMe": False},
+        {"isRefMessage": True},
+        {"isRecalled": True},
+        {"conversationId": "other-chat"},
+        {"type": 5},
+    ],
+)
 async def test_text_insufficient_or_unrelated_message_evidence_is_unknown(
     fast_delivery, changes
 ) -> None:
@@ -698,11 +717,14 @@ async def test_text_online_acknowledgement_and_server_hydration_succeed(
     fast_delivery, server_hydrated
 ) -> None:
     async with text_delivery_page() as page:
-        await page.evaluate("""hydrated => {
+        await page.evaluate(
+            """hydrated => {
             window.nextChanges = hydrated
                 ? {flightStatus:undefined, isOffline:false, serverStatus:0}
                 : {flightStatus:4};
-        }""", server_hydrated)
+        }""",
+            server_hydrated,
+        )
         await DouyinChatAdapter(page).send_text_and_confirm("正文", lambda: None)
         assert await page.evaluate("clicks") == 1
 
@@ -739,3 +761,71 @@ async def test_text_snapshot_excludes_unrelated_bodies_and_serializes_only_metad
         assert [message["clientId"] for message in result["messages"]] == ["new-client"]
         assert "private-current-body" not in repr(result)
         assert "private-incoming-body" not in repr(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["weak", "different_profile"])
+async def test_recipient_verification_never_downgrades_to_same_name_or_avatar(identity) -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1200, "height": 800})
+        try:
+            await page.set_content(current_chat_html())
+            adapter = DouyinChatAdapter(page)
+            candidate = await adapter.capture_current_chat_candidate("测试好友乙")
+            target = Target(
+                id=1,
+                stable_key=candidate.stable_key,
+                display_name=candidate.display_name,
+                profile_url=candidate.profile_url,
+                avatar_url=candidate.avatar_url,
+                search_query="obsolete-number",
+                evidence=candidate.evidence,
+                enabled=True,
+                confirmed_at="fixture-time",
+            )
+            if identity == "weak":
+                await page.locator(".header a").evaluate("node => node.removeAttribute('href')")
+                target = replace(target, profile_url="", evidence={"identity_strength": "weak"})
+            elif identity == "different_profile":
+                await page.locator(".header a").evaluate(
+                    "node => node.href = 'https://www.douyin.com/user/different-person'"
+                )
+            with pytest.raises(TargetIdentityMismatch):
+                await adapter.verify_recipient(target)
+            assert await page.locator(".composer").inner_text() == ""
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_search_and_current_capture_do_not_collect_dom_number_metadata() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1200, "height": 800})
+        try:
+            await page.set_content(conversation_search_html())
+            await page.evaluate("""() => {
+                for (const node of document.querySelectorAll('.conversation, .header')) {
+                    node.setAttribute('data-douyin-id', 'private-number-value');
+                    node.setAttribute('data-user-id', 'private-dom-id');
+                    const small = document.createElement('small');
+                    small.textContent = '抖音号：private-number-value';
+                    node.appendChild(small);
+                }
+            }""")
+            adapter = DouyinChatAdapter(page)
+            raw = await adapter._extract_candidate_rows("测试好友", page.locator("input"))
+            candidate = await adapter.capture_current_chat_candidate("测试好友")
+            assert raw and candidate.profile_url
+            for exported in (
+                repr(raw),
+                repr(candidate),
+                repr(adapter._last_candidate_diagnostics),
+                repr(adapter._last_chat_diagnostics),
+            ):
+                assert "private-number-value" not in exported
+                assert "private-dom-id" not in exported
+                assert "douyinId" not in exported and "dataId" not in exported
+        finally:
+            await browser.close()

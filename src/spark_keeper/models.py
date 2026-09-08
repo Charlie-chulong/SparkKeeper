@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
+
+from .identity import identity_key
+
+
+class ThemeMode(StrEnum):
+    LIGHT = "light"
+    DARK = "dark"
+    SYSTEM = "system"
 
 
 class MessageKind(str, Enum):
@@ -66,7 +73,6 @@ class Account:
 class FriendCandidate:
     stable_key: str
     display_name: str
-    douyin_id: str = ""
     profile_url: str = ""
     avatar_url: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
@@ -101,13 +107,7 @@ class SparkContact:
             and candidate.evidence.get("identity_strength") == "strong"
             and not candidate.evidence.get("identity_conflict")
             and bool(candidate.stable_key)
-            and bool(
-                re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", candidate.douyin_id)
-                or re.fullmatch(
-                    r"https://(?:www\.)?douyin\.com/user/(?!self$)[A-Za-z0-9_-]+",
-                    candidate.profile_url,
-                )
-            )
+            and bool(identity_key(candidate.profile_url, candidate.evidence))
         )
 
 
@@ -127,7 +127,6 @@ class Target:
     id: int
     stable_key: str
     display_name: str
-    douyin_id: str
     profile_url: str
     avatar_url: str
     search_query: str

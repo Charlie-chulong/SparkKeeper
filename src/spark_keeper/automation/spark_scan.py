@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import re
 import threading
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
-from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 
+from ..identity import canonical_profile_url, identity_key
 from ..models import Account, ErrorCode, SparkContact, SparkScanResult, SparkScanStatus, SparkState
 from .douyin_chat import _CONVERSATION_IDENTITY_JS, DouyinChatAdapter
 from .errors import AutomationError
@@ -98,7 +97,6 @@ _SNAPSHOT_JS = r"""({operation, limit}) => {
             && r.bottom > 0 && r.top < innerHeight;
     };
     const rows = mountedRows.filter(inView);
-    const identityAttributes = ['data-uid', 'data-user-id', 'data-conversation-id'];
     const result = rows.slice(0, limit).map((row, index) => {
         // Names/identities must be in a dedicated header/name node, never the whole row.
         const names = [...row.querySelectorAll('.conversationConversationItemtitle, [data-role="conversation-name"], [role="heading"]')]
@@ -107,23 +105,17 @@ _SNAPSHOT_JS = r"""({operation, limit}) => {
         const nameNode = names.length === 1 ? names[0] : null;
         const name = nameNode && (nameNode.children.length === 0 || nameNode.matches('.conversationConversationItemtitle'))
             ? clean(nameNode.textContent).slice(0, 160) : '';
-        const identityNodes = [row, ...(nameNode ? [nameNode, ...nameNode.querySelectorAll('a[href]')] : [])];
         const links = [...row.querySelectorAll('a[href]')].filter(link =>
             visible(link) && link.closest(headerSelector)
                 && !link.closest(previewSelector)
                 && (link === nameNode || nameNode?.contains(link)
                 || link.contains(nameNode) || link.getAttribute('aria-label') === '查看主页'));
         const profiles = [...new Set(links.map(link => link.href))];
-        const conversationIdentity = (__READ_CONVERSATION_IDENTITY__)(row, true);
+        const identityDiagnostic = {};
+        const conversationIdentity = (__READ_CONVERSATION_IDENTITY__)(row, true, identityDiagnostic);
         if (conversationIdentity?.secUserId) {
             profiles.push(`https://www.douyin.com/user/${conversationIdentity.secUserId}`);
         }
-        const ids = [...new Set(identityNodes.map(node => clean(node.getAttribute('data-douyin-id')))
-            .filter(value => value && value.length <= 100))];
-        const dataIds = identityAttributes.flatMap(key => {
-            const value = clean(row.getAttribute(key));
-            return value && value.length <= 200 ? [`${key}:${value}`] : [];
-        });
         const types = [row.getAttribute('data-conversation-type'), row.getAttribute('data-chat-type')]
             .map(clean).filter(Boolean);
         // Public SDK 4187.2096e141.js: ONE_TO_ONE_CHAT=1, GROUP_CHAT=2.
@@ -146,9 +138,12 @@ _SNAPSHOT_JS = r"""({operation, limit}) => {
             .filter(value => value && value.length <= 80 && /火花|spark|streak/i.test(value));
         const flameBadges = [...row.querySelectorAll('.commonStreakstreakContainer')]
             .filter(node => visible(node) && node.closest(headerSelector) && !node.closest(previewSelector));
-        return {name, profiles, ids, dataId: dataIds.sort().join('|'),
+        return {name, profiles,
             types: [...types, ...typeLabels], badges, slot: index,
-            scanConversationId: conversationIdentity?.scanConversationId || '',
+            conversationId: conversationIdentity?.conversationId || '',
+            conversationType: conversationIdentity?.type ?? null,
+            observationId: conversationIdentity?.observationId || '',
+            identityConflict: identityDiagnostic.reason === 'alternate_conflict',
             flame: conversationIdentity?.flame || null, flameVisible: flameBadges.length === 1};
     });
     const loading = list.getAttribute('aria-busy') === 'true'
@@ -163,38 +158,17 @@ _SNAPSHOT_JS = r"""({operation, limit}) => {
 }""".replace("__READ_CONVERSATION_IDENTITY__", _CONVERSATION_IDENTITY_JS)
 
 
-def _profile_url(value: str) -> str:
-    try:
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme != "https"
-            or parsed.hostname not in {"douyin.com", "www.douyin.com"}
-            or parsed.username
-            or parsed.password
-            or parsed.port not in (None, 443)
-            or not re.fullmatch(r"/user/[A-Za-z0-9_-]+/?", parsed.path)
-            or parsed.path.rstrip("/").endswith("/self")
-        ):
-            return ""
-        # Keep the adapter's canonical host/key convention.
-        return f"https://{parsed.netloc}{parsed.path.rstrip('/')}"
-    except ValueError:
-        return ""
-
-
 def _contact(raw: dict, observation: int) -> SparkContact:
-    profiles = {_profile_url(value) for value in raw["profiles"]}
+    profiles = {canonical_profile_url(value) for value in raw["profiles"]}
     invalid_profile = "" in profiles
     profiles.discard("")
-    ids = set(raw["ids"])
-    invalid_id = any(not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", value) for value in ids)
-    conflict = len(profiles) > 1 or len(ids) > 1 or invalid_profile or invalid_id
+    conflict = len(profiles) > 1 or invalid_profile or bool(raw.get("identityConflict"))
     candidate = DouyinChatAdapter._candidate_from_raw(
         {
             "name": raw["name"] or "名称待确认",
             "profileUrl": next(iter(profiles)) if len(profiles) == 1 and not conflict else "",
-            "douyinId": next(iter(ids)) if len(ids) == 1 and not conflict else "",
-            "dataId": raw["dataId"],
+            "conversationId": raw.get("conversationId") if not conflict else "",
+            "conversationType": raw.get("conversationType"),
         }
     )
     types = {str(value).casefold() for value in raw["types"]}
@@ -205,7 +179,9 @@ def _contact(raw: dict, observation: int) -> SparkContact:
         "group" if is_group else "single" if types and types <= singles else "unknown"
     )
     strong = (
-        not conflict and bool(candidate.profile_url or candidate.douyin_id) and bool(raw["name"])
+        not conflict
+        and bool(identity_key(candidate.profile_url, candidate.evidence))
+        and bool(raw["name"])
     )
     evidence = dict(candidate.evidence)
     evidence.update(
@@ -215,9 +191,9 @@ def _contact(raw: dict, observation: int) -> SparkContact:
         spark_evidence="explicit_accessible_badge",
         identity_conflict=conflict,
     )
-    scan_id = str(raw.pop("scanConversationId", "") or "")
-    if scan_id:
-        evidence["scan_conversation_digest"] = hashlib.sha256(scan_id.encode("utf-8")).hexdigest()
+    observation_id = str(raw.get("observationId") or "")
+    if observation_id:
+        evidence["observation_digest"] = hashlib.sha256(observation_id.encode("utf-8")).hexdigest()
     candidate = replace(candidate, evidence=evidence)
     if not strong:
         # Never collapse distinct weak rows merely because their names/avatars match.
@@ -367,7 +343,7 @@ async def scan_contacts(
                     observation += 1
                     contact = _contact(raw, observation)
                     strong_identity = contact.candidate.evidence["identity_strength"] == "strong"
-                    scan_digest = contact.candidate.evidence.get("scan_conversation_digest")
+                    scan_digest = contact.candidate.evidence.get("observation_digest")
                     key = (
                         contact.candidate.stable_key
                         if strong_identity
@@ -383,9 +359,9 @@ async def scan_contacts(
                                 old.candidate.evidence.get("identity_conflict")
                                 or contact.candidate.evidence.get("identity_conflict")
                                 or (
-                                    old.candidate.douyin_id
-                                    and contact.candidate.douyin_id
-                                    and old.candidate.douyin_id != contact.candidate.douyin_id
+                                    old.candidate.profile_url
+                                    and contact.candidate.profile_url
+                                    and old.candidate.profile_url != contact.candidate.profile_url
                                 )
                                 or old.candidate.evidence["chat_type"]
                                 != contact.candidate.evidence["chat_type"]
@@ -415,9 +391,7 @@ async def scan_contacts(
                             snapshot["top"],
                             raw["slot"],
                             raw["name"],
-                            raw["dataId"],
                             tuple(raw["profiles"]),
-                            tuple(raw["ids"]),
                             tuple(raw["badges"]),
                             tuple(raw["types"]),
                         )
@@ -449,7 +423,7 @@ async def scan_contacts(
                 signature = (
                     snapshot["top"],
                     tuple(
-                        (raw["name"], tuple(raw["profiles"]), tuple(raw["ids"]), raw["dataId"])
+                        (raw["name"], tuple(raw["profiles"]), raw.get("observationId", ""))
                         for raw in snapshot["rows"]
                     ),
                 )

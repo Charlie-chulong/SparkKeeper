@@ -186,21 +186,14 @@ async def test_gray_and_recover_observations_of_same_identity_remain_unknown() -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("conflict", ["douyin-id", "unknown-type", "group-type"])
+@pytest.mark.parametrize("conflict", ["unknown-type", "group-type"])
 @pytest.mark.parametrize("reverse", [False, True])
-async def test_same_profile_identity_or_type_conflict_blocks_manual_import(
-    conflict, reverse
-) -> None:
-    first = row("same").replace("<li ", '<li data-douyin-id="first_id" ', 1)
-    second_id = "other_id" if conflict == "douyin-id" else "first_id"
+async def test_same_profile_type_conflict_blocks_manual_import(conflict, reverse) -> None:
+    first = row("same")
     second = row(
         "same",
         badge="火花待恢复",
-        chat_type={"unknown-type": "", "group-type": "group"}.get(conflict, "single"),
-    ).replace(
-        "<li ",
-        f'<li data-douyin-id="{second_id}" ',
-        1,
+        chat_type={"unknown-type": "", "group-type": "group"}[conflict],
     )
     rows = [first, second]
     if reverse:
@@ -358,16 +351,25 @@ async def test_service_scan_uses_html_and_never_calls_send_or_mutates_targets(mo
 
 
 @pytest.mark.asyncio
-async def test_row_id_alone_is_pending_but_explicit_douyin_id_can_import() -> None:
+async def test_dom_ids_and_douyin_number_never_supply_identity_or_export() -> None:
     weak = row("").replace("<li ", '<li data-uid="opaque-row-id" ', 1)
-    strong = row("").replace("<li ", '<li data-douyin-id="friend_123" ', 1)
-    async with fixture_page(html(weak + strong)) as page:
+    number_only = row("", extra="<small>抖音号：private-number-123</small>").replace(
+        "<li ", '<li data-douyin-id="private-number-123" ', 1
+    )
+    async with fixture_page(html(weak + number_only)) as page:
         result = await scan(page)
+        snapshot = await page.evaluate(_SNAPSHOT_JS, {"operation": "read", "limit": 10})
         assert len(result.contacts) == 2
-        assert not result.contacts[0].importable
-        assert result.contacts[0].candidate.evidence["identity_strength"] == "weak"
-        assert result.contacts[1].importable
-        assert result.contacts[1].candidate.douyin_id == "friend_123"
+        assert all(not contact.importable for contact in result.contacts)
+        assert all(
+            contact.candidate.evidence["identity_strength"] == "weak" for contact in result.contacts
+        )
+        for exported in (repr(result), repr(snapshot)):
+            assert "private-number-123" not in exported
+            assert "opaque-row-id" not in exported
+            assert "douyinId" not in exported
+            assert "dataId" not in exported
+            assert "douyin_id" not in exported
 
 
 @pytest.mark.asyncio
@@ -438,7 +440,7 @@ async def test_nested_list_items_do_not_hide_the_conversation_scroll_viewport() 
         + row("first", extra='<span role="listitem">头像</span>')
         + row("second")
         + END
-        + '</div><ul><li>非会话的嵌套列表项</li></ul>'
+        + "</div><ul><li>非会话的嵌套列表项</li></ul>"
     )
     async with fixture_page(content) as page:
         await page.locator("#viewport").evaluate("node => node.scrollTop = 40")
@@ -539,7 +541,6 @@ async def test_scan_and_search_share_row_bound_participant_identity() -> None:
             id=1,
             stable_key=candidate.stable_key,
             display_name=candidate.display_name,
-            douyin_id=candidate.douyin_id,
             profile_url=candidate.profile_url,
             avatar_url=candidate.avatar_url,
             search_query=candidate.display_name,
@@ -696,7 +697,6 @@ async def test_current_chat_verifies_shared_participant_identity_and_rejects_wea
             id=1,
             stable_key=candidate.stable_key,
             display_name=candidate.display_name,
-            douyin_id="",
             profile_url=candidate.profile_url,
             avatar_url="",
             search_query="同名好友",
@@ -746,12 +746,7 @@ async def test_virtual_groups_use_conversation_digest_without_upgrading_identity
             contact.candidate.evidence["identity_strength"] == "weak" for contact in result.contacts
         )
         assert (
-            len(
-                {
-                    contact.candidate.evidence["scan_conversation_digest"]
-                    for contact in result.contacts
-                }
-            )
+            len({contact.candidate.evidence["observation_digest"] for contact in result.contacts})
             == 4
         )
         assert "private-conversation-" not in repr(result)
@@ -871,15 +866,19 @@ async def test_live_header_cur_conversation_binding_is_bounded_and_fail_closed(
             scenario,
         )
         adapter = DouyinChatAdapter(page)
-        expected = adapter._candidate_from_raw({
-            "name": "同名好友", "profileUrl": "https://www.douyin.com/user/fixture-sec"
-        })
+        expected = adapter._candidate_from_raw(
+            {"name": "同名好友", "profileUrl": "https://www.douyin.com/user/fixture-sec"}
+        )
         target = Target(
-            id=1, stable_key=expected.stable_key, display_name=expected.display_name,
-            douyin_id="", profile_url=expected.profile_url, avatar_url="",
+            id=1,
+            stable_key=expected.stable_key,
+            display_name=expected.display_name,
+            profile_url=expected.profile_url,
+            avatar_url="",
             search_query="同名好友",
             evidence={"capture_source": "spark_scan", "identity_strength": "strong"},
-            enabled=False, confirmed_at="fixture-time",
+            enabled=False,
+            confirmed_at="fixture-time",
         )
         if reason is None:
             await adapter.verify_recipient(target)
@@ -892,6 +891,101 @@ async def test_live_header_cur_conversation_binding_is_bounded_and_fail_closed(
             diagnostic = json.loads(caught.value.__notes__[0])
             assert diagnostic["stage"] == "current_chat_identity"
             assert diagnostic["extraction"]["conversation"]["reason"] == reason
-            assert diagnostic["extraction"]["conversation"]["root_class"] == "RightPanelHeaderconvHeader"
+            assert (
+                diagnostic["extraction"]["conversation"]["root_class"]
+                == "RightPanelHeaderconvHeader"
+            )
         assert await page.locator(".composer").inner_text() == ""
         assert await page.evaluate("window.sendCount") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sec_uid", ["shared-fixture-sec", ""])
+async def test_scan_search_current_share_trusted_sdk_conversation_without_number_export(
+    sec_uid,
+) -> None:
+    content = html(
+        row("", extra='<img width="24" height="24" src="data:image/svg+xml,%3Csvg/%3E">')
+    )
+    async with fixture_page(content) as page:
+        await page.evaluate(
+            """secUid => {
+            const row = document.querySelector('li');
+            row.classList.add('conversationConversationItemwrapper');
+            row.setAttribute('data-douyin-id', 'never-export-number');
+            row.setAttribute('data-user-id', 'never-trust-dom-id');
+            const number = document.createElement('small');
+            number.textContent = '抖音号：never-export-number';
+            row.querySelector('[data-role="conversation-header"]').appendChild(number);
+            const conversation = {
+                id: 'shared-private-sdk-conversation', type: 1,
+                get toParticipantSecUserId() { throw Error('Cache-writing getter forbidden'); },
+                toParticipantUserId: 'peer',
+                firstPageParticipant: {participants: [{user_id: 'peer', sec_uid: secUid}]}
+            };
+            row.__reactFiber$fixture = {memoizedProps: {conversation}, return: null};
+            const pane = document.querySelector('main');
+            pane.style.cssText = 'position:absolute;left:400px;top:0;width:760px;height:780px';
+            pane.innerHTML = '<div class="RightPanelHeaderconvHeader" '
+                + 'style="position:absolute;left:50px;top:70px;width:650px;height:80px">'
+                + '<span>同名好友</span><small>抖音号：never-export-number</small></div>'
+                + '<div id="composer" contenteditable="true" '
+                + 'style="position:absolute;left:60px;top:650px;width:620px;height:60px"></div>';
+            pane.querySelector('.RightPanelHeaderconvHeader').__reactFiber$fixture = {
+                memoizedProps: {curConversation: conversation}, return: null
+            };
+        }""",
+            sec_uid,
+        )
+        adapter = DouyinChatAdapter(page)
+        result = await scan(page)
+        scanned = result.contacts[0].candidate
+        assert result.contacts[0].importable
+        await page.locator("li").evaluate("""node => {
+            const fiber = node.__reactFiber$fixture;
+            fiber.memoizedProps = {item: {conversation: fiber.memoizedProps.conversation}};
+        }""")
+        raw = await adapter._extract_candidate_rows("同名好友", page.locator("input"))
+        assert len(raw) == 1
+        assert "douyinId" not in raw[0] and "dataId" not in raw[0]
+        assert "never-export-number" not in repr(raw)
+        searched = adapter._candidate_from_raw(raw[0])
+        current = await adapter.capture_current_chat_candidate("同名好友")
+        assert scanned.stable_key == searched.stable_key == current.stable_key
+        assert scanned.profile_url == searched.profile_url == current.profile_url
+        for candidate in (scanned, searched, current):
+            assert candidate.evidence["identity_source"] == "sdk_single_conversation"
+            assert (
+                candidate.evidence["conversation_digest"] == scanned.evidence["conversation_digest"]
+            )
+            assert "shared-private-sdk-conversation" not in repr(candidate)
+            assert "never-export-number" not in repr(candidate)
+            assert "never-trust-dom-id" not in repr(candidate)
+        target = Target(
+            id=1,
+            stable_key=scanned.stable_key,
+            display_name=scanned.display_name,
+            profile_url=scanned.profile_url,
+            avatar_url="",
+            search_query="old-number-query",
+            evidence=scanned.evidence,
+            enabled=True,
+            confirmed_at="fixture-time",
+        )
+        await adapter.verify_recipient(target)
+        assert await page.locator("#composer").inner_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_sdk_conversation_id_without_bounded_single_participant_is_not_trusted() -> None:
+    async with fixture_page(html(row(""))) as page:
+        await page.locator("li").evaluate("""node => {
+            node.classList.add('conversationConversationItemwrapper');
+            node.__reactFiber$fixture = {memoizedProps: {conversation: {
+                id: 'unverified-conversation', type: 1, toParticipantUserId: 'peer',
+                firstPageParticipant: {participants: [{user_id: 'different-peer'}]}
+            }}, return: null};
+        }""")
+        result = await scan(page)
+        assert not result.contacts[0].importable
+        assert "conversation_digest" not in result.contacts[0].candidate.evidence

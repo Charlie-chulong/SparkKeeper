@@ -46,11 +46,16 @@ def configured_database(tmp_path, kind: MessageKind = MessageKind.TEXT) -> Datab
     database = Database(tmp_path / "state.sqlite3")
     database.save_account("account-key", "测试账号")
     database.add_target(
-        FriendCandidate("friend-key", "测试好友", douyin_id="friend-id"),
+        FriendCandidate(
+            "friend-key", "测试好友", profile_url="https://www.douyin.com/user/friend-key"
+        ),
         "测试好友",
     )
     database.save_plan(
-        enabled=True, send_time="09:00", message_text="测试消息", confirmed=True,
+        enabled=True,
+        send_time="09:00",
+        message_text="测试消息",
+        confirmed=True,
         message_kind=kind,
     )
     with database.connect(immediate=True) as connection:
@@ -79,13 +84,16 @@ def test_missed_schedule_creates_one_deduplicated_action(tmp_path, kind) -> None
     assert action["payload"]["delay_max_seconds"] == 8
     other_kind = MessageKind.SPARK_STICKER if kind is MessageKind.TEXT else MessageKind.TEXT
     database.save_plan(
-        enabled=True, send_time="09:00", message_text="变更后的文本", confirmed=True,
-        message_kind=other_kind, delay_min_seconds=4, delay_max_seconds=9,
+        enabled=True,
+        send_time="09:00",
+        message_text="变更后的文本",
+        confirmed=True,
+        message_kind=other_kind,
+        delay_min_seconds=4,
+        delay_max_seconds=9,
     )
     with database.connect(immediate=True) as connection:
-        connection.execute(
-            "UPDATE plan SET confirmed_at = ?", ("2026-09-01T08:00:00+08:00",)
-        )
+        connection.execute("UPDATE plan SET confirmed_at = ?", ("2026-09-01T08:00:00+08:00",))
     assert detect_missed_schedule(database, now=now).action_id == first.action_id
     assert database.list_pending_actions("missed_schedule")[0]["payload"] == action["payload"]
 

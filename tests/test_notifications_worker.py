@@ -192,7 +192,12 @@ async def test_worker_does_not_recover_active_send(tmp_path, monkeypatch) -> Non
     database = Database(paths.database)
     account = database.save_account("offline-account", "离线账号")
     target = database.add_target(
-        FriendCandidate(stable_key="offline-friend", display_name="离线好友"), "离线好友"
+        FriendCandidate(
+            stable_key="offline-friend",
+            display_name="离线好友",
+            profile_url="https://www.douyin.com/user/offline-friend",
+        ),
+        "离线好友",
     )
     batch = database.start_batch(BatchMode.SCHEDULED, target_count=1)
     reservation = database.reserve_attempt(

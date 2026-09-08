@@ -7,7 +7,9 @@ from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime
 
 from ..database import Database, today_iso
+from ..display_labels import progress_failure_label, status_label
 from ..dpapi import DpapiJsonStore
+from ..identity import identity_key
 from ..logging_safe import format_error, target_label
 from ..models import (
     AttemptStatus,
@@ -143,15 +145,16 @@ class BatchService:
                 )
                 return candidate
 
-    def save_friend(self, candidate: FriendCandidate, search_query: str) -> Target:
-        target = self.database.add_target(candidate, search_query)
-        self.database.record_event(
-            "INFO",
-            "friend_saved",
-            "已确认并保存一位好友",
-            target_alias=target_label(target),
-        )
-        return target
+    def save_friend(self, candidate: FriendCandidate) -> Target:
+        with WindowsTaskMutex():
+            target = self.database.add_target(candidate, candidate.display_name)
+            self.database.record_event(
+                "INFO",
+                "friend_saved",
+                "已确认并保存一位好友",
+                target_alias=target_label(target),
+            )
+            return target
 
     async def scan_spark_contacts(
         self,
@@ -278,7 +281,9 @@ class BatchService:
             message_kind = MessageKind(
                 plan.message_kind if message_kind_override is None else message_kind_override
             )
-            message_text = plan.message_text if message_text_override is None else message_text_override
+            message_text = (
+                plan.message_text if message_text_override is None else message_text_override
+            )
             if message_kind is MessageKind.SPARK_STICKER:
                 message_text = ""
             targets = self._select_targets(target_ids)
@@ -498,7 +503,9 @@ class BatchService:
                                 {"attempt_id": attempt_id, "batch_id": batch_id},
                             )
                         if progress:
-                            progress(label, detail)
+                            progress(
+                                label, progress_failure_label(mode, result_status, result_code)
+                            )
                         if exc.fatal:
                             fatal_error = exc.code
                             results.extend(self._cancel_remaining(targets[index + 1 :]))
@@ -544,7 +551,7 @@ class BatchService:
                                 {"attempt_id": attempt_id, "batch_id": batch_id},
                             )
                         if progress:
-                            progress(label, detail)
+                            progress(label, progress_failure_label(mode, status, code))
         except AutomationError as exc:
             fatal_error = exc.code
             self.database.record_event(
@@ -577,10 +584,13 @@ class BatchService:
 
     def _select_targets(self, target_ids: Iterable[int] | None) -> list[Target]:
         enabled = self.database.list_targets(enabled_only=True)
-        if target_ids is None:
-            return enabled
-        selected = {int(value) for value in target_ids}
-        return [target for target in enabled if target.id in selected]
+        if target_ids is not None:
+            selected = {int(value) for value in target_ids}
+            enabled = [target for target in enabled if target.id in selected]
+        for target in enabled:
+            if not identity_key(target.profile_url, target.evidence):
+                raise ValueError(f"好友“{target.display_name}”缺少可靠身份，请先重新确认")
+        return enabled
 
     def _persist_automation_failure(
         self,
@@ -694,6 +704,6 @@ class BatchService:
         unknown = sum(result.status is AttemptStatus.UNKNOWN for result in results)
         duplicate = sum(result.status is AttemptStatus.DUPLICATE for result in results)
         return (
-            f"批次结束，状态 {status.value}，成功 {success}，失败 {failed}，"
+            f"批次结束，状态 {status_label(status.value)}，成功 {success}，失败 {failed}，"
             f"结果不确定 {unknown}，重复跳过 {duplicate}"
         )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import date
 
@@ -10,6 +12,7 @@ from spark_keeper.database import (
     DatabaseCompatibilityError,
     DatabaseInitializationError,
 )
+from spark_keeper.identity import canonical_profile_url, identities_match, identity_key
 from spark_keeper.models import AttemptStatus, BatchMode, BatchStatus, FriendCandidate, MessageKind
 from spark_keeper.mutex import AlreadyRunningError, WindowsTaskMutex
 
@@ -19,12 +22,11 @@ def fixed_send_day(monkeypatch):
     monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-04")
 
 
-
 def candidate(key: str, name: str = "测试好友") -> FriendCandidate:
     return FriendCandidate(
         stable_key=key,
         display_name=name,
-        douyin_id=f"id-{key}",
+        profile_url=f"https://www.douyin.com/user/{key}",
         evidence={"identity_strength": "strong"},
     )
 
@@ -41,7 +43,7 @@ def test_initialize_is_idempotent(tmp_path) -> None:
     first = Database(path)
     second = Database(path)
     assert first.get_plan().send_time == "09:00"
-    assert second.get_meta("schema_version") == "3"
+    assert second.get_meta("schema_version") == "4"
     assert (first.get_plan().delay_min_seconds, first.get_plan().delay_max_seconds) == (3, 8)
     assert not (tmp_path / "backups").exists()
 
@@ -72,7 +74,7 @@ def test_v1_database_migrates_inter_target_delay_defaults(tmp_path) -> None:
     database = Database(path)
 
     plan = database.get_plan()
-    assert database.get_meta("schema_version") == "3"
+    assert database.get_meta("schema_version") == "4"
     assert plan.message_text == "旧计划"
     assert plan.message_kind is MessageKind.TEXT
     assert (plan.delay_min_seconds, plan.delay_max_seconds) == (3, 8)
@@ -284,12 +286,12 @@ def test_reconfirm_stable_key_beyond_five_updates_existing_target(tmp_path, enab
     database.set_target_enabled(target.id, enabled)
     assert len(database.list_targets(enabled_only=True)) > 5
 
-    confirmed = database.add_target(candidate(target.stable_key, "更新后的好友"), "更新后的搜索词")
+    confirmed = database.add_target(candidate("friend-0", "更新后的好友"), "更新后的搜索词")
 
     assert confirmed.id == target.id
     assert confirmed.stable_key == target.stable_key
     assert confirmed.display_name == "更新后的好友"
-    assert confirmed.search_query == "更新后的搜索词"
+    assert confirmed.search_query == "更新后的好友"
     assert confirmed.enabled
     assert database.get_target(target.id) == confirmed
     assert database.list_targets() == [confirmed, *targets[1:]]
@@ -412,23 +414,29 @@ def test_v2_migration_preserves_plan_history_guard_and_legacy_snapshot(tmp_path)
     reopened = Database(path)
 
     assert migrated.get_plan() == previous
-    assert reopened.get_meta("schema_version") == "3"
+    assert reopened.get_meta("schema_version") == "4"
     history = migrated.list_history()[0]
     assert (history["message_kind"], history["message_text"]) == ("text", "旧历史正文")
     assert history["id"] == reservation.attempt_id
     assert migrated.has_daily_guard(account.platform_user_id, target.id, "2026-09-04")
     assert migrated.list_pending_actions()[0]["payload"] == {
-        "message_text": "旧快照", "target_ids": [target.id], "message_kind": "text"
+        "message_text": "旧快照",
+        "target_ids": [target.id],
+        "message_kind": "text",
     }
     backups = list((path.parent.parent / "backups").glob("*.sqlite3"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as backup:
-        assert backup.execute(
-            "SELECT value FROM app_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "2"
-        assert backup.execute(
-            "SELECT message_text FROM send_attempts WHERE id = ?", (reservation.attempt_id,)
-        ).fetchone()[0] == "旧历史正文"
+        assert (
+            backup.execute("SELECT value FROM app_meta WHERE key = 'schema_version'").fetchone()[0]
+            == "2"
+        )
+        assert (
+            backup.execute(
+                "SELECT message_text FROM send_attempts WHERE id = ?", (reservation.attempt_id,)
+            ).fetchone()[0]
+            == "旧历史正文"
+        )
         assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -438,7 +446,10 @@ def test_message_kind_plan_and_attempt_history_round_trip(tmp_path, kind) -> Non
     account, target = setup_target(database)
     expected_text = " 原始文本 " if kind is MessageKind.TEXT else ""
     plan = database.save_plan(
-        enabled=True, send_time="09:00", message_text=" 原始文本 ", confirmed=True,
+        enabled=True,
+        send_time="09:00",
+        message_text=" 原始文本 ",
+        confirmed=True,
         message_kind=kind,
     )
     assert plan.message_kind is kind
@@ -446,15 +457,23 @@ def test_message_kind_plan_and_attempt_history_round_trip(tmp_path, kind) -> Non
     assert plan.confirmed_at
     batch = database.start_batch(BatchMode.MANUAL, target_count=1)
     reservation = database.reserve_attempt(
-        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
-        run_date="2026-09-04", message_text=" 原始文本 ", manual_override=False,
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-09-04",
+        message_text=" 原始文本 ",
+        manual_override=False,
         message_kind=kind,
     )
     database.mark_attempt_triggered(reservation.attempt_id)
     database.finish_attempt(reservation.attempt_id, AttemptStatus.SUCCESS)
     terminal = database.record_terminal_attempt(
-        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
-        run_date="2026-09-05", message_text=" 原始文本 ", status=AttemptStatus.FAILED,
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-09-05",
+        message_text=" 原始文本 ",
+        status=AttemptStatus.FAILED,
         message_kind=kind,
     )
     assert {row["id"] for row in database.list_history()} == {reservation.attempt_id, terminal}
@@ -466,13 +485,14 @@ def test_message_kind_plan_and_attempt_history_round_trip(tmp_path, kind) -> Non
 def test_daily_guard_spans_kinds_and_preserves_manual_override_audit(tmp_path, first_kind) -> None:
     database = Database(tmp_path / "state.sqlite3")
     account, target = setup_target(database)
-    other_kind = (
-        MessageKind.SPARK_STICKER if first_kind is MessageKind.TEXT else MessageKind.TEXT
-    )
+    other_kind = MessageKind.SPARK_STICKER if first_kind is MessageKind.TEXT else MessageKind.TEXT
     batch = database.start_batch(BatchMode.MANUAL, target_count=1)
     common = {
-        "batch_id": batch, "account_key": account.platform_user_id, "target_id": target.id,
-        "run_date": "2026-09-04", "message_text": "文本",
+        "batch_id": batch,
+        "account_key": account.platform_user_id,
+        "target_id": target.id,
+        "run_date": "2026-09-04",
+        "message_text": "文本",
     }
     first = database.reserve_attempt(**common, message_kind=first_kind, manual_override=False)
     database.mark_attempt_triggered(first.attempt_id)
@@ -494,13 +514,19 @@ def test_daily_guard_spans_kinds_and_preserves_manual_override_audit(tmp_path, f
 def test_plan_kind_validation_and_database_failure_leave_previous_plan_intact(tmp_path) -> None:
     database = Database(tmp_path / "state.sqlite3")
     previous = database.save_plan(
-        enabled=True, send_time="09:00", message_text="", confirmed=True,
+        enabled=True,
+        send_time="09:00",
+        message_text="",
+        confirmed=True,
         message_kind=MessageKind.SPARK_STICKER,
     )
     for kind, text in (("unsupported", "文本"), (MessageKind.TEXT, " ")):
         with pytest.raises(ValueError):
             database.save_plan(
-                enabled=True, send_time="10:00", message_text=text, confirmed=True,
+                enabled=True,
+                send_time="10:00",
+                message_text=text,
+                confirmed=True,
                 message_kind=kind,
             )
         assert database.get_plan() == previous
@@ -511,7 +537,10 @@ def test_plan_kind_validation_and_database_failure_leave_previous_plan_intact(tm
         )
     with pytest.raises(sqlite3.IntegrityError, match="plan write failed"):
         database.save_plan(
-            enabled=True, send_time="10:00", message_text="新文本", confirmed=True,
+            enabled=True,
+            send_time="10:00",
+            message_text="新文本",
+            confirmed=True,
             message_kind=MessageKind.TEXT,
         )
     assert database.get_plan() == previous
@@ -523,13 +552,19 @@ def test_unknown_attempt_kind_is_rejected_before_writing(tmp_path, method) -> No
     account, target = setup_target(database)
     batch = database.start_batch(BatchMode.MANUAL, target_count=1)
     options = (
-        {"manual_override": False} if method == "reserve_attempt"
+        {"manual_override": False}
+        if method == "reserve_attempt"
         else {"status": AttemptStatus.FAILED}
     )
     with pytest.raises(ValueError):
         getattr(database, method)(
-            batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
-            run_date="2026-09-04", message_text="文本", message_kind="unsupported", **options,
+            batch_id=batch,
+            account_key=account.platform_user_id,
+            target_id=target.id,
+            run_date="2026-09-04",
+            message_text="文本",
+            message_kind="unsupported",
+            **options,
         )
     assert database.count_rows("send_attempts") == 0
     assert database.count_rows("daily_send_guards") == 0
@@ -559,7 +594,7 @@ def test_future_schema_rejected_without_any_database_write(tmp_path) -> None:
         connection.execute("UPDATE app_meta SET value = '999' WHERE key = 'schema_version'")
     before = {item.name: item.read_bytes() for item in path.parent.iterdir()}
 
-    with pytest.raises(DatabaseCompatibilityError, match="999.*3"):
+    with pytest.raises(DatabaseCompatibilityError, match="999.*4"):
         Database(path)
 
     assert {item.name: item.read_bytes() for item in path.parent.iterdir()} == before
@@ -576,7 +611,7 @@ def test_future_schema_in_wal_rejected_without_changing_persistent_data(tmp_path
         keeper.commit()
         wal = path.with_name(path.name + "-wal")
         before = (path.read_bytes(), wal.read_bytes())
-        with pytest.raises(DatabaseCompatibilityError, match="999.*3"):
+        with pytest.raises(DatabaseCompatibilityError, match="999.*4"):
             Database(path)
         # SQLite read-only WAL readers may update volatile SHM reader marks,
         # but neither the database nor its committed WAL may be modified.
@@ -597,9 +632,12 @@ def test_backup_failure_stops_before_schema_changes(tmp_path) -> None:
 
     assert path.read_bytes() == before
     with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT value FROM app_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "1"
+        assert (
+            connection.execute(
+                "SELECT value FROM app_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "1"
+        )
 
 
 def test_migration_failure_rolls_back_all_ddl_and_keeps_backup(tmp_path, monkeypatch) -> None:
@@ -622,9 +660,12 @@ def test_migration_failure_rolls_back_all_ddl_and_keeps_backup(tmp_path, monkeyp
     assert len(backups) == 1
     with sqlite3.connect(path) as original, sqlite3.connect(backups[0]) as backup:
         assert list(original.iterdump()) == list(backup.iterdump())
-        assert original.execute(
-            "SELECT name FROM sqlite_master WHERE name IN ('partial_migration', 'send_attempts')"
-        ).fetchall() == []
+        assert (
+            original.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('partial_migration', 'send_attempts')"
+            ).fetchall()
+            == []
+        )
 
 
 def test_migration_backup_includes_committed_wal_and_is_not_reused(tmp_path) -> None:
@@ -642,10 +683,15 @@ def test_migration_backup_includes_committed_wal_and_is_not_reused(tmp_path) -> 
         backups = list((tmp_path / "backups").glob("*.sqlite3"))
         assert len(backups) == 1
         with sqlite3.connect(backups[0]) as backup:
-            assert backup.execute("SELECT message_text FROM plan").fetchone()[0] == "仅在WAL中的计划"
-            assert backup.execute(
-                "SELECT value FROM app_meta WHERE key = 'schema_version'"
-            ).fetchone()[0] == "2"
+            assert (
+                backup.execute("SELECT message_text FROM plan").fetchone()[0] == "仅在WAL中的计划"
+            )
+            assert (
+                backup.execute(
+                    "SELECT value FROM app_meta WHERE key = 'schema_version'"
+                ).fetchone()[0]
+                == "2"
+            )
             assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         migrated.save_plan(
             enabled=False, send_time="10:30", message_text="升级后新业务", confirmed=True
@@ -707,17 +753,23 @@ def test_maintenance_lock_normalizes_aliases_without_holding_automation_lock(
     database = Database(path)
     with WindowsTaskMutex(), pytest.raises(AlreadyRunningError), WindowsTaskMutex():
         pass
-    assert database.get_meta("schema_version") == "3"
+    assert database.get_meta("schema_version") == "4"
 
 
-@pytest.mark.parametrize("outcome", [AttemptStatus.SUCCESS, AttemptStatus.UNKNOWN, AttemptStatus.FAILED])
+@pytest.mark.parametrize(
+    "outcome", [AttemptStatus.SUCCESS, AttemptStatus.UNKNOWN, AttemptStatus.FAILED]
+)
 def test_trigger_migrates_only_own_reservation_to_actual_day(tmp_path, monkeypatch, outcome):
     database = Database(tmp_path / "state.sqlite3")
     account, target = setup_target(database)
     batch = database.start_batch(BatchMode.MANUAL, target_count=1)
     reservation = database.reserve_attempt(
-        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
-        run_date="2026-09-04", message_text="跨日", manual_override=False,
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-09-04",
+        message_text="跨日",
+        manual_override=False,
     )
     monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-05")
     assert database.mark_attempt_triggered(reservation.attempt_id)
@@ -730,12 +782,20 @@ def test_trigger_migrates_only_own_reservation_to_actual_day(tmp_path, monkeypat
     )
 
 
-@pytest.mark.parametrize("existing_status", [
-    AttemptStatus.SENDING, AttemptStatus.SUCCESS, AttemptStatus.UNKNOWN,
-])
+@pytest.mark.parametrize(
+    "existing_status",
+    [
+        AttemptStatus.SENDING,
+        AttemptStatus.SUCCESS,
+        AttemptStatus.UNKNOWN,
+    ],
+)
 @pytest.mark.parametrize("manual_override", [False, True])
 def test_cross_day_guard_conflict_rejects_without_changing_existing_audit(
-    tmp_path, monkeypatch, existing_status, manual_override,
+    tmp_path,
+    monkeypatch,
+    existing_status,
+    manual_override,
 ):
     database = Database(tmp_path / "state.sqlite3")
     account, target = setup_target(database)
@@ -751,13 +811,17 @@ def test_cross_day_guard_conflict_rejects_without_changing_existing_audit(
         assert database.mark_attempt_triggered(old.attempt_id)
         database.finish_attempt(old.attempt_id, AttemptStatus.UNKNOWN)
         reservation = database.reserve_attempt(
-            **common, run_date="2026-09-04", manual_override=True,
+            **common,
+            run_date="2026-09-04",
+            manual_override=True,
         )
     else:
         reservation = old
     monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-05")
     existing = database.reserve_attempt(
-        **common, run_date="2026-09-05", manual_override=False,
+        **common,
+        run_date="2026-09-05",
+        manual_override=False,
     )
     if existing_status is not AttemptStatus.SENDING:
         assert database.mark_attempt_triggered(existing.attempt_id)
@@ -768,12 +832,13 @@ def test_cross_day_guard_conflict_rejects_without_changing_existing_audit(
     assert rejected["status"] == AttemptStatus.DUPLICATE.value
     assert rejected["triggered_at"] is None
     assert rejected["manual_override"] == int(manual_override)
-    assert rejected["override_of"] == (
-        old.attempt_id if manual_override else existing.attempt_id
-    )
+    assert rejected["override_of"] == (old.attempt_id if manual_override else existing.attempt_id)
     assert database.get_attempt(existing.attempt_id) == previous
     assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-05")
-    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-04") == manual_override
+    assert (
+        database.has_daily_guard(account.platform_user_id, target.id, "2026-09-04")
+        == manual_override
+    )
 
 
 def test_manual_override_without_existing_guard_expires_at_midnight(tmp_path, monkeypatch):
@@ -781,8 +846,12 @@ def test_manual_override_without_existing_guard_expires_at_midnight(tmp_path, mo
     account, target = setup_target(database)
     batch = database.start_batch(BatchMode.MANUAL, target_count=1)
     reservation = database.reserve_attempt(
-        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
-        run_date="2026-09-04", message_text="跨日", manual_override=True,
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-09-04",
+        message_text="跨日",
+        manual_override=True,
     )
     monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-05")
     assert not database.mark_attempt_triggered(reservation.attempt_id)
@@ -795,8 +864,12 @@ def test_trigger_day_migration_rolls_back_if_trigger_write_fails(tmp_path, monke
     account, target = setup_target(database)
     batch = database.start_batch(BatchMode.MANUAL, target_count=1)
     reservation = database.reserve_attempt(
-        batch_id=batch, account_key=account.platform_user_id, target_id=target.id,
-        run_date="2026-09-04", message_text="跨日", manual_override=False,
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-09-04",
+        message_text="跨日",
+        manual_override=False,
     )
     with database.connect(immediate=True) as connection:
         connection.execute(
@@ -811,3 +884,303 @@ def test_trigger_day_migration_rolls_back_if_trigger_write_fails(tmp_path, monke
     assert row["triggered_at"] is None
     assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-04")
     assert not database.has_daily_guard(account.platform_user_id, target.id, "2026-09-05")
+
+
+def create_number_legacy_database(path, version=3):
+    database = Database(path)
+    account = database.save_account("synthetic-account", "合成账号")
+    targets = [
+        database.add_target(candidate(f"old-{index}", f"合成好友{index}"), "旧查询")
+        for index in range(2)
+    ]
+    batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    reservation = database.reserve_attempt(
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=targets[0].id,
+        run_date="2026-09-04",
+        message_text="历史正文 synthetic-number",
+        manual_override=False,
+    )
+    database.mark_attempt_triggered(reservation.attempt_id)
+    database.finish_attempt(reservation.attempt_id, AttemptStatus.SUCCESS)
+    database.record_event("INFO", "legacy_audit", "原始诊断 synthetic-number")
+    profiles = [
+        "http://douyin.com/user/first/?from=synthetic-number#section",
+        "http://douyin.com/user/reliable/?from=synthetic-number#section",
+    ]
+    with database.connect(immediate=True) as connection:
+        connection.execute("ALTER TABLE targets ADD COLUMN douyin_id TEXT NOT NULL DEFAULT ''")
+        for index, target in enumerate(targets):
+            connection.execute(
+                "UPDATE targets SET douyin_id = ?, stable_key = ?, profile_url = ?, "
+                "search_query = ?, evidence_json = ? WHERE id = ?",
+                (
+                    f"synthetic-number-{index}",
+                    f"number-key-{index}",
+                    profiles[index],
+                    f"synthetic-number-{index}",
+                    json.dumps(
+                        {
+                            "douyin_id": f"synthetic-number-{index}",
+                            "ids": [f"synthetic-number-{index}"],
+                            "raw_text": f"抖音号 synthetic-number-{index}",
+                            "nested": {"number": "synthetic-number"},
+                            "scan_conversation_digest": "a" * 64,
+                            "identity_strength": "strong",
+                            "chat_type": "single",
+                        }
+                    ),
+                    target.id,
+                ),
+            )
+        connection.execute(
+            "UPDATE app_meta SET value = ? WHERE key = 'schema_version'", (str(version),)
+        )
+    return account, targets, reservation.attempt_id
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_number_field_migration_preserves_reliable_ids_history_and_guards(tmp_path, version):
+    path = tmp_path / "data" / "state.sqlite3"
+    account, old, attempt_id = create_number_legacy_database(path, version)
+    migrated = Database(path)
+    targets = migrated.list_targets()
+    assert migrated.get_meta("schema_version") == "4"
+    assert [target.id for target in targets] == [target.id for target in old]
+    assert [target.id for target in migrated.list_targets(enabled_only=True)] == [
+        target.id for target in old
+    ]
+    assert targets[1].profile_url == "https://www.douyin.com/user/reliable"
+    assert targets[1].stable_key == identity_key(targets[1].profile_url, {})
+    with migrated.connect() as connection:
+        assert "douyin_id" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(targets)")
+        }
+        active = str([tuple(row) for row in connection.execute("SELECT * FROM targets")])
+        assert "synthetic-number" not in active
+        assert "number-key" not in active
+        assert "scan_conversation_digest" not in active
+    assert all(target.search_query == target.display_name for target in targets)
+    assert migrated.get_attempt(attempt_id)["message_text"] == "历史正文 synthetic-number"
+    assert migrated.has_daily_guard(account.platform_user_id, old[0].id, "2026-09-04")
+    assert migrated.list_events()[0]["message"] == "原始诊断 synthetic-number"
+    backups = list((tmp_path / "backups").glob("*.sqlite3"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup:
+        assert (
+            backup.execute("SELECT douyin_id FROM targets WHERE id = ?", (old[0].id,)).fetchone()[0]
+            == "synthetic-number-0"
+        )
+        assert backup.execute("SELECT target_id FROM daily_send_guards").fetchone()[0] == old[0].id
+
+
+def test_schema_four_empty_database_has_no_number_column(tmp_path):
+    database = Database(tmp_path / "state.sqlite3")
+    with database.connect() as connection:
+        assert "douyin_id" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(targets)")
+        }
+
+
+def test_number_migration_failure_rolls_back_drop_and_identity_updates(tmp_path, monkeypatch):
+    path = tmp_path / "data" / "state.sqlite3"
+    create_number_legacy_database(path)
+    with sqlite3.connect(path) as connection:
+        before = list(connection.iterdump())
+    migrate = Database._migrate_schema
+
+    def fail_after_drop(connection):
+        migrate(connection)
+        raise sqlite3.OperationalError("合成迁移故障")
+
+    monkeypatch.setattr(Database, "_migrate_schema", staticmethod(fail_after_drop))
+    with pytest.raises(DatabaseInitializationError, match="事务已回滚"):
+        Database(path)
+    with sqlite3.connect(path) as connection:
+        assert list(connection.iterdump()) == before
+    backups = list((tmp_path / "backups").glob("*.sqlite3"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup:
+        assert list(backup.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.douyin.com/user/synthetic",
+        "http://douyin.com/user/synthetic/?from=obsolete-number#tab",
+        "HTTPS://WWW.DOUYIN.COM/user/synthetic/",
+    ],
+)
+def test_profile_identity_canonicalization(url):
+    canonical = "https://www.douyin.com/user/synthetic"
+    assert canonical_profile_url(url) == canonical
+    assert identity_key(url, {}) == hashlib.sha256(f"profile:{canonical}".encode()).hexdigest()
+    assert identities_match(url, {}, canonical, {})
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "https://www.douyin.com/user/self",
+        "https://evil.example/user/synthetic",
+        "https://www.douyin.com@evil.example/user/synthetic",
+        "https://www.douyin.com/user/synthetic/chat",
+        "javascript:alert(1)",
+    ],
+)
+def test_invalid_profile_is_not_identity(url):
+    assert canonical_profile_url(url) == ""
+    assert identity_key(url, {}) == ""
+
+
+def test_conversation_identity_requires_trusted_source_and_profiles_win_conflicts():
+    trusted = {"identity_source": "sdk_single_conversation", "conversation_digest": "a" * 64}
+    other = {"identity_source": "sdk_single_conversation", "conversation_digest": "b" * 64}
+    assert identity_key("", trusted) == "sdk-conversation:" + "a" * 64
+    assert identity_key("", {"scan_conversation_digest": "a" * 64}) == ""
+    assert identity_key("", {"conversation_digest": "a" * 64}) == ""
+    assert identity_key("", {**trusted, "conversation_digest": "not-a-digest"}) == ""
+    assert identities_match("", trusted, "", trusted)
+    assert not identities_match("", trusted, "", other)
+    assert not identities_match("", {}, "", {})
+    assert not identities_match(
+        "https://www.douyin.com/user/left",
+        trusted,
+        "https://www.douyin.com/user/right",
+        trusted,
+    )
+    assert identities_match(
+        "https://www.douyin.com/user/same",
+        trusted,
+        "https://douyin.com/user/same/?query=removed",
+        other,
+    )
+
+
+def test_weak_candidate_rejected_and_new_saves_remove_number_evidence(tmp_path):
+    database = Database(tmp_path / "state.sqlite3")
+    with pytest.raises(ValueError, match="稳定身份"):
+        database.add_target(FriendCandidate("arbitrary-key", "无身份"), "无身份")
+    target = database.add_target(
+        FriendCandidate(
+            "arbitrary-key",
+            "可靠名称",
+            profile_url="http://douyin.com/user/safe/?id=synthetic-number",
+            evidence={
+                "douyin_id": "synthetic-number",
+                "raw_text": "synthetic-number",
+                "scan_conversation_digest": "a" * 64,
+            },
+        ),
+        "synthetic-number",
+    )
+    assert target.stable_key == identity_key(target.profile_url, target.evidence)
+    assert target.search_query == "可靠名称"
+    assert target.evidence == {}
+
+
+def test_migration_profile_collision_rolls_back_without_merging_history(tmp_path):
+    path = tmp_path / "data" / "state.sqlite3"
+    create_number_legacy_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE targets SET profile_url = 'https://www.douyin.com/user/collision'"
+        )
+    with sqlite3.connect(path) as connection:
+        before = list(connection.iterdump())
+    with pytest.raises(DatabaseInitializationError, match="事务已回滚"):
+        Database(path)
+    with sqlite3.connect(path) as connection:
+        assert list(connection.iterdump()) == before
+    assert len(list((tmp_path / "backups").glob("*.sqlite3"))) == 1
+
+
+def test_sdk_identity_migration_normalizes_key_without_profile(tmp_path):
+    path = tmp_path / "data" / "state.sqlite3"
+    _, targets, _ = create_number_legacy_database(path)
+    evidence = {"identity_source": "sdk_single_conversation", "conversation_digest": "c" * 64}
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE targets SET profile_url = '', evidence_json = ? WHERE id = ?",
+            (json.dumps(evidence), targets[1].id),
+        )
+    database = Database(path)
+    migrated = database.get_target(targets[1].id)
+    assert migrated.stable_key == "sdk-conversation:" + "c" * 64
+    assert migrated.evidence == evidence
+    assert migrated.enabled
+
+
+def test_normalized_add_keeps_original_id_and_same_day_guard(tmp_path):
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    reservation = database.reserve_attempt(
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-09-04",
+        message_text="已发送",
+        manual_override=False,
+    )
+    database.mark_attempt_triggered(reservation.attempt_id)
+    database.finish_attempt(reservation.attempt_id, AttemptStatus.SUCCESS)
+    updated = database.add_target(
+        FriendCandidate(
+            "different-observation-key",
+            "新名称",
+            profile_url="http://douyin.com/user/friend-key/?source=search",
+        ),
+        "ignored-query",
+    )
+    assert updated.id == target.id
+    assert updated.search_query == updated.display_name
+    assert len(database.list_targets()) == 1
+    duplicate = database.reserve_attempt(
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=updated.id,
+        run_date="2026-09-04",
+        message_text="再次发送",
+        manual_override=False,
+    )
+    assert not duplicate.allowed and duplicate.conflicting_attempt_id == reservation.attempt_id
+
+
+def test_weak_target_cannot_be_enabled_reserved_or_triggered(tmp_path):
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    reservation = database.reserve_attempt(
+        batch_id=batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-09-04",
+        message_text="保留防重",
+        manual_override=False,
+    )
+    with database.connect(immediate=True) as connection:
+        connection.execute("UPDATE targets SET profile_url = '', evidence_json = '{}', enabled = 0")
+    for enable in (
+        lambda: database.set_target_enabled(target.id, True),
+        lambda: database.set_targets_enabled([target.id], True),
+    ):
+        with pytest.raises(ValueError, match="稳定身份"):
+            enable()
+    with pytest.raises(ValueError, match="稳定身份"):
+        database.reserve_attempt(
+            batch_id=batch,
+            account_key=account.platform_user_id,
+            target_id=target.id,
+            run_date="2026-09-04",
+            message_text="不得发送",
+            manual_override=True,
+        )
+    with pytest.raises(ValueError, match="稳定身份"):
+        database.mark_attempt_triggered(reservation.attempt_id)
+    assert database.get_attempt(reservation.attempt_id)["triggered_at"] is None
+    assert database.count_rows("send_attempts") == 1
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-09-04")

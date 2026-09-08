@@ -1,11 +1,12 @@
-"""Shared light-blue Qt theme and native widget constructors."""
+"""Shared semantic Qt palettes and native widget constructors."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSignalBlocker, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -21,180 +22,341 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from spark_keeper.models import ThemeMode
+
 FONT_FAMILY = "Microsoft YaHei UI"
-APP_BG = "#eef2f9"
-CARD_BG = "#ffffff"
-CARD_BORDER = "#dbe3f0"
-BORDER = CARD_BORDER
-SIDEBAR_BG = "#e3e9f4"
-SIDEBAR_HOVER = "#d7e0f0"
-TEXT = "#1f2937"
-TEXT_MUTED = "#6b7280"
-ACCENT = "#2563eb"
-ACCENT_ACTIVE = "#1e40af"
-ACCENT_PRESSED = "#1a3690"
-ACCENT_DISABLED = "#9db4e8"
-ACCENT_SOFT = "#e2ebfd"
-SUCCESS = "#15803d"
-SUCCESS_SOFT = "#e6f4ea"
-WARNING = "#b45309"
-WARNING_SOFT = "#fbf0dd"
-DANGER = "#b91c1c"
-DANGER_SOFT = "#fbeaea"
-DANGER_BORDER = "#e3b7b3"
-NEUTRAL_SOFT = "#e8edf5"
-ROW_ALT = "#f4f7fc"
-HEADING_BG = "#ecf1f8"
-BTN_ACTIVE_BORDER = "#c4cfe3"
-BTN_PRESSED_BG = "#e5ebf5"
-NAV_SELECTED_BG = "#bdd2f5"
-NAV_SELECTED_HOVER = "#adc7f0"
+
+
+@dataclass(frozen=True, slots=True)
+class ThemeColors:
+    app_bg: str
+    card_bg: str
+    card_border: str
+    sidebar_bg: str
+    sidebar_hover: str
+    text: str
+    text_muted: str
+    accent: str
+    accent_active: str
+    accent_pressed: str
+    accent_disabled: str
+    accent_soft: str
+    success: str
+    success_soft: str
+    warning: str
+    warning_soft: str
+    danger: str
+    danger_soft: str
+    danger_border: str
+    neutral_soft: str
+    row_alt: str
+    heading_bg: str
+    btn_active_border: str
+    btn_pressed_bg: str
+    nav_selected_bg: str
+    nav_selected_hover: str
+    primary_bg: str
+    primary_hover: str
+    primary_pressed: str
+    primary_text: str
+    checkbox_bg: str
+    checkbox_mark: str
+
+
+_LIGHT = ThemeColors(
+    app_bg="#eef2f9",
+    card_bg="#ffffff",
+    card_border="#dbe3f0",
+    sidebar_bg="#e3e9f4",
+    sidebar_hover="#d7e0f0",
+    text="#1f2937",
+    text_muted="#6b7280",
+    accent="#2563eb",
+    accent_active="#1e40af",
+    accent_pressed="#1a3690",
+    accent_disabled="#9db4e8",
+    accent_soft="#e2ebfd",
+    success="#15803d",
+    success_soft="#e6f4ea",
+    warning="#b45309",
+    warning_soft="#fbf0dd",
+    danger="#b91c1c",
+    danger_soft="#fbeaea",
+    danger_border="#e3b7b3",
+    neutral_soft="#e8edf5",
+    row_alt="#f4f7fc",
+    heading_bg="#ecf1f8",
+    btn_active_border="#c4cfe3",
+    btn_pressed_bg="#e5ebf5",
+    nav_selected_bg="#bdd2f5",
+    nav_selected_hover="#adc7f0",
+    primary_bg="#2563eb",
+    primary_hover="#1e40af",
+    primary_pressed="#1a3690",
+    primary_text="#ffffff",
+    checkbox_bg="#ffffff",
+    checkbox_mark="#000000",
+)
+_DARK = ThemeColors(
+    app_bg="#141b27",
+    card_bg="#1c2635",
+    card_border="#3c4c63",
+    sidebar_bg="#182232",
+    sidebar_hover="#25364f",
+    text="#e5edf8",
+    text_muted="#a4b2c7",
+    accent="#7bafff",
+    accent_active="#b4d2ff",
+    accent_pressed="#c9dfff",
+    accent_disabled="#405a82",
+    accent_soft="#2b4263",
+    success="#7cdda2",
+    success_soft="#203d32",
+    warning="#f4c477",
+    warning_soft="#443822",
+    danger="#ffa3a3",
+    danger_soft="#482c35",
+    danger_border="#825262",
+    neutral_soft="#2b3648",
+    row_alt="#202c3e",
+    heading_bg="#273449",
+    btn_active_border="#6380a8",
+    btn_pressed_bg="#31445f",
+    nav_selected_bg="#2c466b",
+    nav_selected_hover="#365580",
+    primary_bg="#2563eb",
+    primary_hover="#2456c5",
+    primary_pressed="#1e479f",
+    primary_text="#ffffff",
+    checkbox_bg="#1c2635",
+    checkbox_mark="#e5edf8",
+)
 NAV_WIDTH = 176
 NAV_HEIGHT = 40
 ROLE_ID = int(Qt.ItemDataRole.UserRole)
 
-_CHIP_TONES = {
-    "success": (SUCCESS, SUCCESS_SOFT),
-    "warning": (WARNING, WARNING_SOFT),
-    "danger": (DANGER, DANGER_SOFT),
-    "accent": (ACCENT, ACCENT_SOFT),
-    "neutral": (TEXT_MUTED, NEUTRAL_SOFT),
-}
+_CHIP_TONES = ("success", "warning", "danger", "accent", "neutral")
 _ROW_TONES = {
-    "normal": TEXT,
-    "neutral": TEXT_MUTED,
-    "muted": TEXT_MUTED,
-    "success": SUCCESS,
-    "warning": WARNING,
-    "danger": DANGER,
-    "accent": ACCENT,
+    "normal": "text",
+    "neutral": "text_muted",
+    "muted": "text_muted",
+    "success": "success",
+    "warning": "warning",
+    "danger": "danger",
+    "accent": "accent",
 }
 
-_STYLESHEET = f"""
-QWidget {{ color: {TEXT}; }}
-QMainWindow, QDialog, QWidget#page {{ background: {APP_BG}; }}
-QWidget#sidebar {{ background: {SIDEBAR_BG}; }}
+
+def colors_for(mode: ThemeMode) -> ThemeColors:
+    """Return immutable colors for an effective (not system-following) mode."""
+    if mode == ThemeMode.LIGHT:
+        return _LIGHT
+    if mode == ThemeMode.DARK:
+        return _DARK
+    raise ValueError(f"Not an effective theme mode: {mode!r}")
+
+
+def current_colors() -> ThemeColors:
+    app = QApplication.instance()
+    mode = app.property("spark-theme-mode") if app is not None else None
+    return colors_for(ThemeMode(mode) if mode is not None else ThemeMode.LIGHT)
+
+
+def resolve_mode(preference: ThemeMode, system_scheme: Qt.ColorScheme) -> ThemeMode:
+    if preference == ThemeMode.SYSTEM:
+        return ThemeMode.DARK if system_scheme == Qt.ColorScheme.Dark else ThemeMode.LIGHT
+    colors_for(preference)
+    return preference
+
+
+def _stylesheet(c: ThemeColors) -> str:
+    stylesheet = f"""
+QWidget {{ color: {c.text}; }}
+QWidget:disabled {{ color: {c.text_muted}; }}
+QMainWindow, QDialog, QWidget#page {{ background: {c.app_bg}; }}
+QWidget#sidebar {{ background: {c.sidebar_bg}; }}
 QScrollArea {{ border: none; background: transparent; }}
 QFrame#card {{
-    background: {CARD_BG}; border: 1px solid {CARD_BORDER}; border-radius: 14px;
+    background: {c.card_bg}; border: 1px solid {c.card_border}; border-radius: 14px;
 }}
 QLabel {{ background: transparent; border: none; }}
 QLabel#page-title {{ font-size: 16pt; font-weight: bold; }}
 QLabel#card-title, QLabel[role="section"] {{ font-size: 10pt; font-weight: bold; }}
 QLabel[role="brand"] {{ font-size: 13pt; font-weight: bold; }}
 QLabel#page-description, QLabel#card-description, QLabel[role="muted"] {{
-    color: {TEXT_MUTED};
+    color: {c.text_muted};
 }}
-QLabel[role="warning"] {{ color: {WARNING}; }}
+QLabel[role="warning"] {{ color: {c.warning}; }}
 QLabel#chip {{ border-radius: 9px; padding: 3px 10px; font-size: 8pt; font-weight: bold; }}
 QPushButton {{
-    background: {CARD_BG}; border: 1px solid {CARD_BORDER}; border-radius: 8px;
+    background: {c.card_bg}; border: 1px solid {c.card_border}; border-radius: 8px;
     padding: 7px 14px; min-height: 18px;
 }}
-QPushButton:hover {{ background: {ROW_ALT}; border-color: {BTN_ACTIVE_BORDER}; }}
-QPushButton:pressed {{ background: {BTN_PRESSED_BG}; }}
-QPushButton:focus {{ border-color: {ACCENT}; }}
-QPushButton:disabled {{ color: {TEXT_MUTED}; background: {CARD_BG}; }}
-QPushButton[variant="primary"] {{ background: {ACCENT}; color: white; border-color: {ACCENT}; }}
-QPushButton[variant="primary"]:hover {{ background: {ACCENT_ACTIVE}; border-color: {ACCENT_ACTIVE}; }}
-QPushButton[variant="primary"]:pressed {{ background: {ACCENT_PRESSED}; }}
-QPushButton[variant="primary"]:disabled {{ background: {ACCENT_DISABLED}; border-color: {ACCENT_DISABLED}; }}
-QPushButton[variant="danger"] {{ color: {DANGER}; border-color: {DANGER_BORDER}; }}
-QPushButton[variant="danger"]:hover {{ background: {DANGER_SOFT}; }}
-QPushButton[variant="danger"]:disabled {{ color: {TEXT_MUTED}; border-color: {CARD_BORDER}; }}
+QPushButton:hover {{ background: {c.row_alt}; border-color: {c.btn_active_border}; }}
+QPushButton:pressed {{ background: {c.btn_pressed_bg}; }}
+QPushButton:focus {{ border-color: {c.accent}; }}
+QPushButton:disabled {{ color: {c.text_muted}; background: {c.card_bg}; }}
+QPushButton[variant="primary"] {{ background: {c.primary_bg}; color: {c.primary_text}; border-color: {c.primary_bg}; }}
+QPushButton[variant="primary"]:hover {{ background: {c.primary_hover}; border-color: {c.primary_hover}; }}
+QPushButton[variant="primary"]:pressed {{ background: {c.primary_pressed}; }}
+QPushButton[variant="primary"]:disabled {{ background: {c.accent_disabled}; border-color: {c.accent_disabled}; }}
+QPushButton[variant="danger"] {{ color: {c.danger}; border-color: {c.danger_border}; }}
+QPushButton[variant="danger"]:hover {{ background: {c.danger_soft}; }}
+QPushButton[variant="danger"]:disabled {{ color: {c.text_muted}; border-color: {c.card_border}; }}
 QPushButton#nav-button {{
-    background: {SIDEBAR_BG}; color: {TEXT}; font-size: 10pt; text-align: left;
+    background: {c.sidebar_bg}; color: {c.text}; font-size: 10pt; text-align: left;
     border: 1px solid transparent; border-left: 3px solid transparent;
     border-radius: 9px; padding: 8px 12px 8px 17px; min-height: 22px;
 }}
-QPushButton#nav-button:hover {{ background: {SIDEBAR_HOVER}; }}
+QPushButton#nav-button:hover {{ background: {c.sidebar_hover}; }}
 QPushButton#nav-button:checked {{
-    background: {NAV_SELECTED_BG}; color: {ACCENT_ACTIVE}; border-left-color: {ACCENT};
+    background: {c.nav_selected_bg}; color: {c.accent_active}; border-left-color: {c.accent};
 }}
-QPushButton#nav-button:checked:hover {{ background: {NAV_SELECTED_HOVER}; }}
-QPushButton#nav-button:focus {{ border-top-color: {ACCENT}; border-right-color: {ACCENT}; border-bottom-color: {ACCENT}; }}
-QPushButton#nav-button:disabled {{ background: {SIDEBAR_BG}; color: {TEXT_MUTED}; }}
-QPushButton#nav-button:checked:disabled {{ background: {NAV_SELECTED_BG}; color: {ACCENT_ACTIVE}; }}
+QPushButton#nav-button:checked:hover {{ background: {c.nav_selected_hover}; }}
+QPushButton#nav-button:focus {{ border-top-color: {c.accent}; border-right-color: {c.accent}; border-bottom-color: {c.accent}; }}
+QPushButton#nav-button:disabled {{ background: {c.sidebar_bg}; color: {c.text_muted}; }}
+QPushButton#nav-button:checked:disabled {{ background: {c.nav_selected_bg}; color: {c.accent_active}; }}
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTimeEdit, QDateEdit {{
-    background: {CARD_BG}; color: {TEXT}; border: 1px solid {CARD_BORDER};
-    border-radius: 7px; padding: 6px 8px; selection-background-color: {ACCENT_SOFT};
-    selection-color: {TEXT};
+    background: {c.card_bg}; color: {c.text}; border: 1px solid {c.card_border};
+    border-radius: 7px; padding: 6px 8px; selection-background-color: {c.accent_soft};
+    selection-color: {c.text};
 }}
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
-QComboBox:focus, QTimeEdit:focus, QDateEdit:focus {{ border-color: {ACCENT}; }}
+QComboBox:focus, QTimeEdit:focus, QDateEdit:focus {{ border-color: {c.accent}; }}
 QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QSpinBox:disabled,
 QDoubleSpinBox:disabled, QComboBox:disabled, QTimeEdit:disabled, QDateEdit:disabled {{
-    color: {TEXT_MUTED}; background: {ROW_ALT};
+    color: {c.text_muted}; background: {c.row_alt};
 }}
 QPlainTextEdit[role="mono"] {{ font-family: Consolas; font-size: 10pt; }}
-QComboBox QAbstractItemView {{ background: {CARD_BG}; color: {TEXT}; selection-background-color: {ACCENT_SOFT}; }}
-QCheckBox {{ background: transparent; spacing: 8px; min-height: 24px; padding: 4px 0; }}
-QCheckBox:disabled {{ color: {TEXT_MUTED}; }}
-QCheckBox::indicator {{
-    width: 10px; height: 10px; border: 1px solid black; border-radius: 6px;
-    background: white;
+QComboBox QAbstractItemView {{
+    background: {c.card_bg}; color: {c.text};
+    selection-background-color: {c.accent_soft}; selection-color: {c.text};
 }}
-QCheckBox::indicator:checked, QCheckBox::indicator:indeterminate {{ background: black; }}
-QCheckBox::indicator:focus {{ border-color: {ACCENT}; }}
-QCheckBox::indicator:disabled {{ border-color: {TEXT_MUTED}; }}
-QCheckBox::indicator:checked:disabled, QCheckBox::indicator:indeterminate:disabled {{ background: {TEXT_MUTED}; }}
+QCheckBox {{ background: transparent; spacing: 8px; min-height: 24px; padding: 4px 0; }}
+QCheckBox:disabled, QRadioButton:disabled {{ color: {c.text_muted}; }}
+QCheckBox::indicator {{
+    width: 10px; height: 10px; border: 1px solid {c.checkbox_mark}; border-radius: 6px;
+    background: {c.checkbox_bg};
+}}
+QCheckBox::indicator:checked, QCheckBox::indicator:indeterminate {{ background: {c.checkbox_mark}; }}
+QCheckBox::indicator:focus {{ border-color: {c.accent}; }}
+QCheckBox::indicator:disabled {{ border-color: {c.text_muted}; }}
+QCheckBox::indicator:checked:disabled, QCheckBox::indicator:indeterminate:disabled {{ background: {c.text_muted}; }}
 QTreeWidget {{
-    background: {CARD_BG}; alternate-background-color: {ROW_ALT}; color: {TEXT};
-    border: 1px solid {CARD_BORDER}; border-radius: 7px;
-    selection-background-color: {ACCENT_SOFT}; selection-color: {TEXT};
+    background: {c.card_bg}; alternate-background-color: {c.row_alt}; color: {c.text};
+    border: 1px solid {c.card_border}; border-radius: 7px;
+    selection-background-color: {c.accent_soft}; selection-color: {c.text};
 }}
 QTreeWidget[bordered="false"] {{ border: none; border-radius: 0; }}
 QTreeWidget::item {{ min-height: 28px; padding: 2px 6px; }}
-QTreeWidget::item:selected {{ background: {ACCENT_SOFT}; color: {TEXT}; }}
-QHeaderView {{ background: {HEADING_BG}; }}
+QTreeWidget::item:selected {{ background: {c.accent_soft}; color: {c.text}; }}
+QHeaderView {{ background: {c.heading_bg}; }}
 QHeaderView::section {{
-    background: {HEADING_BG}; color: {TEXT}; font-weight: bold;
-    border: none; border-bottom: 1px solid {CARD_BORDER}; padding: 7px 8px;
+    background: {c.heading_bg}; color: {c.text}; font-weight: bold;
+    border: none; border-bottom: 1px solid {c.card_border}; padding: 7px 8px;
 }}
+QMenu {{ background: {c.card_bg}; color: {c.text}; border: 1px solid {c.card_border}; }}
+QMenu::item:selected {{ background: {c.accent_soft}; color: {c.text}; }}
+QMenu::item:disabled {{ color: {c.text_muted}; }}
+QMenu::separator {{ background: {c.card_border}; height: 1px; }}
 QProgressBar {{
-    background: {NEUTRAL_SOFT}; border: none; border-radius: 4px;
+    background: {c.neutral_soft}; border: none; border-radius: 4px;
     min-height: 8px; max-height: 8px; text-align: center;
 }}
-QProgressBar::chunk {{ background: {ACCENT}; border-radius: 4px; }}
-QToolTip {{ background: {CARD_BG}; color: {TEXT}; border: 1px solid {CARD_BORDER}; padding: 5px; }}
+QProgressBar::chunk {{ background: {c.accent}; border-radius: 4px; }}
+QToolTip {{ background: {c.card_bg}; color: {c.text}; border: 1px solid {c.card_border}; padding: 5px; }}
 """ + "\n".join(
-    f'QLabel#chip[tone="{tone}"] {{ color: {foreground}; background: {background}; }}'
-    for tone, (foreground, background) in _CHIP_TONES.items()
-)
+        f'QLabel#chip[tone="{tone}"] {{ color: '
+        f"{c.text_muted if tone == 'neutral' else getattr(c, tone)}; "
+        f"background: {getattr(c, tone + '_soft')}; }}"
+        for tone in _CHIP_TONES
+    )
+    if c is _DARK:
+        # Fusion derives the native radio outline from Window.darker(150).
+        # Override only dark indicators, keeping the light native rendering intact.
+        stylesheet += f"""
+QRadioButton::indicator {{
+    width: 12px; height: 12px; border: 1px solid {c.text_muted}; border-radius: 7px;
+    background: {c.card_bg};
+}}
+QRadioButton::indicator:checked {{
+    background: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.5, fx: 0.5, fy: 0.5,
+        stop: 0 {c.accent}, stop: 0.45 {c.accent}, stop: 0.46 {c.card_bg}, stop: 1 {c.card_bg});
+}}
+QRadioButton::indicator:hover {{ border-color: {c.accent_active}; }}
+QRadioButton::indicator:focus {{ border-color: {c.accent}; }}
+QRadioButton::indicator:disabled {{ border-color: {c.text_muted}; }}
+QRadioButton::indicator:checked:disabled {{
+    background: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.5, fx: 0.5, fy: 0.5,
+        stop: 0 {c.text_muted}, stop: 0.45 {c.text_muted}, stop: 0.46 {c.card_bg}, stop: 1 {c.card_bg});
+}}
+"""
+    return stylesheet
 
 
-def apply_theme(app: QApplication) -> None:
-    """Apply a readable light palette independently of the desktop's dark mode."""
+def initialize_theme(app: QApplication) -> None:
+    """Initialize native style, font and decoded application icon only once."""
+    if app.property("spark-theme-initialized"):
+        return
     # PNG decoding is built into QtGui; portable builds need no icon/image plugins.
     pixmap = QPixmap(str(Path(__file__).resolve().parents[1] / "assets" / "app-icon.png"))
     if pixmap.isNull():
         raise RuntimeError("软件图标资源无法加载；请检查安装文件。")
+    app.setStyle("Fusion")
     app.setWindowIcon(QIcon(pixmap))
     app.setFont(QFont(FONT_FAMILY, 9))
+    app.setProperty("spark-theme-initialized", True)
+
+
+def apply_theme(app: QApplication, mode: ThemeMode) -> None:
+    """Apply an effective palette without resetting fonts, icons or widget state."""
+    c = colors_for(mode)
+    initialize_theme(app)
     palette = QPalette()
-    for role, color in (
-        (QPalette.ColorRole.Window, APP_BG),
-        (QPalette.ColorRole.WindowText, TEXT),
-        (QPalette.ColorRole.Base, CARD_BG),
-        (QPalette.ColorRole.AlternateBase, ROW_ALT),
-        (QPalette.ColorRole.Text, TEXT),
-        (QPalette.ColorRole.Button, CARD_BG),
-        (QPalette.ColorRole.ButtonText, TEXT),
-        (QPalette.ColorRole.Highlight, ACCENT_SOFT),
-        (QPalette.ColorRole.HighlightedText, TEXT),
-        (QPalette.ColorRole.PlaceholderText, TEXT_MUTED),
-        (QPalette.ColorRole.ToolTipBase, CARD_BG),
-        (QPalette.ColorRole.ToolTipText, TEXT),
+    roles = (
+        (QPalette.ColorRole.Window, c.app_bg),
+        (QPalette.ColorRole.WindowText, c.text),
+        (QPalette.ColorRole.Base, c.card_bg),
+        (QPalette.ColorRole.AlternateBase, c.row_alt),
+        (QPalette.ColorRole.Text, c.text),
+        (QPalette.ColorRole.Button, c.card_bg),
+        (QPalette.ColorRole.ButtonText, c.text),
+        (QPalette.ColorRole.Highlight, c.accent_soft),
+        (QPalette.ColorRole.HighlightedText, c.text),
+        (QPalette.ColorRole.PlaceholderText, c.text_muted),
+        (QPalette.ColorRole.ToolTipBase, c.card_bg),
+        (QPalette.ColorRole.ToolTipText, c.text),
+        (QPalette.ColorRole.Light, c.btn_active_border),
+        (QPalette.ColorRole.Midlight, c.heading_bg),
+        (QPalette.ColorRole.Mid, c.card_border),
+        (QPalette.ColorRole.Dark, c.sidebar_bg),
+        (QPalette.ColorRole.Shadow, c.app_bg),
+        (QPalette.ColorRole.BrightText, c.primary_text),
+        (QPalette.ColorRole.Link, c.accent),
+        (QPalette.ColorRole.LinkVisited, c.accent_active),
+        (QPalette.ColorRole.Accent, c.accent),
+    )
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+        QPalette.ColorGroup.Disabled,
     ):
-        palette.setColor(role, QColor(color))
+        for role, color in roles:
+            palette.setColor(group, role, QColor(color))
     for role in (
         QPalette.ColorRole.WindowText,
         QPalette.ColorRole.Text,
         QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.HighlightedText,
+        QPalette.ColorRole.ToolTipText,
+        QPalette.ColorRole.Link,
+        QPalette.ColorRole.LinkVisited,
     ):
-        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(TEXT_MUTED))
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(c.text_muted))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, QColor(c.row_alt))
+    app.setProperty("spark-theme-mode", mode.value)
     app.setPalette(palette)
-    app.setStyleSheet(_STYLESHEET)
+    app.setStyleSheet(_stylesheet(c))
 
 
 def confirm(parent: QWidget, title: str, text: str) -> bool:
@@ -309,7 +471,23 @@ def set_chip(chip: QLabel, text: str, tone: str) -> None:
 
 
 def set_tree_row_tone(item: QTreeWidgetItem, tone: str) -> None:
-    """Color row text without overriding native selection or alternating fills."""
-    brush = QBrush(QColor(_ROW_TONES[tone]))
+    """Store semantic text color without overriding native selection or fills."""
+    brush = QBrush(QColor(getattr(current_colors(), _ROW_TONES[tone])))
+    item.setData(0, ROLE_ID + 1, tone)
     for column in range(item.columnCount()):
         item.setForeground(column, brush)
+
+
+def refresh_tree_tones(tree: QTreeWidget) -> None:
+    """Recolor existing rows recursively without emitting business item changes."""
+
+    def refresh(parent: QTreeWidgetItem) -> None:
+        for index in range(parent.childCount()):
+            item = parent.child(index)
+            tone = item.data(0, ROLE_ID + 1)
+            if tone in _ROW_TONES:
+                set_tree_row_tone(item, tone)
+            refresh(item)
+
+    with QSignalBlocker(tree):
+        refresh(tree.invisibleRootItem())

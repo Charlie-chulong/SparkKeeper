@@ -38,7 +38,6 @@ def native_target() -> Target:
         id=1,
         stable_key="native-fixture-friend",
         display_name="测试好友",
-        douyin_id="",
         profile_url="https://www.douyin.com/user/native-fixture-friend",
         avatar_url="",
         search_query="测试好友",
@@ -213,8 +212,8 @@ async def test_validation_opens_only_native_panel_and_preserves_composer() -> No
         await adapter.validate_spark_sticker(native_target())
         # Revalidation of an already-open panel must not toggle or select it.
         await adapter.validate_spark_sticker(native_target())
-        assert await page.locator('.componentsemojiemojiPanel').is_visible()
-        assert await page.locator('[contenteditable]').inner_text() == "保留草稿"
+        assert await page.locator(".componentsemojiemojiPanel").is_visible()
+        assert await page.locator("[contenteditable]").inner_text() == "保留草稿"
         assert await page.evaluate("effects") == {"panel": 1, "inputs": 0, "sticker": 0, "send": 0}
         assert await page.evaluate("forbiddenReads") == 0
 
@@ -223,20 +222,33 @@ async def test_validation_opens_only_native_panel_and_preserves_composer() -> No
 @pytest.mark.parametrize(
     "mutation",
     [
-        ("document.querySelector('.componentsemojiemojiPanel').append("
-        "document.querySelector('.emojiEmojiItememojiItem').cloneNode(true))"),
+        (
+            "document.querySelector('.componentsemojiemojiPanel').append("
+            "document.querySelector('.emojiEmojiItememojiItem').cloneNode(true))"
+        ),
         "sticker.static_url += '-wrong-resource'",
         "document.querySelector('.emojiEmojiItemimgBox img').src += '-wrong-resource'",
         "sticker.resource_type = 3",
-        ("document.querySelector('.componentsemojiim-saas-modal')"
-        ".__reactFiber$nativeFixture.return.memoizedProps.conversation = "
-        "{...conversation, id: 'another-conversation'}"),
+        (
+            "document.querySelector('.componentsemojiim-saas-modal')"
+            ".__reactFiber$nativeFixture.return.memoizedProps.conversation = "
+            "{...conversation, id: 'another-conversation'}"
+        ),
         "conversation.lastMessageIndexV2 = null; conversation.maxIndexV2FromServer = null",
-        ("conversation.lastMessageIndexV2 = longIndex('0'); "
-        "conversation.maxIndexV2FromServer = longIndex('0')"),
+        (
+            "conversation.lastMessageIndexV2 = longIndex('0'); "
+            "conversation.maxIndexV2FromServer = longIndex('0')"
+        ),
     ],
-    ids=["duplicate", "wrong-prop-resource", "wrong-image-resource", "wrong-resource-type",
-         "wrong-panel-conversation", "missing-watermark", "zero-watermark"],
+    ids=[
+        "duplicate",
+        "wrong-prop-resource",
+        "wrong-image-resource",
+        "wrong-resource-type",
+        "wrong-panel-conversation",
+        "missing-watermark",
+        "zero-watermark",
+    ],
 )
 async def test_native_validation_rejects_unsafe_panel_without_selecting(mutation: str) -> None:
     async with native_page() as page:
@@ -244,13 +256,13 @@ async def test_native_validation_rejects_unsafe_panel_without_selecting(mutation
         with pytest.raises(PageStructureChanged):
             await DouyinChatAdapter(page).validate_spark_sticker(native_target())
         assert await page.evaluate("effects") == {"panel": 1, "inputs": 0, "sticker": 0, "send": 0}
-        assert await page.locator('[contenteditable]').inner_text() == "保留草稿"
+        assert await page.locator("[contenteditable]").inner_text() == "保留草稿"
 
 
 @pytest.mark.asyncio
 async def test_wrong_recipient_is_rejected_before_opening_panel() -> None:
     async with native_page() as page:
-        await page.locator('.RightPanelHeaderconvHeader span').evaluate(
+        await page.locator(".RightPanelHeaderconvHeader span").evaluate(
             "element => element.textContent = '其他好友'"
         )
         with pytest.raises(TargetIdentityMismatch):
@@ -283,8 +295,15 @@ async def test_snapshot_whitelists_native_outgoing_messages_without_reading_othe
         assert snapshot == {
             "conversationId": CONVERSATION_ID,
             "watermark": WATERMARK,
-            "messages": [{"clientId": "fresh-client", "serverId": "server-1",
-                          "flightStatus": 3, "serverHydrated": False, "indexV2": NEXT_INDEX}],
+            "messages": [
+                {
+                    "clientId": "fresh-client",
+                    "serverId": "server-1",
+                    "flightStatus": 3,
+                    "serverHydrated": False,
+                    "indexV2": NEXT_INDEX,
+                }
+            ],
         }
         assert await page.evaluate("forbiddenReads") == 0
         assert await page.evaluate("effects") == {"panel": 0, "inputs": 0, "sticker": 0, "send": 0}
@@ -326,7 +345,8 @@ async def test_snapshot_uses_maximum_long_watermark_and_preserves_missing_messag
     ],
 )
 async def test_live_server_hydrated_shape_requires_positive_server_proof(
-    mutation: str, confirmed: bool,
+    mutation: str,
+    confirmed: bool,
 ) -> None:
     async with native_page() as page:
         await page.evaluate(
@@ -369,12 +389,20 @@ async def test_live_prototype_wrapper_observes_online_self_acknowledgement() -> 
 
 
 def message(
-    *, client_id: str = "new-client", status: int | None = 3,
-    index: str | None = NEXT_INDEX, server_id: str = "server-1",
+    *,
+    client_id: str = "new-client",
+    status: int | None = 3,
+    index: str | None = NEXT_INDEX,
+    server_id: str = "server-1",
     server_hydrated: bool = False,
 ) -> dict[str, Any]:
-    return {"clientId": client_id, "serverId": server_id, "flightStatus": status,
-            "serverHydrated": server_hydrated, "indexV2": index}
+    return {
+        "clientId": client_id,
+        "serverId": server_id,
+        "flightStatus": status,
+        "serverHydrated": server_hydrated,
+        "indexV2": index,
+    }
 
 
 def snapshot(*messages: dict[str, Any], conversation_id: str = CONVERSATION_ID) -> dict[str, Any]:
@@ -383,8 +411,11 @@ def snapshot(*messages: dict[str, Any], conversation_id: str = CONVERSATION_ID) 
 
 class NativeTimeline:
     def __init__(
-        self, monkeypatch: pytest.MonkeyPatch, frames: list[dict[str, Any] | Exception],
-        *, baseline: dict[str, Any] | None = None,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        frames: list[dict[str, Any] | Exception],
+        *,
+        baseline: dict[str, Any] | None = None,
     ) -> None:
         self.frames = frames
         self.baseline = baseline if baseline is not None else snapshot()
@@ -450,17 +481,29 @@ class NativeTimeline:
         self.now += seconds
         self.index += 1
 
-    async def await_terminal(self, sample: Callable[[], Awaitable[DeliverySample]]) -> DeliveryOutcome:
+    async def await_terminal(
+        self, sample: Callable[[], Awaitable[DeliverySample]]
+    ) -> DeliveryOutcome:
         self.events.append("await")
         return await await_delivery_terminal(
-            sample, timeout_seconds=3, poll_seconds=0.25,
-            clock=lambda: self.now, sleep=self.sleep,
+            sample,
+            timeout_seconds=3,
+            poll_seconds=0.25,
+            clock=lambda: self.now,
+            sleep=self.sleep,
         )
 
     def assert_single_trigger(self) -> None:
         actions = [event for event in self.events if event != "capture-element"]
         assert actions[:8] == [
-            "prepare", "verify", "baseline", "verify", "recheck-panel", "trigger", "click", "await",
+            "prepare",
+            "verify",
+            "baseline",
+            "verify",
+            "recheck-panel",
+            "trigger",
+            "click",
+            "await",
         ]
         assert self.events.count("capture-element") == 1
         assert self.events.index("capture-element") < self.events.index("trigger")
@@ -474,11 +517,16 @@ class NativeTimeline:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status,server_hydrated", [(3, False), (4, False), (None, True)])
 async def test_first_sample_already_successful_requires_stability_and_one_click(
-    monkeypatch: pytest.MonkeyPatch, status: int | None, server_hydrated: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int | None,
+    server_hydrated: bool,
 ) -> None:
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(message(status=status, server_hydrated=server_hydrated)),
-    ])
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(message(status=status, server_hydrated=server_hydrated)),
+        ],
+    )
     await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
     assert timeline.samples > 1
@@ -489,13 +537,18 @@ async def test_first_sample_already_successful_requires_stability_and_one_click(
 @pytest.mark.parametrize("pending_status", [0, 1, 2])
 @pytest.mark.parametrize("terminal_status,server_hydrated", [(3, False), (4, False), (None, True)])
 async def test_pending_with_new_server_index_binds_client_until_stable_success(
-    monkeypatch: pytest.MonkeyPatch, pending_status: int,
-    terminal_status: int | None, server_hydrated: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_status: int,
+    terminal_status: int | None,
+    server_hydrated: bool,
 ) -> None:
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(message(status=pending_status, server_id="0")),
-        snapshot(message(status=terminal_status, server_hydrated=server_hydrated)),
-    ])
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(message(status=pending_status, server_id="0")),
+            snapshot(message(status=terminal_status, server_hydrated=server_hydrated)),
+        ],
+    )
 
     await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
@@ -507,14 +560,19 @@ async def test_pending_with_new_server_index_binds_client_until_stable_success(
 @pytest.mark.parametrize("failure_status", [-1, -2])
 @pytest.mark.parametrize("terminal_status,server_hydrated", [(3, False), (4, False), (None, True)])
 async def test_delayed_failure_of_bound_client_wins_over_pending_or_provisional_success(
-    monkeypatch: pytest.MonkeyPatch, failure_status: int,
-    terminal_status: int | None, server_hydrated: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_status: int,
+    terminal_status: int | None,
+    server_hydrated: bool,
 ) -> None:
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(message(status=1, server_id="0")),
-        snapshot(message(status=terminal_status, server_hydrated=server_hydrated)),
-        snapshot(message(status=failure_status, server_id="0")),
-    ])
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(message(status=1, server_id="0")),
+            snapshot(message(status=terminal_status, server_hydrated=server_hydrated)),
+            snapshot(message(status=failure_status, server_id="0")),
+        ],
+    )
     with pytest.raises(SendFailed) as failure:
         await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     assert failure.value.send_triggered
@@ -528,7 +586,10 @@ async def test_delayed_failure_of_bound_client_wins_over_pending_or_provisional_
     [
         (message(index=WATERMARK), snapshot()),
         (message(index="9223372036854775804"), snapshot()),
-        (message(client_id="old-client"), snapshot(message(client_id="old-client", index=WATERMARK))),
+        (
+            message(client_id="old-client"),
+            snapshot(message(client_id="old-client", index=WATERMARK)),
+        ),
         (message(status=None), snapshot()),
         (message(status=-3), snapshot()),
         (message(server_id=""), snapshot()),
@@ -537,11 +598,23 @@ async def test_delayed_failure_of_bound_client_wins_over_pending_or_provisional_
         (message(status=-1, index="0", server_id="0"), snapshot()),
         (message(status=-2, index="0", server_id="0"), snapshot()),
     ],
-    ids=["equal-index", "older-index", "old-client-id", "missing-status-without-server-proof", "self-visible",
-         "missing-server", "zero-server", "missing-index", "unbound-failure", "unbound-rejection"],
+    ids=[
+        "equal-index",
+        "older-index",
+        "old-client-id",
+        "missing-status-without-server-proof",
+        "self-visible",
+        "missing-server",
+        "zero-server",
+        "missing-index",
+        "unbound-failure",
+        "unbound-rejection",
+    ],
 )
 async def test_non_terminal_or_stale_evidence_remains_unknown_without_retry(
-    monkeypatch: pytest.MonkeyPatch, candidate: dict[str, Any], baseline: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    candidate: dict[str, Any],
+    baseline: dict[str, Any],
 ) -> None:
     timeline = NativeTimeline(monkeypatch, [snapshot(candidate)], baseline=baseline)
     with pytest.raises(SendUnknown) as unknown:
@@ -552,11 +625,18 @@ async def test_non_terminal_or_stale_evidence_remains_unknown_without_retry(
 
 
 @pytest.mark.asyncio
-async def test_unrelated_failed_client_does_not_fail_bound_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(message(status=1, server_id="0")),
-        snapshot(message(), message(client_id="unrelated", status=-1, index="0", server_id="0")),
-    ])
+async def test_unrelated_failed_client_does_not_fail_bound_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(message(status=1, server_id="0")),
+            snapshot(
+                message(), message(client_id="unrelated", status=-1, index="0", server_id="0")
+            ),
+        ],
+    )
     await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
 
@@ -565,9 +645,13 @@ async def test_unrelated_failed_client_does_not_fail_bound_success(monkeypatch: 
 async def test_multiple_new_candidates_cannot_be_rebound_to_later_single_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(message(), message(client_id="another-client")), snapshot(message()),
-    ])
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(message(), message(client_id="another-client")),
+            snapshot(message()),
+        ],
+    )
     with pytest.raises(SendUnknown):
         await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
@@ -576,7 +660,8 @@ async def test_multiple_new_candidates_cannot_be_rebound_to_later_single_success
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["prepare", "verify", "baseline", "callback"])
 async def test_pretrigger_failure_never_clicks_or_samples(
-    monkeypatch: pytest.MonkeyPatch, stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
 ) -> None:
     timeline = NativeTimeline(monkeypatch, [snapshot(message())])
     rejection = RuntimeError("safety gate refused")
@@ -592,8 +677,11 @@ async def test_pretrigger_failure_never_clicks_or_samples(
     if stage == "callback":
         callback = reject_callback
     else:
-        attribute = {"prepare": "_prepare_spark_sticker", "verify": "verify_recipient",
-                     "baseline": "_spark_sticker_snapshot"}[stage]
+        attribute = {
+            "prepare": "_prepare_spark_sticker",
+            "verify": "verify_recipient",
+            "baseline": "_spark_sticker_snapshot",
+        }[stage]
         monkeypatch.setattr(timeline.adapter, attribute, reject)
     with pytest.raises(RuntimeError) as error:
         await timeline.adapter.send_spark_sticker_and_confirm(native_target(), callback)
@@ -606,7 +694,8 @@ async def test_pretrigger_failure_never_clicks_or_samples(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["click", "sample", "conversation-change"])
 async def test_posttrigger_exceptions_are_unknown_and_never_retried(
-    monkeypatch: pytest.MonkeyPatch, stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
 ) -> None:
     frames: list[dict[str, Any] | Exception] = [snapshot(message())]
     if stage == "sample":
@@ -621,7 +710,13 @@ async def test_posttrigger_exceptions_are_unknown_and_never_retried(
     assert unknown.value.send_triggered
     actions = [event for event in timeline.events if event != "capture-element"]
     assert actions[:7] == [
-        "prepare", "verify", "baseline", "verify", "recheck-panel", "trigger", "click",
+        "prepare",
+        "verify",
+        "baseline",
+        "verify",
+        "recheck-panel",
+        "trigger",
+        "click",
     ]
     assert timeline.events.count("click") == 1
     assert timeline.events.count("trigger") == 1
@@ -633,10 +728,13 @@ async def test_posttrigger_exceptions_are_unknown_and_never_retried(
 async def test_unindexed_pending_can_complete_only_when_new_index_arrives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(message(status=1, index="0", server_id="0")),
-        snapshot(message()),
-    ])
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(message(status=1, index="0", server_id="0")),
+            snapshot(message()),
+        ],
+    )
     await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
     # Unindexed pending did not establish a matching outgoing observation.
@@ -648,10 +746,13 @@ async def test_old_pending_virtual_mount_does_not_capture_new_send_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     old_pending = message(client_id="old-virtual-mount", status=1, index="0", server_id="0")
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(old_pending),
-        snapshot(old_pending, message()),
-    ])
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(old_pending),
+            snapshot(old_pending, message()),
+        ],
+    )
     await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
 
@@ -659,12 +760,16 @@ async def test_old_pending_virtual_mount_does_not_capture_new_send_client(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_status", [-1, -2])
 async def test_unindexed_pending_then_failure_cannot_prove_this_send_failed(
-    monkeypatch: pytest.MonkeyPatch, failure_status: int,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_status: int,
 ) -> None:
-    timeline = NativeTimeline(monkeypatch, [
-        snapshot(message(status=1, index="0", server_id="0")),
-        snapshot(message(status=failure_status, index="0", server_id="0")),
-    ])
+    timeline = NativeTimeline(
+        monkeypatch,
+        [
+            snapshot(message(status=1, index="0", server_id="0")),
+            snapshot(message(status=failure_status, index="0", server_id="0")),
+        ],
+    )
     with pytest.raises(SendUnknown):
         await timeline.adapter.send_spark_sticker_and_confirm(native_target(), timeline.trigger)
     timeline.assert_single_trigger()
@@ -674,7 +779,8 @@ async def test_unindexed_pending_then_failure_cannot_prove_this_send_failed(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["identity", "panel-conversation", "panel-unavailable"])
 async def test_final_preparation_recipient_or_panel_change_rejects_before_trigger(
-    monkeypatch: pytest.MonkeyPatch, change: str,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
 ) -> None:
     timeline = NativeTimeline(monkeypatch, [snapshot(message())])
 
@@ -699,7 +805,9 @@ async def test_final_preparation_recipient_or_panel_change_rejects_before_trigge
 
 
 @pytest.mark.asyncio
-async def test_missing_fixed_element_is_rejected_before_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_missing_fixed_element_is_rejected_before_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     timeline = NativeTimeline(monkeypatch, [snapshot(message())])
 
     async def missing_element() -> None:
@@ -718,10 +826,16 @@ async def test_missing_fixed_element_is_rejected_before_callback(monkeypatch: py
 @pytest.mark.parametrize("status,server_hydrated", [(4, False), (None, True)])
 @pytest.mark.parametrize("stale", ["equal-index", "old-client", "preparation-arrival"])
 async def test_server_confirmed_history_never_becomes_this_click(
-    monkeypatch: pytest.MonkeyPatch, status: int | None, server_hydrated: bool, stale: str,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int | None,
+    server_hydrated: bool,
+    stale: str,
 ) -> None:
-    candidate = message(status=status, server_hydrated=server_hydrated,
-                        index=WATERMARK if stale == "equal-index" else NEXT_INDEX)
+    candidate = message(
+        status=status,
+        server_hydrated=server_hydrated,
+        index=WATERMARK if stale == "equal-index" else NEXT_INDEX,
+    )
     baseline = snapshot(candidate) if stale == "old-client" else snapshot()
     timeline = NativeTimeline(monkeypatch, [snapshot(candidate)], baseline=baseline)
     if stale == "preparation-arrival":
@@ -745,7 +859,9 @@ async def test_identity_change_while_loading_panel_is_rejected_before_trigger() 
         )
         triggers = []
         with pytest.raises(TargetIdentityMismatch):
-            await adapter.send_spark_sticker_and_confirm(native_target(), lambda: triggers.append(True))
+            await adapter.send_spark_sticker_and_confirm(
+                native_target(), lambda: triggers.append(True)
+            )
         assert triggers == []
         assert await page.evaluate("effects") == {"panel": 1, "inputs": 0, "sticker": 0, "send": 0}
 

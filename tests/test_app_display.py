@@ -30,6 +30,7 @@ from spark_keeper.models import (
     FriendCandidate,
     MessageKind,
     Target,
+    ThemeMode,
 )
 from spark_keeper.scheduler import SchedulerError
 from spark_keeper.ui import app as app_module
@@ -64,6 +65,8 @@ def app(tmp_path, monkeypatch, qapp):
         assert not thread.is_alive()
     instance.deleteLater()
     qapp.processEvents()
+    qapp.styleHints().unsetColorScheme()
+    theme.apply_theme(qapp, ThemeMode.LIGHT)
 
 
 def wait_until(predicate):
@@ -179,7 +182,6 @@ def target(identifier, name=None, *, enabled=True):
         id=identifier,
         stable_key=f"fixture:{identifier}",
         display_name=name or f"测试好友 {identifier}",
-        douyin_id="",
         profile_url="",
         avatar_url="",
         search_query="测试",
@@ -377,7 +379,7 @@ def test_difference_updates_preserve_selection_focus_and_scroll(app, monkeypatch
     assert app.target_tree.verticalScrollBar().value() == before
     assert selected.text(1) == "更新的名称"
     assert selected.text(0) == "否"
-    assert selected.foreground(0).color().name() == theme.TEXT_MUTED
+    assert selected.foreground(0).color().name() == theme.current_colors().text_muted
     app._display_targets([target(101)] + rows[:-1])
     assert keys(app.target_tree)[0] == "101"
     assert "100" not in keys(app.target_tree)
@@ -695,8 +697,12 @@ def test_confirmation_previews_preserve_markup_and_decline_prevents_actions(
     candidate = FriendCandidate(
         "fixture:html",
         friend_name,
-        douyin_id="<u>literal-id</u>",
-        evidence={"identity_strength": "strong"},
+        profile_url="<u>literal-profile</u>",
+        evidence={
+            "identity_strength": "strong",
+            "identity_source": "sdk_single_conversation",
+            "conversation_digest": "a" * 64,
+        },
     )
     database = Mock()
     database.list_targets.return_value = [target(1, friend_name)]
@@ -741,7 +747,7 @@ def test_confirmation_previews_preserve_markup_and_decline_prevents_actions(
     if action == "manual":
         assert friend_name in preview
     if action == "candidate":
-        assert candidate.douyin_id in preview
+        assert candidate.profile_url in preview
     if action == "duplicate":
         assert theme.confirm.call_count == 2
         assert message in theme.confirm.call_args_list[0].args[2]
@@ -759,7 +765,12 @@ def test_confirmation_previews_preserve_markup_and_decline_prevents_actions(
 def save_targets(app, count=3):
     targets = [
         app.database.add_target(
-            FriendCandidate(f"friend:{i}", f"好友 <{i}>", douyin_id=f"friend-{i}"), "好友"
+            FriendCandidate(
+                f"friend:{i}",
+                f"好友 <{i}>",
+                profile_url=f"https://www.douyin.com/user/friend{i}",
+            ),
+            "好友",
         )
         for i in range(count)
     ]
@@ -799,18 +810,30 @@ def visible_target_actions(app):
     [
         ([], 0, None, None, []),
         ([True, True, True], 0, "共 3 位", "全选", []),
-        ([True, True, True], 2, "已选 2/3 位", "全选",
-         ["停用所选", None, "删除所选…", "取消选择"]),
-        ([False, False, True], 2, "已选 2/3 位", "全选",
-         ["启用所选", None, "删除所选…", "取消选择"]),
-        ([True, False, True], 2, "已选 2/3 位", "全选",
-         ["全部启用", "全部停用", None, "删除所选…", "取消选择"]),
-        ([True, True, True], 3, "已选 3/3 位", "取消选择",
-         ["停用所选", None, "删除所选…"]),
-        ([False, False, False], 3, "已选 3/3 位", "取消选择",
-         ["启用所选", None, "删除所选…"]),
-        ([True, False, True], 3, "已选 3/3 位", "取消选择",
-         ["全部启用", "全部停用", None, "删除所选…"]),
+        ([True, True, True], 2, "已选 2/3 位", "全选", ["停用所选", None, "删除所选…", "取消选择"]),
+        (
+            [False, False, True],
+            2,
+            "已选 2/3 位",
+            "全选",
+            ["启用所选", None, "删除所选…", "取消选择"],
+        ),
+        (
+            [True, False, True],
+            2,
+            "已选 2/3 位",
+            "全选",
+            ["全部启用", "全部停用", None, "删除所选…", "取消选择"],
+        ),
+        ([True, True, True], 3, "已选 3/3 位", "取消选择", ["停用所选", None, "删除所选…"]),
+        ([False, False, False], 3, "已选 3/3 位", "取消选择", ["启用所选", None, "删除所选…"]),
+        (
+            [True, False, True],
+            3,
+            "已选 3/3 位",
+            "取消选择",
+            ["全部启用", "全部停用", None, "删除所选…"],
+        ),
     ],
 )
 def test_target_selection_context_matrix(
@@ -948,6 +971,8 @@ def test_target_columns_use_native_row_selection_and_keyboard_focus(app, monkeyp
     tree = app.target_tree
     assert tree.allColumnsShowFocus()
     assert tree.focusPolicy() != Qt.FocusPolicy.NoFocus
+    assert tree.columnCount() == 2
+    assert [tree.headerItem().text(i) for i in range(2)] == ["启用", "昵称"]
     for other in (app.candidate_tree, app.history_tree, app.logs_tree, app.progress_tree):
         assert not other.allColumnsShowFocus()
 
@@ -983,10 +1008,10 @@ def test_target_columns_use_native_row_selection_and_keyboard_focus(app, monkeyp
         tree.viewport().repaint()
         assert painted_focus and not any(painted_focus)
     click_cell(0, 1)
-    click_cell(2, 3, Qt.KeyboardModifier.ControlModifier)
+    click_cell(2, 0, Qt.KeyboardModifier.ControlModifier)
     assert set(app._selected_keys(tree)) == {"1", "3"}
     click_cell(0, 1)
-    click_cell(2, 4, Qt.KeyboardModifier.ShiftModifier)
+    click_cell(2, 1, Qt.KeyboardModifier.ShiftModifier)
     assert set(app._selected_keys(tree)) == {"1", "2", "3"}
     QTest.keyClick(tree, Qt.Key.Key_Down)
     assert app._selected_keys(tree) == ["4"]
@@ -1222,9 +1247,7 @@ def test_native_plan_save_and_reload_preserve_hidden_text_draft(app, monkeypatch
     app.text_mode_button.setChecked(True)
     assert app.message_text.toPlainText() == "保留草稿"
 
-    app.database.save_plan(
-        enabled=False, send_time="09:00", message_text="旧文本", confirmed=True
-    )
+    app.database.save_plan(enabled=False, send_time="09:00", message_text="旧文本", confirmed=True)
     app._refresh_plan()
     assert app._current_message_kind() == MessageKind.TEXT
     assert app._current_message() == "旧文本"
@@ -1242,9 +1265,7 @@ def test_plan_scheduler_failure_restores_previous_message_kind(app, monkeypatch,
     app.sticker_mode_button.setChecked(previous_kind == MessageKind.TEXT)
     app.text_mode_button.setChecked(previous_kind == MessageKind.SPARK_STICKER)
     app.message_text.setPlainText("新的文本")
-    monkeypatch.setattr(
-        app.scheduler, "sync", Mock(side_effect=[SchedulerError("同步失败"), None])
-    )
+    monkeypatch.setattr(app.scheduler, "sync", Mock(side_effect=[SchedulerError("同步失败"), None]))
     with pytest.raises(SchedulerError, match="同步失败"):
         app._persist_plan(app._snapshot_plan(), require_confirmation=True)
     restored = app.database.get_plan()
@@ -1271,15 +1292,23 @@ def test_native_confirmation_decline_never_sends_or_previews_text(app, monkeypat
         app._save_plan()
     elif action == "missed":
         monkeypatch.setattr(app_module, "detect_missed_schedule", Mock())
-        monkeypatch.setattr(app.database, "list_pending_actions", Mock(return_value=[{
-            "id": "native-missed",
-            "kind": "missed_schedule",
-            "payload": {
-                "target_count": 1,
-                "message_kind": "spark_sticker",
-                "message_text": "绝不能作为表情发出的草稿",
-            },
-        }]))
+        monkeypatch.setattr(
+            app.database,
+            "list_pending_actions",
+            Mock(
+                return_value=[
+                    {
+                        "id": "native-missed",
+                        "kind": "missed_schedule",
+                        "payload": {
+                            "target_count": 1,
+                            "message_kind": "spark_sticker",
+                            "message_text": "绝不能作为表情发出的草稿",
+                        },
+                    }
+                ]
+            ),
+        )
         monkeypatch.setattr(app.database, "resolve_pending_action", Mock())
         app._check_pending_actions()
         app.database.resolve_pending_action.assert_called_once_with("native-missed", "skipped")
@@ -1377,7 +1406,7 @@ def test_native_history_labels_attempt_without_claiming_sent_text(app):
     selected = item(app.history_tree, row["id"])
     selected.setSelected(True)
     assert selected.text(6) == "续火花（原生表情）"
-    assert selected.text(2) == "unknown"
+    assert selected.text(2) == "结果不确定"
     detail = app.history_message.toPlainText()
     assert "续火花（原生表情）" in detail
     assert "不是已发送的同名文本" in detail
@@ -1567,7 +1596,9 @@ def test_task_result_survives_failed_pending_refresh(app, monkeypatch, result_ki
     show = Mock()
     monkeypatch.setattr(theme, "show_message", show)
     monkeypatch.setattr(
-        app.database, "list_pending_actions", Mock(side_effect=sqlite3.OperationalError("收尾读取失败"))
+        app.database,
+        "list_pending_actions",
+        Mock(side_effect=sqlite3.OperationalError("收尾读取失败")),
     )
     app.busy = True
     if result_kind == "error":
@@ -1715,7 +1746,9 @@ def test_manual_cancel_during_scheduler_never_starts_batch(app, monkeypatch, blo
     assert app.status_label.text() == "任务已取消"
 
 
-def test_task_error_presentation_failure_preserves_original_without_recursive_dialog(app, monkeypatch):
+def test_task_error_presentation_failure_preserves_original_without_recursive_dialog(
+    app, monkeypatch
+):
     original = RuntimeError("原始任务失败")
     show = Mock(side_effect=RuntimeError("对话框失败"))
     monkeypatch.setattr(theme, "show_message", show)
@@ -1762,3 +1795,124 @@ def test_manual_scheduler_rollback_holds_busy_and_never_starts_send(
     app.service.run_batch.assert_not_called()
     show.assert_called_once()
     assert "计划同步失败" in show.call_args.args[2]
+
+
+def test_history_and_event_lists_translate_machine_labels_but_keep_original_details(app):
+    row = history_row()
+    row.update(
+        status="unknown",
+        mode="scheduled",
+        error_code="send_unknown",
+        target_name="Synthetic English Name",
+        message_text="User message stays English",
+    )
+    app._display_history([row])
+    history = app.history_tree.topLevelItem(0)
+    app.history_tree.setCurrentItem(history)
+    assert [history.text(i) for i in (1, 2, 3, 5)] == [
+        "Synthetic English Name",
+        "结果不确定",
+        "定时发送",
+        "结果不确定，请人工核对聊天",
+    ]
+    assert app.history_message.toPlainText() == "User message stays English"
+    raw = "TimeoutError: synthetic diagnostic\nTraceback <原文>"
+    app._display_logs(
+        [
+            {
+                "id": 71,
+                "created_at": "2026-09-09",
+                "level": "ERROR",
+                "target_alias": "Synthetic English Name（ID: 12）",
+                "category": "page_not_ready",
+                "message": raw,
+            }
+        ]
+    )
+    event = app.logs_tree.topLevelItem(0)
+    app.logs_tree.setCurrentItem(event)
+    assert [event.text(i) for i in (1, 2, 3)] == [
+        "错误",
+        "Synthetic English Name（编号：12）",
+        "聊天页面未就绪",
+    ]
+    assert "TimeoutError" not in event.text(4)
+    assert "Traceback" not in event.text(4)
+    assert app.logs_message.toPlainText() == raw
+    assert event.data(0, theme.ROLE_ID + 1) == "danger"
+    assert history.data(0, theme.ROLE_ID + 1) == "warning"
+
+
+def test_progress_target_translation_does_not_change_row_identity(app):
+    alias = "Synthetic Name（ID: 17）"
+    app.messages.put(("progress", alias, "发送前核对"))
+    app._poll_messages()
+    row = app.progress_tree.topLevelItem(0)
+    app.messages.put(("progress", alias, "发送完成"))
+    app._poll_messages()
+    assert app.progress_tree.topLevelItemCount() == 1
+    assert app.progress_tree.topLevelItem(0) is row
+    assert row.data(0, theme.ROLE_ID) == alias
+    assert row.text(0) == "Synthetic Name（编号：17）"
+    assert row.text(1) == "发送完成"
+
+
+@pytest.mark.parametrize("names", [("同名合成好友", "同名合成好友"), ("合成甲", "合成乙")])
+def test_unconfirmed_candidates_have_independent_display_rows_and_cannot_be_saved(
+    app, monkeypatch, names
+):
+    candidates = [
+        FriendCandidate("", name, evidence={"identity_strength": "weak"}) for name in names
+    ]
+    app._show_candidates(candidates)
+    assert app.candidate_tree.topLevelItemCount() == 2
+    assert len(set(keys(app.candidate_tree))) == 2
+    assert list(app.candidates.values()) == candidates
+    assert [candidate.stable_key for candidate in candidates] == ["", ""]
+    save = Mock()
+    confirm = Mock(return_value=True)
+    show = Mock()
+    monkeypatch.setattr(app.service, "save_friend", save)
+    monkeypatch.setattr(theme, "confirm", confirm)
+    monkeypatch.setattr(theme, "show_message", show)
+    for index in range(2):
+        row = app.candidate_tree.topLevelItem(index)
+        assert row.text(0) == names[index]
+        assert row.text(1) == "弱"
+        app.candidate_tree.setCurrentItem(row)
+        assert not app.save_candidate_button.isEnabled()
+        assert "不能确认保存" in app.save_candidate_button.toolTip()
+        app._set_task_buttons_state(False)
+        app._set_task_buttons_state(True)
+        assert not app.save_candidate_button.isEnabled()
+        app._save_selected_candidate()
+        assert "不能确认保存" in show.call_args.args[2]
+    assert show.call_count == 2
+    confirm.assert_not_called()
+    save.assert_not_called()
+
+
+def test_candidate_save_rechecks_real_identity_instead_of_strength_claim(app, monkeypatch):
+    claimed = FriendCandidate("", "合成伪强候选", evidence={"identity_strength": "strong"})
+    confirmed = FriendCandidate(
+        "profile-candidate",
+        "合成可靠候选",
+        profile_url="https://www.douyin.com/user/syntheticReliable",
+    )
+    app._show_candidates([claimed, confirmed])
+    app.candidate_tree.setCurrentItem(app.candidate_tree.topLevelItem(0))
+    assert not app.save_candidate_button.isEnabled()
+    app.candidate_tree.setCurrentItem(app.candidate_tree.topLevelItem(1))
+    assert app.save_candidate_button.isEnabled()
+    app.busy = True
+    app._set_task_buttons_state(True)
+    assert not app.save_candidate_button.isEnabled()
+    app.busy = False
+    app._update_candidate_selection()
+    assert app.save_candidate_button.isEnabled()
+    save = Mock()
+    monkeypatch.setattr(app.service, "save_friend", save)
+    monkeypatch.setattr(theme, "confirm", Mock(return_value=True))
+    monkeypatch.setattr(app, "_refresh_targets", Mock())
+    app.save_candidate_button.click()
+    save.assert_called_once_with(confirmed)

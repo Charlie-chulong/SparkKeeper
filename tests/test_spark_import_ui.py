@@ -85,7 +85,7 @@ def app(monkeypatch: pytest.MonkeyPatch, scan: SparkScanResult, qapp):
         scan.account_key, "测试账号", scan.account_logged_in_at
     )
     instance.database.list_targets.return_value = [
-        SimpleNamespace(stable_key="uid:saved", profile_url="", douyin_id="")
+        SimpleNamespace(stable_key="uid:saved", profile_url="", evidence={})
     ]
     instance.service = Mock()
     instance._set_status = Mock()
@@ -439,12 +439,12 @@ def test_new_scan_discards_preview_and_wires_readonly_progress_and_cancel(app, s
     app.service.run_batch.assert_not_called()
 
 
-@pytest.mark.parametrize("match_by", ["profile_url", "douyin_id"])
-def test_existing_equivalent_identity_is_not_default_selected(app, scan, match_by) -> None:
-    candidate = replace(scan.contacts[0].candidate, douyin_id="new-account")
-    scan = replace(scan, contacts=(replace(scan.contacts[0], candidate=candidate),))
-    saved = SimpleNamespace(stable_key="different-key", profile_url="", douyin_id="")
-    setattr(saved, match_by, getattr(candidate, match_by))
+def test_existing_equivalent_profile_is_not_default_selected(app, scan) -> None:
+    candidate = scan.contacts[0].candidate
+    scan = replace(scan, contacts=(scan.contacts[0],))
+    saved = SimpleNamespace(
+        stable_key="different-key", profile_url=candidate.profile_url, evidence={}
+    )
     app.database.list_targets.return_value = [saved]
     app._show_spark_preview(scan)
     preview = app._spark_preview

@@ -138,8 +138,7 @@ class SparkImportPreview(QDialog):
             item.setData(0, theme.ROLE_ID, candidate.stable_key)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setToolTip(5, contact.reason)
-            if not contact.importable:
-                theme.set_tree_row_tone(item, "muted")
+            theme.set_tree_row_tone(item, "normal" if contact.importable else "muted")
             self.tree.addTopLevelItem(item)
             self._items.append(item)
         self.tree.itemChanged.connect(self._item_changed)

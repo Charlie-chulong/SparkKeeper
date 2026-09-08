@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from spark_keeper.automation.errors import (
 from spark_keeper.automation.service import BatchService, wait_for_delay
 from spark_keeper.database import Database, today_iso
 from spark_keeper.dpapi import DpapiJsonStore
+from spark_keeper.identity import identity_key
 from spark_keeper.logging_safe import target_label
 from spark_keeper.models import (
     Account,
@@ -97,11 +99,16 @@ class CaptureAdapter:
         )
 
 
+def friend_candidate(key: str, name: str) -> FriendCandidate:
+    profile = f"https://www.douyin.com/user/{key}"
+    return FriendCandidate(identity_key(profile, {}), name, profile_url=profile)
+
+
 def setup_service(tmp_path) -> tuple[BatchService, Database]:
     database = Database(tmp_path / "state.sqlite3")
     database.save_account(ACCOUNT_KEY, "测试账号")
-    database.add_target(FriendCandidate("friend-1", "失败好友", douyin_id="id-1"), "失败")
-    database.add_target(FriendCandidate("friend-2", "成功好友", douyin_id="id-2"), "成功")
+    database.add_target(friend_candidate("friend-1", "失败好友"), "失败好友")
+    database.add_target(friend_candidate("friend-2", "成功好友"), "成功好友")
     database.save_plan(enabled=False, send_time="09:00", message_text="测试消息", confirmed=True)
     state = DpapiJsonStore(tmp_path / "auth-state.bin")
     state.path.write_bytes(b"exists-for-fake-browser")
@@ -111,7 +118,9 @@ def setup_service(tmp_path) -> tuple[BatchService, Database]:
 
 
 @pytest.mark.asyncio
-async def test_native_batch_shares_text_guard_and_manual_override_audit(tmp_path, monkeypatch) -> None:
+async def test_native_batch_shares_text_guard_and_manual_override_audit(
+    tmp_path, monkeypatch
+) -> None:
     service, database = setup_service(tmp_path)
     target = database.list_targets()[1]
     sent = []
@@ -129,7 +138,10 @@ async def test_native_batch_shares_text_guard_and_manual_override_audit(tmp_path
     monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", BothKindsAdapter)
     first = await service.run_batch(BatchMode.MANUAL, target_ids=[target.id])
     database.save_plan(
-        enabled=False, send_time="09:00", message_text="", confirmed=True,
+        enabled=False,
+        send_time="09:00",
+        message_text="",
+        confirmed=True,
         message_kind=MessageKind.SPARK_STICKER,
     )
     duplicate = await service.run_batch(BatchMode.SCHEDULED, target_ids=[target.id])
@@ -137,10 +149,14 @@ async def test_native_batch_shares_text_guard_and_manual_override_audit(tmp_path
     assert sent == [MessageKind.TEXT]
     with pytest.raises(ValueError, match="定时任务不能覆盖"):
         await service.run_batch(
-            BatchMode.SCHEDULED, target_ids=[target.id], manual_override_target_ids=[target.id],
+            BatchMode.SCHEDULED,
+            target_ids=[target.id],
+            manual_override_target_ids=[target.id],
         )
     override = await service.run_batch(
-        BatchMode.MANUAL, target_ids=[target.id], manual_override_target_ids=[target.id],
+        BatchMode.MANUAL,
+        target_ids=[target.id],
+        manual_override_target_ids=[target.id],
     )
     assert override.results[0].status is AttemptStatus.SUCCESS
     assert sent == [MessageKind.TEXT, MessageKind.SPARK_STICKER]
@@ -175,7 +191,10 @@ async def test_native_dispatch_records_failed_and_triggered_history(
 ) -> None:
     service, database = setup_service(tmp_path)
     database.save_plan(
-        enabled=False, send_time="09:00", message_text="", confirmed=True,
+        enabled=False,
+        send_time="09:00",
+        message_text="",
+        confirmed=True,
         message_kind=MessageKind.SPARK_STICKER,
     )
     sends = []
@@ -193,7 +212,9 @@ async def test_native_dispatch_records_failed_and_triggered_history(
             assert database.get_attempt(row["id"])["triggered_at"]
             sends.append(target.id)
 
-    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", RecordingStickerAdapter)
+    monkeypatch.setattr(
+        "spark_keeper.automation.service.DouyinChatAdapter", RecordingStickerAdapter
+    )
     result = await service.run_batch(BatchMode.MANUAL)
     assert [item.status for item in result.results] == [AttemptStatus.FAILED, AttemptStatus.SUCCESS]
     assert sends == [database.list_targets()[1].id]
@@ -226,12 +247,15 @@ async def test_native_validation_uses_snapshot_without_reserving_or_triggering(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("验证不能预留、记录发送或标记触发")
 
-    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", ValidationStickerAdapter)
+    monkeypatch.setattr(
+        "spark_keeper.automation.service.DouyinChatAdapter", ValidationStickerAdapter
+    )
     monkeypatch.setattr(database, "reserve_attempt", forbidden)
     monkeypatch.setattr(database, "record_terminal_attempt", forbidden)
     monkeypatch.setattr(database, "mark_attempt_triggered", forbidden)
     result = await service.validate_config(
-        message_text_override="", message_kind_override=MessageKind.SPARK_STICKER,
+        message_text_override="",
+        message_kind_override=MessageKind.SPARK_STICKER,
     )
     expected = AttemptStatus.SUCCESS if available else AttemptStatus.FAILED
     assert [item.status for item in result.results] == [expected, expected]
@@ -250,7 +274,10 @@ async def test_missed_message_snapshot_is_independent_of_current_plan(
         MessageKind.SPARK_STICKER if snapshot_kind is MessageKind.TEXT else MessageKind.TEXT
     )
     database.save_plan(
-        enabled=False, send_time="09:00", message_text="当前计划", confirmed=True,
+        enabled=False,
+        send_time="09:00",
+        message_text="当前计划",
+        confirmed=True,
         message_kind=current_kind,
     )
     sent = []
@@ -269,7 +296,9 @@ async def test_missed_message_snapshot_is_independent_of_current_plan(
     monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", SnapshotAdapter)
     text = "旧快照正文" if snapshot_kind is MessageKind.TEXT else ""
     result = await service.run_batch(
-        BatchMode.MISSED, target_ids=[target.id], message_text_override=text,
+        BatchMode.MISSED,
+        target_ids=[target.id],
+        message_text_override=text,
         message_kind_override=snapshot_kind,
     )
     assert result.status is BatchStatus.SUCCESS
@@ -279,12 +308,15 @@ async def test_missed_message_snapshot_is_independent_of_current_plan(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("overrides", [
-    {"message_text_override": "旧正文"},
-    {"message_kind_override": MessageKind.SPARK_STICKER},
-    {"message_kind_override": "unsupported", "message_text_override": ""},
-    {"message_kind_override": MessageKind.TEXT, "message_text_override": " "},
-])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"message_text_override": "旧正文"},
+        {"message_kind_override": MessageKind.SPARK_STICKER},
+        {"message_kind_override": "unsupported", "message_text_override": ""},
+        {"message_kind_override": MessageKind.TEXT, "message_text_override": " "},
+    ],
+)
 async def test_invalid_message_snapshot_is_rejected_before_batch(tmp_path, overrides) -> None:
     service, database = setup_service(tmp_path)
     with pytest.raises(ValueError):
@@ -299,6 +331,7 @@ async def test_native_failures_preserve_triggered_unknown_guard(
 ) -> None:
     service, database = setup_service(tmp_path)
     target = database.list_targets()[1]
+    progress: list[tuple[str, str]] = []
 
     class FailingStickerAdapter(StickerAdapter):
         async def send_spark_sticker_and_confirm(self, target, on_trigger) -> None:
@@ -312,8 +345,11 @@ async def test_native_failures_preserve_triggered_unknown_guard(
 
     monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", FailingStickerAdapter)
     result = await service.run_batch(
-        BatchMode.MANUAL, target_ids=[target.id],
-        message_kind_override=MessageKind.SPARK_STICKER, message_text_override="",
+        BatchMode.MANUAL,
+        target_ids=[target.id],
+        message_kind_override=MessageKind.SPARK_STICKER,
+        message_text_override="",
+        progress=lambda *item: progress.append(item),
     )
     unknown = phase in {"after", "domain_after"}
     expected = AttemptStatus.UNKNOWN if unknown else AttemptStatus.FAILED
@@ -327,6 +363,8 @@ async def test_native_failures_preserve_triggered_unknown_guard(
     assert bool(database.list_pending_actions("unknown_send")) == unknown
     if unknown:
         assert item.error_code is ErrorCode.SEND_UNKNOWN
+        assert progress[-1] == (target_label(target), "结果不确定，请人工核对聊天")
+        assert "失败" not in progress[-1][1]
 
 
 @pytest.mark.asyncio
@@ -355,13 +393,17 @@ async def test_native_cancel_during_delay_never_triggers_remaining_target(
     service.delay_waiter = cancel_wait
     monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", SendingStickerAdapter)
     result = await service.run_batch(
-        BatchMode.MANUAL, message_kind_override=MessageKind.SPARK_STICKER,
-        message_text_override="", inter_target_delay_override=(4, 8), cancel=cancel,
+        BatchMode.MANUAL,
+        message_kind_override=MessageKind.SPARK_STICKER,
+        message_text_override="",
+        inter_target_delay_override=(4, 8),
+        cancel=cancel,
     )
     assert waited == [6]
     assert sends == [database.list_targets()[0].id]
     assert [item.status for item in result.results] == [
-        AttemptStatus.SUCCESS, AttemptStatus.CANCELLED,
+        AttemptStatus.SUCCESS,
+        AttemptStatus.CANCELLED,
     ]
     assert database.count_rows("send_attempts") == 1
 
@@ -398,7 +440,7 @@ async def test_batch_sends_all_enabled_targets_beyond_five_in_order(tmp_path, mo
     targets = [first_enabled]
     targets.extend(
         database.add_target(
-            FriendCandidate(f"friend-{index}", f"好友{index}", douyin_id=f"id-{index}"),
+            friend_candidate(f"friend-{index}", f"好友{index}"),
             f"好友{index}",
         )
         for index in range(3, 9)
@@ -431,9 +473,7 @@ async def test_batch_sends_all_enabled_targets_beyond_five_in_order(tmp_path, mo
     assert calls == [
         (operation, target.id) for target in targets for operation in ("open", "verify", "sent")
     ]
-    assert all(
-        database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso()) for target in targets
-    )
+    assert all(database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso()) for target in targets)
     assert not database.has_daily_guard(ACCOUNT_KEY, disabled.id, today_iso())
 
 
@@ -445,7 +485,7 @@ async def test_batch_waits_randomized_interval_only_between_actual_sends(
     disabled, first_enabled = database.list_targets()
     database.set_target_enabled(disabled.id, False)
     second_enabled = database.add_target(
-        FriendCandidate("friend-3", "另一位好友", douyin_id="id-3"),
+        friend_candidate("friend-3", "另一位好友"),
         "另一位好友",
     )
     database.save_plan(
@@ -488,7 +528,7 @@ async def test_batch_cancellation_during_delay_cancels_unsent_targets(
     disabled, first_enabled = database.list_targets()
     database.set_target_enabled(disabled.id, False)
     second_enabled = database.add_target(
-        FriendCandidate("friend-3", "另一位好友", douyin_id="id-3"),
+        friend_candidate("friend-3", "另一位好友"),
         "另一位好友",
     )
     cancel = threading.Event()
@@ -520,7 +560,7 @@ async def test_validation_and_zero_delay_do_not_wait(tmp_path, monkeypatch) -> N
     disabled, _first_enabled = database.list_targets()
     database.set_target_enabled(disabled.id, False)
     database.add_target(
-        FriendCandidate("friend-3", "另一位好友", douyin_id="id-3"),
+        friend_candidate("friend-3", "另一位好友"),
         "另一位好友",
     )
     database.save_plan(
@@ -614,7 +654,7 @@ async def test_target_errors_keep_full_details_and_existing_send_safety(
     service, database = setup_service(tmp_path)
     target = database.list_targets()[1]
     progress: list[tuple[str, str]] = []
-    original = "浏览器查找原文 storage_state\n" + "详情" * 200
+    original = "English browser failure storage_state\n" + "详情" * 200
 
     def fail() -> None:
         try:
@@ -663,7 +703,16 @@ async def test_target_errors_keep_full_details_and_existing_send_safety(
     event = next(event for event in database.list_events() if event["category"] == expected_code)
     assert event["message"] == item.detail
     assert event["target_alias"] == item.target_alias
-    assert (item.target_alias, item.detail) in progress
+    expected_progress = (
+        "结果不确定，请人工核对聊天"
+        if failure_phase == "after_trigger"
+        else "发送失败：未找到好友"
+        if failure_phase == "domain"
+        else "发送失败：运行异常，请查看详情"
+    )
+    assert progress[-1] == (item.target_alias, expected_progress)
+    assert all("Traceback" not in message and "English" not in message for _, message in progress)
+    assert all("\n" not in message and len(message) < 60 for _, message in progress)
     assert database.has_daily_guard(ACCOUNT_KEY, target.id, today_iso()) == (
         failure_phase == "after_trigger"
     )
@@ -702,10 +751,114 @@ async def test_batch_boundary_preserves_original_error_chain(tmp_path, monkeypat
 
 def test_saved_friend_event_uses_real_target_label(tmp_path) -> None:
     service, database = setup_service(tmp_path)
-    target = service.save_friend(FriendCandidate("friend-new", "新增好友"), "新增好友")
+    target = service.save_friend(friend_candidate("friend-new", "新增好友"))
 
     event = next(event for event in database.list_events() if event["category"] == "friend_saved")
     assert event["target_alias"] == target_label(target)
+
+
+def test_save_friend_uses_name_under_mutex(tmp_path, monkeypatch) -> None:
+    service, database = setup_service(tmp_path)
+    candidate = friend_candidate("new-name", "名称搜索好友")
+    held = False
+
+    class Mutex:
+        def __enter__(self):
+            nonlocal held
+            held = True
+
+        def __exit__(self, *_args):
+            nonlocal held
+            held = False
+
+    original_add = database.add_target
+
+    def add(candidate, query):
+        assert held
+        assert query == candidate.display_name
+        return original_add(candidate, query)
+
+    monkeypatch.setattr("spark_keeper.automation.service.WindowsTaskMutex", Mutex)
+    monkeypatch.setattr(database, "add_target", add)
+    saved = service.save_friend(candidate)
+
+    assert saved.search_query == saved.display_name == "名称搜索好友"
+    assert not held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [BatchMode.MANUAL, BatchMode.VALIDATION])
+@pytest.mark.parametrize("identity_state", ["weak", "untrusted_digest"])
+async def test_batch_rejects_unconfirmed_identity_before_browser_or_reservation(
+    tmp_path, monkeypatch, mode, identity_state
+) -> None:
+    service, database = setup_service(tmp_path)
+    target = database.list_targets()[1]
+    evidence = (
+        {"conversation_digest": "a" * 64, "identity_source": "dom"}
+        if identity_state == "untrusted_digest"
+        else {}
+    )
+    unsafe = replace(
+        target,
+        profile_url="",
+        evidence=evidence,
+    )
+    monkeypatch.setattr(database, "list_targets", lambda **_kwargs: [unsafe])
+
+    with pytest.raises(ValueError, match="缺少可靠身份.*重新确认"):
+        await service.run_batch(mode, target_ids=[target.id])
+
+    assert database.count_rows("batch_runs") == 0
+    assert database.count_rows("send_attempts") == 0
+    assert database.count_rows("daily_send_guards") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("domain_error", [False, True])
+async def test_validation_failure_progress_is_chinese_while_detail_retains_traceback(
+    tmp_path, monkeypatch, domain_error
+) -> None:
+    service, database = setup_service(tmp_path)
+    target = database.list_targets()[1]
+    progress: list[tuple[str, str]] = []
+
+    class FailingValidationAdapter(ContinuingAdapter):
+        async def open_confirmed_target(self, _target):
+            try:
+                raise RuntimeError("English browser traceback diagnostic")
+            except RuntimeError as cause:
+                if domain_error:
+                    raise TargetNotFound() from cause
+                raise ValueError("English validation error") from cause
+
+    monkeypatch.setattr(
+        "spark_keeper.automation.service.DouyinChatAdapter",
+        FailingValidationAdapter,
+    )
+    result = await service.run_batch(
+        BatchMode.VALIDATION,
+        target_ids=[target.id],
+        progress=lambda *item: progress.append(item),
+    )
+    item = result.results[0]
+    assert item.status is AttemptStatus.FAILED
+    assert progress[-1] == (
+        target_label(target),
+        "验证失败：未找到好友" if domain_error else "验证失败：运行异常，请查看详情",
+    )
+    assert all("English" not in message and "Traceback" not in message for _, message in progress)
+    assert "English browser traceback diagnostic" in item.detail
+    assert "Traceback (most recent call last)" in item.detail
+    event = next(event for event in database.list_events() if event["category"] == item.error_code)
+    assert event["message"] == item.detail
+    summary = next(
+        event for event in database.list_events() if event["category"] == "batch_finished"
+    )
+    assert "状态 失败，成功 0，失败 1" in summary["message"]
+    assert "failed" not in summary["message"]
+    assert database.count_rows("send_attempts") == 0
+    assert database.count_rows("daily_send_guards") == 0
 
 
 @pytest.mark.asyncio
@@ -759,6 +912,7 @@ async def test_batch_snapshots_account_plan_targets_only_under_mutex(tmp_path, m
         def read(*args, **kwargs):
             assert held
             return method(*args, **kwargs)
+
         return read
 
     for name in ("get_account", "get_plan", "list_targets"):
@@ -773,7 +927,9 @@ async def test_batch_snapshots_account_plan_targets_only_under_mutex(tmp_path, m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["interactive", "delete", "account", "state", None])
 async def test_login_commit_failures_never_pair_new_state_with_old_account(
-    tmp_path, monkeypatch, failure,
+    tmp_path,
+    monkeypatch,
+    failure,
 ):
     service, database = setup_service(tmp_path)
     database.save_plan(enabled=True, send_time="09:00", message_text="消息", confirmed=True)
@@ -878,7 +1034,11 @@ async def test_login_cancellation_preserves_entire_old_login(tmp_path, monkeypat
 @pytest.mark.parametrize("conflict", [False, True])
 @pytest.mark.parametrize("manual_override", [False, True])
 async def test_cross_midnight_rechecks_guard_before_send(
-    tmp_path, monkeypatch, phase, conflict, manual_override,
+    tmp_path,
+    monkeypatch,
+    phase,
+    conflict,
+    manual_override,
 ):
     service, database = setup_service(tmp_path)
     first, target = database.list_targets()
@@ -890,8 +1050,12 @@ async def test_cross_midnight_rechecks_guard_before_send(
     if conflict:
         other_batch = database.start_batch(BatchMode.MANUAL, target_count=1)
         existing = database.reserve_attempt(
-            batch_id=other_batch, account_key=ACCOUNT_KEY, target_id=target.id,
-            run_date="2026-09-05", message_text="已经发送", manual_override=False,
+            batch_id=other_batch,
+            account_key=ACCOUNT_KEY,
+            target_id=target.id,
+            run_date="2026-09-05",
+            message_text="已经发送",
+            manual_override=False,
         )
         database.finish_attempt(existing.attempt_id, AttemptStatus.UNKNOWN)
         existing_before = database.get_attempt(existing.attempt_id)
@@ -968,13 +1132,19 @@ async def test_trigger_persistence_failure_does_not_send_or_become_unknown(tmp_p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("kind", "boundary"), [
-    (MessageKind.TEXT, "snapshot"),
-    (MessageKind.SPARK_STICKER, "snapshot"),
-    (MessageKind.SPARK_STICKER, "identity"),
-])
+@pytest.mark.parametrize(
+    ("kind", "boundary"),
+    [
+        (MessageKind.TEXT, "snapshot"),
+        (MessageKind.SPARK_STICKER, "snapshot"),
+        (MessageKind.SPARK_STICKER, "identity"),
+    ],
+)
 async def test_real_adapter_final_preparation_await_rechecks_actual_day_before_click(
-    tmp_path, monkeypatch, kind, boundary,
+    tmp_path,
+    monkeypatch,
+    kind,
+    boundary,
 ):
     service, database = setup_service(tmp_path)
     target = database.list_targets()[1]
@@ -983,8 +1153,12 @@ async def test_real_adapter_final_preparation_await_rechecks_actual_day_before_c
     monkeypatch.setattr("spark_keeper.automation.service.today_iso", lambda: day)
     other_batch = database.start_batch(BatchMode.MANUAL, target_count=1)
     existing = database.reserve_attempt(
-        batch_id=other_batch, account_key=ACCOUNT_KEY, target_id=target.id,
-        run_date="2026-09-05", message_text="当日已有消息", manual_override=False,
+        batch_id=other_batch,
+        account_key=ACCOUNT_KEY,
+        target_id=target.id,
+        run_date="2026-09-05",
+        message_text="当日已有消息",
+        manual_override=False,
     )
     database.finish_attempt(existing.attempt_id, AttemptStatus.UNKNOWN)
     protected = database.get_attempt(existing.attempt_id)
@@ -1072,7 +1246,9 @@ async def test_real_adapter_final_preparation_await_rechecks_actual_day_before_c
     service.browser_factory = SimpleNamespace(open=open_session)
     monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", BoundaryAdapter)
     result = await service.run_batch(
-        BatchMode.MANUAL, target_ids=[target.id], message_kind_override=kind,
+        BatchMode.MANUAL,
+        target_ids=[target.id],
+        message_kind_override=kind,
         message_text_override="消息" if kind is MessageKind.TEXT else "",
     )
     assert events[-3:] == ["captured", "midnight", "disposed"]

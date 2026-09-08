@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page
 
+from ..identity import canonical_profile_url, identities_match, identity_key
 from ..logging_safe import safe_url
 from ..models import Account, ErrorCode, FriendCandidate, Target
 from .browser import BrowserSession, BrowserSessionFactory
@@ -129,10 +130,12 @@ _CONVERSATION_IDENTITY_JS = r"""(element, includeFlame = false, diagnostic = {})
             const matches = participantUserId && Array.isArray(participants) && participants.length <= 2
                 ? participants.filter(participant => String(participant?.user_id) === String(participantUserId))
                 : [];
-            const secUserId = matches.length === 1 ? matches[0].sec_uid : '';
+            const singleVerified = type === 1 && matches.length === 1;
+            const secUserId = singleVerified ? matches[0].sec_uid : '';
             diagnostic.participant_count = Array.isArray(participants) ? participants.length : null;
             diagnostic.matching_participant_count = matches.length;
-            diagnostic.reason = secUserId ? 'participant_identity' : 'participant_identity_missing';
+            diagnostic.reason = secUserId ? 'participant_identity'
+                : singleVerified ? 'conversation_identity' : 'participant_identity_missing';
             let flame = null;
             if (includeFlame) {
                 try {
@@ -151,14 +154,16 @@ _CONVERSATION_IDENTITY_JS = r"""(element, includeFlame = false, diagnostic = {})
                     }
                 } catch (_) { /* Unavailable/malformed dedicated metadata stays unknown. */ }
             }
-            const scanConversationId = includeFlame ? conversation.id : '';
+            const conversationId = conversation.id;
+            const boundedId = typeof conversationId === 'string'
+                && conversationId.length > 0 && conversationId.length <= 500 ? conversationId : '';
             return {
                 secUserId: typeof secUserId === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(secUserId)
                     ? secUserId : '',
                 type: typeof type === 'number' ? type : null,
                 flame,
-                scanConversationId: typeof scanConversationId === 'string' && scanConversationId.length <= 500
-                    ? scanConversationId : ''
+                conversationId: singleVerified ? boundedId : '',
+                observationId: includeFlame ? boundedId : ''
             };
         } catch (_) { return unavailable('binding_unreadable'); }
     }
@@ -347,7 +352,8 @@ class _DeliveryTracker:
     def sample(self, snapshot: dict[str, Any]) -> DeliverySample:
         self._check_conversation(snapshot)
         messages = [
-            message for message in snapshot["messages"]
+            message
+            for message in snapshot["messages"]
             if message["clientId"] not in self.previous_ids
         ]
         # The SDK sequence proves freshness even if a fast send is terminal at
@@ -520,7 +526,7 @@ class DouyinChatAdapter:
         seen: set[str] = set()
         for raw in raw_candidates:
             candidate = self._candidate_from_raw(raw)
-            if candidate.stable_key in seen:
+            if candidate.stable_key and candidate.stable_key in seen:
                 continue
             seen.add(candidate.stable_key)
             candidates.append(candidate)
@@ -747,16 +753,7 @@ class DouyinChatAdapter:
                     && new URL(linkedProfile).pathname.replace(/\/$/, '')
                         !== new URL(participantProfile).pathname) return {error: 'identity_conflict', diagnostic};
                 const profileUrl = participantProfile || linkedProfile;
-                const idMatch = headerText.match(/抖音号\s*[:：]\s*([^\s]+)/);
-                const dataIds = [];
-                for (const node of nodes) {
-                    for (const attribute of node.attributes || []) {
-                        if (/(uid|user.?id|conversation.?id)/i.test(attribute.name)
-                            && attribute.value && attribute.value.length <= 200) {
-                            dataIds.push(`${attribute.name}:${attribute.value}`);
-                        }
-                    }
-                }
+                const conversationId = conversationIdentity?.conversationId || '';
                 const image = nodes.find(node =>
                     node.matches && node.matches('img') && visible(node)
                 );
@@ -764,10 +761,10 @@ class DouyinChatAdapter:
                     diagnostic,
                     token: '',
                     name: expectedName,
-                    douyinId: idMatch ? idMatch[1] : '',
                     profileUrl,
                     avatarUrl: image ? (image.currentSrc || image.src || '') : '',
-                    dataId: [...new Set(dataIds)].sort().join('|'),
+                    conversationId,
+                    conversationType: conversationIdentity?.type ?? null,
                     lineCount: headerText ? headerText.split(/\n+/).length : 1,
                     source: 'current_chat'
                 };
@@ -793,7 +790,6 @@ class DouyinChatAdapter:
         return FriendCandidate(
             stable_key=candidate.stable_key,
             display_name=candidate.display_name,
-            douyin_id=candidate.douyin_id,
             profile_url=candidate.profile_url,
             avatar_url=candidate.avatar_url,
             evidence={**candidate.evidence, "capture_source": "current_chat"},
@@ -804,10 +800,10 @@ class DouyinChatAdapter:
         search = await self._chat_search_input()
         await self._enter_chat_search_query(
             search,
-            target.search_query or target.display_name,
+            target.display_name,
         )
         raw_candidates = await self._wait_for_candidate_rows(
-            target.search_query or target.display_name,
+            target.display_name,
             search,
         )
         matches: list[dict[str, Any]] = []
@@ -823,13 +819,12 @@ class DouyinChatAdapter:
                 "target": {
                     "id": target.id,
                     "display_name": target.display_name,
-                    "search_query": target.search_query or target.display_name,
+                    "search_query": target.display_name,
                     "stable_key": target.stable_key,
-                    "douyin_id": target.douyin_id,
                     "profile_url": target.profile_url,
                     "avatar_url": target.avatar_url,
                     "identity_strength": target.evidence.get("identity_strength"),
-                    "data_id_digest": target.evidence.get("data_id_digest"),
+                    "conversation_digest": target.evidence.get("conversation_digest"),
                     "capture_source": target.evidence.get("capture_source"),
                 },
                 "candidate_count": len(raw_candidates),
@@ -839,10 +834,9 @@ class DouyinChatAdapter:
                         "token": raw.get("token"),
                         "display_name": candidate.display_name,
                         "stable_key": candidate.stable_key,
-                        "douyin_id": candidate.douyin_id,
                         "profile_url": candidate.profile_url,
                         "avatar_url": candidate.avatar_url,
-                        "data_id": raw.get("dataId"),
+                        "conversation_digest": candidate.evidence.get("conversation_digest"),
                         "identity_strength": candidate.evidence["identity_strength"],
                         "matches_saved_identity": self._identity_matches(candidate, target),
                     }
@@ -887,27 +881,24 @@ class DouyinChatAdapter:
         candidate = None
         try:
             candidate = await self._current_chat_candidate(target.display_name)
-            target_is_strong = target.evidence.get("identity_strength") == "strong"
-            candidate_is_strong = candidate.evidence.get("identity_strength") == "strong"
-            if target.evidence.get("capture_source") == "spark_scan" and not candidate_is_strong:
-                raise TargetIdentityMismatch(
-                    "扫描导入的好友需要稳定身份复核，当前聊天身份不足，请重新确认"
-                )
-            if (
-                target_is_strong
-                and candidate_is_strong
-                and not self._identity_matches(candidate, target)
-            ):
-                raise TargetIdentityMismatch()
+            if not self._identity_matches(candidate, target):
+                raise TargetIdentityMismatch("当前聊天缺少一致的可靠身份凭据，请重新确认")
         except TargetIdentityMismatch as error:
-            error.add_note(json.dumps({
-                "stage": "current_chat_identity",
-                "target_id": target.id,
-                "expected_profile": target.profile_url,
-                "current_profile": candidate.profile_url if candidate else "",
-                "identity_strength": candidate.evidence.get("identity_strength") if candidate else None,
-                "extraction": self._last_chat_diagnostics,
-            }, ensure_ascii=False))
+            error.add_note(
+                json.dumps(
+                    {
+                        "stage": "current_chat_identity",
+                        "target_id": target.id,
+                        "expected_profile": target.profile_url,
+                        "current_profile": candidate.profile_url if candidate else "",
+                        "identity_strength": candidate.evidence.get("identity_strength")
+                        if candidate
+                        else None,
+                        "extraction": self._last_chat_diagnostics,
+                    },
+                    ensure_ascii=False,
+                )
+            )
             raise
 
     async def composer_available(self) -> bool:
@@ -1259,17 +1250,13 @@ class DouyinChatAdapter:
                             'a,button,li,[role="listitem"],[role="option"]'
                         ) || row.querySelector('a,button,[role="button"]');
                         const pointer = getComputedStyle(row).cursor === 'pointer';
-                        const stableAttribute = [...row.attributes].some(attribute =>
-                            /(uid|user.?id|conversation.?id)/i.test(attribute.name)
-                            && Boolean(attribute.value)
-                        );
                         const chatAction = [...row.querySelectorAll('*')].some(element =>
                             visible(element)
                             && getComputedStyle(element).cursor === 'pointer'
                             && /^(发消息|聊天)$/.test(normalize(element.innerText))
                         );
                         if (row.querySelector('img')
-                            && (interactive || pointer || stableAttribute || chatAction)) {
+                            && (interactive || pointer || chatAction)) {
                             selected = row;
                             break;
                         }
@@ -1297,7 +1284,14 @@ class DouyinChatAdapter:
                     const links = [...selected.querySelectorAll('a[href]')]
                         .map(link => link.href)
                         .filter(Boolean);
-                    const conversationIdentity = (__READ_CONVERSATION_IDENTITY__)(selected);
+                    const identityDiagnostic = {};
+                    const conversationIdentity = (__READ_CONVERSATION_IDENTITY__)(
+                        selected, false, identityDiagnostic
+                    );
+                    if (identityDiagnostic.reason === 'alternate_conflict') {
+                        rowCounts.conflicting_profile++;
+                        continue;
+                    }
                     if (conversationIdentity && conversationIdentity.type !== null
                         && conversationIdentity.type !== 1) {
                         rowCounts.non_private_conversation++;
@@ -1318,28 +1312,17 @@ class DouyinChatAdapter:
                         .split(/\n+/)
                         .map(normalize)
                         .filter(Boolean);
-                    const name = lines.find(line => line === needle)
-                        || lines.find(line => line.includes(needle))
-                        || lines[0]
-                        || needle;
-                    const idLine = lines.find(line => /抖音号\s*[:：]/.test(line)) || '';
-                    const idMatch = idLine.match(/抖音号\s*[:：]\s*([^\s]+)/);
-                    const dataIds = [];
-                    for (const node of [selected, ...selected.querySelectorAll('*')]) {
-                        for (const attribute of node.attributes || []) {
-                            if (/(uid|user.?id|conversation.?id)/i.test(attribute.name)
-                                && attribute.value && attribute.value.length <= 200) {
-                                dataIds.push(`${attribute.name}:${attribute.value}`);
-                            }
-                        }
-                    }
+                    const nameNode = selected.querySelector(
+                        '.conversationConversationItemtitle, [data-role="conversation-name"]'
+                    );
+                    const name = normalize((nameNode || leaf).innerText);
                     results.push({
                         token,
                         name,
-                        douyinId: idMatch ? idMatch[1] : '',
                         profileUrl,
                         avatarUrl: image ? (image.currentSrc || image.src || '') : '',
-                        dataId: [...new Set(dataIds)].sort().join('|'),
+                        conversationId: conversationIdentity?.conversationId || '',
+                        conversationType: conversationIdentity?.type ?? null,
                         lineCount: lines.length
                     });
                 }
@@ -1378,53 +1361,52 @@ class DouyinChatAdapter:
     @staticmethod
     def _candidate_from_raw(raw: dict[str, Any]) -> FriendCandidate:
         display_name = " ".join(str(raw.get("name") or "").split()).strip()
-        douyin_id = " ".join(str(raw.get("douyinId") or "").split()).strip()
-        profile_url = _canonical_http_url(str(raw.get("profileUrl") or ""))
+        profile_url = canonical_profile_url(str(raw.get("profileUrl") or ""))
         avatar_url = _canonical_http_url(str(raw.get("avatarUrl") or ""))
-        data_id = str(raw.get("dataId") or "")[:500]
-        if profile_url and "/user/self" not in profile_url:
-            identity_source = f"profile:{profile_url}"
-            strength = "strong"
-        elif douyin_id:
-            identity_source = f"douyin:{douyin_id}"
-            strength = "strong"
-        elif data_id:
-            identity_source = f"data:{data_id}"
-            strength = "strong"
-        else:
-            avatar_path = urlsplit(avatar_url).path if avatar_url else ""
-            identity_source = f"visual:{display_name}|{avatar_path}"
-            strength = "weak"
-        stable_key = hashlib.sha256(identity_source.encode("utf-8")).hexdigest()
+        evidence: dict[str, Any] = {
+            "profile_url": profile_url,
+            "line_count": int(raw.get("lineCount") or 0),
+            "chat_type": "single" if raw.get("conversationType") == 1 else "unknown",
+        }
+        conversation_id = raw.get("conversationId")
+        if (
+            raw.get("conversationType") == 1
+            and isinstance(conversation_id, str)
+            and 0 < len(conversation_id) <= 500
+        ):
+            evidence.update(
+                identity_source="sdk_single_conversation",
+                conversation_digest=hashlib.sha256(conversation_id.encode("utf-8")).hexdigest(),
+            )
+        stable_key = identity_key(profile_url, evidence)
+        evidence["identity_strength"] = "strong" if stable_key else "weak"
         return FriendCandidate(
             stable_key=stable_key,
             display_name=display_name,
-            douyin_id=douyin_id,
             profile_url=profile_url,
             avatar_url=avatar_url,
-            evidence={
-                "identity_strength": strength,
-                "profile_url": profile_url,
-                "douyin_id": douyin_id,
-                "data_id_digest": hashlib.sha256(data_id.encode("utf-8")).hexdigest()
-                if data_id
-                else "",
-                "line_count": int(raw.get("lineCount") or 0),
-            },
+            evidence=evidence,
         )
 
     @staticmethod
     def _identity_matches(candidate: FriendCandidate, target: Target) -> bool:
-        return (
-            candidate.stable_key == target.stable_key
-            or bool(target.profile_url and candidate.profile_url == target.profile_url)
-            or bool(target.douyin_id and candidate.douyin_id == target.douyin_id)
+        if any(
+            evidence.get("identity_conflict") or evidence.get("chat_type") == "group"
+            for evidence in (candidate.evidence, target.evidence)
+        ):
+            return False
+        return identities_match(
+            candidate.profile_url, candidate.evidence, target.profile_url, target.evidence
         )
 
     async def _text_message_snapshot(self, text: str) -> dict[str, Any]:
         snapshot = await self.page.evaluate(
             _MESSAGE_DELIVERY_SNAPSHOT_JS,
-            {"resourcePath": SPARK_STICKER_RESOURCE_PATH, "requirePanel": False, "expectedText": text},
+            {
+                "resourcePath": SPARK_STICKER_RESOURCE_PATH,
+                "requirePanel": False,
+                "expectedText": text,
+            },
         )
         if not isinstance(snapshot, dict) or snapshot.get("error"):
             raise PageStructureChanged()

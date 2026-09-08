@@ -12,6 +12,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
+from .identity import canonical_profile_url, identities_match, identity_key
 from .models import (
     Account,
     AttemptStatus,
@@ -52,7 +53,7 @@ class DatabaseInitializationError(RuntimeError):
 
 
 class Database:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path).resolve()
@@ -205,7 +206,6 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     stable_key TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL,
-                    douyin_id TEXT NOT NULL DEFAULT '',
                     profile_url TEXT NOT NULL DEFAULT '',
                     avatar_url TEXT NOT NULL DEFAULT '',
                     search_query TEXT NOT NULL,
@@ -329,11 +329,72 @@ class Database:
                 connection.execute(
                     f"ALTER TABLE {table} ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text'"
                 )
+        cls._migrate_target_identities(connection)
         connection.execute(
             "INSERT INTO app_meta(key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(cls.SCHEMA_VERSION),),
         )
+
+    @staticmethod
+    def _identity_evidence(value: Any) -> dict[str, Any]:
+        """Keep structured identity evidence, not obsolete number-based diagnostics."""
+        if not isinstance(value, dict):
+            return {}
+        evidence: dict[str, Any] = {}
+        for field in ("chat_type", "identity_strength", "identity_source"):
+            allowed = {
+                "chat_type": {"single", "group", "unknown"},
+                "identity_strength": {"strong", "weak"},
+                "identity_source": {"sdk_single_conversation"},
+            }[field]
+            if isinstance(value.get(field), str) and value[field] in allowed:
+                evidence[field] = value[field]
+        digest = identity_key("", value)
+        if digest:
+            evidence["conversation_digest"] = digest.removeprefix("sdk-conversation:")
+        if value.get("identity_conflict"):
+            evidence["identity_conflict"] = True
+        profile = canonical_profile_url(value.get("profile_url", ""))
+        if profile:
+            evidence["profile_url"] = profile
+        scan = value.get("spark_scan")
+        if (
+            isinstance(scan, dict)
+            and isinstance(scan.get("state"), str)
+            and scan["state"] in {state.value for state in SparkState}
+        ):
+            evidence["spark_scan"] = {"state": scan["state"]}
+        return evidence
+
+    @classmethod
+    def _migrate_target_identities(cls, connection: sqlite3.Connection) -> None:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(targets)")}
+        if "douyin_id" not in columns:
+            return
+        # ALTER preserves target primary keys and every history/guard foreign key.
+        rows = connection.execute(
+            "SELECT id, profile_url, evidence_json FROM targets ORDER BY id"
+        ).fetchall()
+        # Clear old keys before assigning canonical ones, including key swaps.
+        connection.execute(
+            "UPDATE targets SET stable_key = ? || id", (f"migration:{uuid.uuid4().hex}:",)
+        )
+        for target_id, profile_url, raw_evidence in rows:
+            try:
+                evidence = cls._identity_evidence(json.loads(raw_evidence))
+            except (TypeError, ValueError):
+                evidence = {}
+            profile = canonical_profile_url(profile_url)
+            key = identity_key(profile, evidence)
+            if not key:
+                raise ValueError("好友稳定身份尚未确认，无法完成身份迁移")
+            connection.execute(
+                "UPDATE targets SET stable_key = ?, profile_url = ?, evidence_json = ?, "
+                "search_query = display_name WHERE id = ?",
+                (key, profile, json.dumps(evidence, ensure_ascii=False), target_id),
+            )
+        connection.execute("ALTER TABLE targets DROP COLUMN douyin_id")
 
     def get_meta(self, key: str, default: str | None = None) -> str | None:
         with self.connect() as connection:
@@ -409,42 +470,91 @@ class Database:
         with self.connect(immediate=True) as connection:
             connection.execute("DELETE FROM account WHERE singleton = 1")
 
-    def add_target(self, candidate: FriendCandidate, search_query: str) -> Target:
-        if not candidate.stable_key.strip():
-            raise ValueError("好友稳定标识不能为空")
-        timestamp = now_iso()
-        evidence = json.dumps(candidate.evidence, ensure_ascii=False, separators=(",", ":"))
-        with self.connect(immediate=True) as connection:
-            connection.execute(
-                """
-                INSERT INTO targets(
-                    stable_key, display_name, douyin_id, profile_url, avatar_url,
-                    search_query, evidence_json, enabled, confirmed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-                ON CONFLICT(stable_key) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    douyin_id = excluded.douyin_id,
-                    profile_url = excluded.profile_url,
-                    avatar_url = excluded.avatar_url,
-                    search_query = excluded.search_query,
-                    evidence_json = excluded.evidence_json,
-                    enabled = 1,
-                    confirmed_at = excluded.confirmed_at
-                """,
-                (
-                    candidate.stable_key,
-                    candidate.display_name,
-                    candidate.douyin_id,
-                    candidate.profile_url,
-                    candidate.avatar_url,
-                    search_query.strip(),
-                    evidence,
-                    timestamp,
-                ),
+    @classmethod
+    def _confirmed_candidate(cls, candidate: FriendCandidate) -> FriendCandidate:
+        evidence = cls._identity_evidence(candidate.evidence)
+        profile = canonical_profile_url(candidate.profile_url)
+        key = identity_key(profile, evidence)
+        if (
+            not key
+            or not candidate.display_name.strip()
+            or evidence.get("identity_conflict")
+            or evidence.get("chat_type") == "group"
+            or (profile and evidence.get("profile_url") and profile != evidence["profile_url"])
+        ):
+            raise ValueError("好友稳定身份尚未确认，请重新核验")
+        return replace(candidate, stable_key=key, profile_url=profile, evidence=evidence)
+
+    @classmethod
+    def _matching_targets(
+        cls, connection: sqlite3.Connection, candidate: FriendCandidate
+    ) -> list[Target]:
+        matches = []
+        conversation = identity_key("", candidate.evidence)
+        for row in connection.execute("SELECT * FROM targets"):
+            target = cls._target_from_row(row)
+            same_conversation = bool(
+                conversation and conversation == identity_key("", target.evidence)
             )
-            row = connection.execute(
-                "SELECT * FROM targets WHERE stable_key = ?", (candidate.stable_key,)
-            ).fetchone()
+            if (
+                target.stable_key == candidate.stable_key
+                or same_conversation
+                or identities_match(
+                    target.profile_url, target.evidence, candidate.profile_url, candidate.evidence
+                )
+            ):
+                if not identities_match(
+                    target.profile_url, target.evidence, candidate.profile_url, candidate.evidence
+                ):
+                    raise ValueError("好友身份与已有记录冲突，不能合并历史")
+                matches.append(target)
+        if len(matches) > 1:
+            raise ValueError("好友身份与已有记录冲突，不能合并历史")
+        return matches
+
+    @classmethod
+    def _require_confirmed_target(cls, connection: sqlite3.Connection, target_id: int) -> Target:
+        row = connection.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
+        if row is None:
+            raise KeyError(target_id)
+        target = cls._target_from_row(row)
+        if (
+            target.evidence.get("identity_conflict")
+            or not identity_key(target.profile_url, target.evidence)
+            or target.evidence.get("chat_type") == "group"
+        ):
+            raise ValueError("好友稳定身份尚未确认，请重新核验")
+        return target
+
+    def add_target(self, candidate: FriendCandidate, search_query: str) -> Target:
+        candidate = self._confirmed_candidate(candidate)
+        with self.connect(immediate=True) as connection:
+            matches = self._matching_targets(connection, candidate)
+            values = (
+                candidate.stable_key,
+                candidate.display_name,
+                candidate.profile_url,
+                candidate.avatar_url,
+                candidate.display_name,
+                json.dumps(candidate.evidence, ensure_ascii=False),
+                now_iso(),
+            )
+            if matches:
+                target_id = matches[0].id
+                connection.execute(
+                    "UPDATE targets SET stable_key = ?, display_name = ?, profile_url = ?, "
+                    "avatar_url = ?, search_query = ?, evidence_json = ?, confirmed_at = ?, "
+                    "enabled = 1 WHERE id = ?",
+                    (*values, target_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "INSERT INTO targets(stable_key, display_name, profile_url, avatar_url, "
+                    "search_query, evidence_json, confirmed_at, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                    values,
+                )
+                target_id = cursor.lastrowid
+            row = connection.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
         assert row is not None
         return self._target_from_row(row)
 
@@ -463,8 +573,12 @@ class Database:
                 if (
                     not previous.importable
                     or not contact.importable
-                    or previous.candidate.douyin_id != contact.candidate.douyin_id
-                    or previous.candidate.profile_url != contact.candidate.profile_url
+                    or not identities_match(
+                        previous.candidate.profile_url,
+                        previous.candidate.evidence,
+                        contact.candidate.profile_url,
+                        contact.candidate.evidence,
+                    )
                 ):
                     raise ValueError("扫描结果包含冲突或未确认身份，请重新扫描")
                 if previous.spark_state != contact.spark_state:
@@ -489,29 +603,8 @@ class Database:
             ):
                 raise ValueError("登录账号或登录状态已变化，请重新扫描")
             for key in selected:
-                candidate = candidates[key].candidate
-                matches = connection.execute(
-                    """
-                    SELECT id, profile_url FROM targets
-                    WHERE stable_key = ?
-                       OR (? != '' AND profile_url = ?)
-                       OR (? != '' AND douyin_id = ?)
-                    """,
-                    (
-                        key,
-                        candidate.profile_url,
-                        candidate.profile_url,
-                        candidate.douyin_id,
-                        candidate.douyin_id,
-                    ),
-                ).fetchall()
-                if len(matches) > 1 or (
-                    matches
-                    and candidate.profile_url
-                    and matches[0]["profile_url"]
-                    and matches[0]["profile_url"] != candidate.profile_url
-                ):
-                    raise ValueError("好友身份与已有记录冲突，本次导入未保存")
+                candidate = self._confirmed_candidate(candidates[key].candidate)
+                matches = self._matching_targets(connection, candidate)
                 if matches:
                     existing += 1
                     continue
@@ -523,17 +616,16 @@ class Database:
                 connection.execute(
                     """
                     INSERT INTO targets(
-                        stable_key, display_name, douyin_id, profile_url, avatar_url,
+                        stable_key, display_name, profile_url, avatar_url,
                         search_query, evidence_json, enabled, confirmed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
                     """,
                     (
-                        key,
+                        candidate.stable_key,
                         candidate.display_name,
-                        candidate.douyin_id,
                         candidate.profile_url,
                         candidate.avatar_url,
-                        candidate.douyin_id or candidate.display_name,
+                        candidate.display_name,
                         json.dumps(evidence, ensure_ascii=False, separators=(",", ":")),
                         now_iso(),
                     ),
@@ -565,17 +657,13 @@ class Database:
         return self._target_from_row(row) if row else None
 
     def set_target_enabled(self, target_id: int, enabled: bool) -> None:
-        with self.connect(immediate=True) as connection:
-            row = connection.execute("SELECT id FROM targets WHERE id = ?", (target_id,)).fetchone()
-            if row is None:
-                raise KeyError(target_id)
-            connection.execute(
-                "UPDATE targets SET enabled = ? WHERE id = ?", (int(enabled), target_id)
-            )
+        self.set_targets_enabled((target_id,), enabled)
 
     def set_targets_enabled(self, target_ids: Iterable[int], enabled: bool) -> None:
         with self.connect(immediate=True) as connection:
             for target_id in dict.fromkeys(target_ids):
+                if enabled:
+                    self._require_confirmed_target(connection, target_id)
                 result = connection.execute(
                     "UPDATE targets SET enabled = ? WHERE id = ?", (int(enabled), target_id)
                 )
@@ -608,7 +696,6 @@ class Database:
             id=int(row["id"]),
             stable_key=str(row["stable_key"]),
             display_name=str(row["display_name"]),
-            douyin_id=str(row["douyin_id"]),
             profile_url=str(row["profile_url"]),
             avatar_url=str(row["avatar_url"]),
             search_query=str(row["search_query"]),
@@ -807,6 +894,7 @@ class Database:
         attempt_id = str(uuid.uuid4())
         timestamp = now_iso()
         with self.connect(immediate=True) as connection:
+            self._require_confirmed_target(connection, target_id)
             guard = connection.execute(
                 """
                 SELECT source_attempt_id, status FROM daily_send_guards
@@ -899,6 +987,7 @@ class Database:
                 or row["triggered_at"] is not None
             ):
                 raise ValueError("发送尝试不在可触发状态")
+            self._require_confirmed_target(connection, int(row["target_id"]))
             run_date = today_iso()
             timestamp = now_iso()
             guard = connection.execute(
@@ -928,10 +1017,13 @@ class Database:
                     WHERE id = ?
                     """,
                     (
-                        AttemptStatus.DUPLICATE.value, timestamp,
+                        AttemptStatus.DUPLICATE.value,
+                        timestamp,
                         ErrorCode.DUPLICATE_BLOCKED.value,
                         row["run_date"] if row["manual_override"] else run_date,
-                        row["override_of"] if row["manual_override"] else guard["source_attempt_id"],
+                        row["override_of"]
+                        if row["manual_override"]
+                        else guard["source_attempt_id"],
                         attempt_id,
                     ),
                 )
@@ -954,8 +1046,13 @@ class Database:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        row["account_key"], row["target_id"], run_date, attempt_id,
-                        AttemptStatus.SENDING.value, timestamp, timestamp,
+                        row["account_key"],
+                        row["target_id"],
+                        run_date,
+                        attempt_id,
+                        AttemptStatus.SENDING.value,
+                        timestamp,
+                        timestamp,
                     ),
                 )
             connection.execute(

@@ -13,10 +13,8 @@ def test_candidate_prefers_canonical_profile_identity() -> None:
     candidate = DouyinChatAdapter._candidate_from_raw(
         {
             "name": " 测试好友 ",
-            "douyinId": "",
             "profileUrl": "https://www.douyin.com/user/abc/?token=secret",
             "avatarUrl": "https://example.test/avatar.png?x=1",
-            "dataId": "conversation:123",
             "lineCount": 2,
         }
     )
@@ -27,7 +25,6 @@ def test_candidate_prefers_canonical_profile_identity() -> None:
         id=1,
         stable_key=candidate.stable_key,
         display_name=candidate.display_name,
-        douyin_id="",
         profile_url=candidate.profile_url,
         avatar_url=candidate.avatar_url,
         search_query="测试好友",
@@ -75,7 +72,6 @@ def test_target_labels_preserve_names_and_distinguish_same_name_targets() -> Non
         id=41,
         stable_key="friend-41",
         display_name="真实好友名称",
-        douyin_id="friend41",
         profile_url="",
         avatar_url="",
         search_query="真实好友名称",
@@ -88,3 +84,69 @@ def test_target_labels_preserve_names_and_distinguish_same_name_targets() -> Non
     assert target_label(first) == "真实好友名称（ID: 41）"
     assert target_label(second) == "真实好友名称（ID: 42）"
     assert target_label(first) != target_label(second)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"douyinId": "obsolete-number"},
+        {"dataId": "arbitrary-dom-identity"},
+        {"avatarUrl": "https://example.test/same-avatar.png"},
+        {"conversationId": "unverified-conversation", "conversationType": 2},
+        {"conversationId": "unverified-conversation"},
+    ],
+)
+def test_numbers_dom_ids_and_visual_identity_cannot_confirm(raw) -> None:
+    candidate = DouyinChatAdapter._candidate_from_raw({"name": "同名好友", **raw})
+    assert not candidate.stable_key
+    assert candidate.evidence["identity_strength"] == "weak"
+    assert "douyin_id" not in candidate.evidence
+    assert "data_id_digest" not in candidate.evidence
+    assert "obsolete-number" not in repr(candidate)
+    target = Target(
+        id=1,
+        stable_key=candidate.stable_key,
+        display_name=candidate.display_name,
+        profile_url="",
+        avatar_url=candidate.avatar_url,
+        search_query=candidate.display_name,
+        evidence=candidate.evidence,
+        enabled=True,
+        confirmed_at="fixture-time",
+    )
+    assert not DouyinChatAdapter._identity_matches(candidate, target)
+
+
+def test_profiles_override_conversation_digest_and_stable_key_claims() -> None:
+    candidate = DouyinChatAdapter._candidate_from_raw(
+        {
+            "name": "同名好友",
+            "profileUrl": "https://www.douyin.com/user/current",
+            "conversationId": "same-sdk-conversation",
+            "conversationType": 1,
+        }
+    )
+    target = Target(
+        id=1,
+        stable_key=candidate.stable_key,
+        display_name=candidate.display_name,
+        profile_url="https://www.douyin.com/user/different",
+        avatar_url=candidate.avatar_url,
+        search_query=candidate.display_name,
+        evidence=candidate.evidence,
+        enabled=True,
+        confirmed_at="fixture-time",
+    )
+    assert not DouyinChatAdapter._identity_matches(candidate, target)
+    assert DouyinChatAdapter._identity_matches(
+        candidate, replace(target, profile_url="https://douyin.com/user/current/?tracking=ignored")
+    )
+    legacy = replace(
+        target,
+        profile_url="",
+        evidence={
+            "scan_conversation_digest": candidate.evidence["conversation_digest"],
+            "identity_strength": "strong",
+        },
+    )
+    assert not DouyinChatAdapter._identity_matches(candidate, legacy)

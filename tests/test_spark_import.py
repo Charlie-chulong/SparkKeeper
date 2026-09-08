@@ -123,7 +123,7 @@ def test_all_spark_states_of_reliable_single_chats_import_on_selection(database,
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("state", list(SparkState))
-def test_import_preserves_existing_record_including_legacy_identity_key(
+def test_import_preserves_existing_record_after_identity_key_normalization(
     database, enabled, state
 ) -> None:
     found = replace(contact("existing", "当前名称"), spark_state=state)
@@ -169,7 +169,7 @@ def test_import_rejects_changed_account_or_login(database, change) -> None:
         "missing-identity",
         "foreign-profile",
         "self-profile",
-        "invalid-id",
+        "untrusted-conversation",
     ],
 )
 def test_import_rejects_unsafe_identity_selection_atomically(database, unsafe, state) -> None:
@@ -196,7 +196,8 @@ def test_import_rejects_unsafe_identity_selection_atomically(database, unsafe, s
     elif unsafe == "self-profile":
         candidate = replace(candidate, profile_url="https://www.douyin.com/user/self")
     else:
-        candidate = replace(candidate, profile_url="", douyin_id="invalid id")
+        candidate = replace(candidate, profile_url="")
+        evidence["scan_conversation_digest"] = "a" * 64
     other = replace(other, candidate=replace(candidate, evidence=evidence))
     assert not other.importable
 
@@ -217,8 +218,14 @@ def test_import_rejects_keys_not_in_scan(database) -> None:
 
 def test_import_rolls_back_insert_when_later_identity_is_ambiguous(database) -> None:
     first, ambiguous = contact("new"), contact("ambiguous")
-    database.add_target(replace(ambiguous.candidate, stable_key="old-a"), "旧记录甲")
-    database.add_target(replace(ambiguous.candidate, stable_key="old-b"), "旧记录乙")
+    saved = database.add_target(ambiguous.candidate, "旧记录甲")
+    with database.connect(immediate=True) as connection:
+        connection.execute(
+            "INSERT INTO targets(stable_key, display_name, profile_url, search_query, evidence_json, "
+            "enabled, confirmed_at) SELECT 'corrupt-duplicate', display_name, profile_url, "
+            "search_query, evidence_json, 0, confirmed_at FROM targets WHERE id = ?",
+            (saved.id,),
+        )
     before = database.list_targets()
 
     with pytest.raises(ValueError, match="冲突"):
@@ -265,7 +272,9 @@ def test_duplicate_reliable_identity_imports_despite_spark_state_changes(
     assert database.list_targets() == targets
 
 
-@pytest.mark.parametrize("unsafe", ["weak", "unknown-type", "group", "identity-conflict", "id"])
+@pytest.mark.parametrize(
+    "unsafe", ["weak", "unknown-type", "group", "identity-conflict", "profile"]
+)
 @pytest.mark.parametrize("reverse", [False, True])
 def test_duplicate_unreliable_or_conflicting_identity_rejects_entire_selection(
     database, unsafe, reverse
@@ -282,8 +291,10 @@ def test_duplicate_unreliable_or_conflicting_identity_rejects_entire_selection(
     elif unsafe == "group":
         second = replace(second, is_group=True)
     else:
-        first = replace(first, candidate=replace(first.candidate, douyin_id="first_id"))
-        second = replace(second, candidate=replace(second.candidate, douyin_id="other_id"))
+        second = replace(
+            second,
+            candidate=replace(second.candidate, profile_url="https://www.douyin.com/user/other"),
+        )
     second = replace(second, candidate=replace(second.candidate, evidence=evidence))
     observations = [first, second]
     if reverse:

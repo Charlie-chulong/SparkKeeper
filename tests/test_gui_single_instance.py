@@ -219,6 +219,7 @@ def test_smoke_bypasses_production_lease_and_uses_temporary_data(qapp, monkeypat
         assert smoke_mode
         roots.append(os.environ["SPARK_KEEPER_ROOT"])
         window = QWidget()
+        window._theme_writer = Mock()
         return window
 
     monkeypatch.setattr(app_module, "SparkKeeperApp", build_window)

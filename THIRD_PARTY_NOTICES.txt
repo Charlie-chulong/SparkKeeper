@@ -27,6 +27,31 @@ PyInstaller
 License: GPL-2.0-or-later with the PyInstaller Bootloader Exception
 Source: https://github.com/pyinstaller/pyinstaller
 
+Inno Setup (Windows installer engine, starting with SparkKeeper 3.0.2)
+License: Inno Setup License
+Copyright (C) 1997-2026 Jordan Russell. All rights reserved.
+Portions Copyright (C) 2000-2026 Martijn Laan. All rights reserved.
+Project: https://jrsoftware.org/isinfo.php
+License: https://jrsoftware.org/files/is/license.txt
+Source: https://github.com/jrsoftware/issrc
+Inno Setup is used to produce the per-user Windows installer. Its own license permits
+commercial use subject to its terms; it is not governed by SparkKeeper's PolyForm
+Noncommercial license. Conversely, use of this installer engine grants no commercial
+rights to SparkKeeper's own code. Original engine copyright notices and website
+addresses must be retained in binary redistributions.
+
+Simplified Chinese installer messages:
+Maintainer: Zhenghan Yang (Kira).
+Official translation index: https://jrsoftware.org/files/istrans/
+Unmodified upstream file (declared for Inno Setup 6.5.0+):
+  https://github.com/jrsoftware/issrc/blob/6ef32198ef1f7b7b375cd4b6b90896c2a58eb4c2/Files/Languages/ChineseSimplified.isl
+SHA-256: e0b0b350e2245f3c5e65586dfe43d574f6e7f06f2261149aba284954b3fc9a8d
+The source copy is tools/installer/ChineseSimplified.isl, retaining all upstream
+maintainer and translator notices. The unchanged Inno Setup License from the same
+revision is retained in tools/installer/LICENSE.txt in source and
+licenses/InnoSetup/LICENSE.txt in the Windows distribution. This translation is
+not relicensed under SparkKeeper's noncommercial license.
+
 Runtime Python standard-library components remain subject to the Python Software Foundation License.
 
 PySide6-Essentials, shiboken6, and Qt Core/Gui/Widgets 6.11.2

@@ -161,6 +161,7 @@ def copy_licenses(release_directory: Path) -> None:
     shutil.copy2(ROOT / "LICENSE", release_directory / "LICENSE")
     sources = {
         "Python-LICENSE.txt": Path(sys.base_prefix) / "LICENSE.txt",
+        "InnoSetup/LICENSE.txt": ROOT / "tools" / "installer" / "LICENSE.txt",
         "Playwright-LICENSE.txt": (
             VENV / "Lib" / "site-packages" / "playwright" / "driver" / "LICENSE"
         ),
@@ -176,7 +177,9 @@ def copy_licenses(release_directory: Path) -> None:
     for name, source in sources.items():
         if not source.is_file():
             raise FileNotFoundError(f"缺少许可文件：{source}")
-        shutil.copy2(source, destination / name)
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
     copy_qt_licenses(destination)
 
 

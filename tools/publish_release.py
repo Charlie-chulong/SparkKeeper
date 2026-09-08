@@ -18,6 +18,11 @@ project_version = _build["project_version"]
 release_version = _build["release_version"]
 sha256_file = _build["sha256_file"]
 is_sensitive_path = _build["is_sensitive_path"]
+_installer = runpy.run_path(str(ROOT / "tools" / "build_installer.py"))
+validate_member = _installer["validate_member"]
+unique_object = _installer["unique_object"]
+validate_manifest = _installer["validate_manifest"]
+validate_installer = _installer["validate_installer"]
 
 
 def checked(command: list[str], *, root: Path) -> str:
@@ -71,24 +76,6 @@ def validate_git(root: Path, repo: str, tag: str, version: str, remote: str = "o
     return head
 
 
-def validate_member(name: str) -> None:
-    parts = name.split("/")
-    if not name or "\\" in name or any(
-        not part or part in {".", ".."} or part.endswith((".", " "))
-        or any(ord(char) < 32 or char in ':*?"<>|' for char in part)
-        or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part, re.IGNORECASE)
-        for part in parts
-    ):
-        raise ValueError(f"发行包含不安全路径：{name!r}")
-
-
-def unique_object(pairs: list[tuple[str, object]]) -> dict:
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"manifest 含重复字段：{key}")
-        result[key] = value
-    return result
 
 
 def validate_archive(archive: Path, version: str, *, root: Path = ROOT) -> Path:
@@ -117,17 +104,9 @@ def validate_archive(archive: Path, version: str, *, root: Path = ROOT) -> Path:
         manifest_name = "SparkKeeper/release-manifest.json"
         if manifest_name not in members:
             raise RuntimeError("发行包缺少 release-manifest.json")
-        manifest = json.loads(bundle.read(manifest_name), object_pairs_hook=unique_object)
-        if not isinstance(manifest, dict) or type(manifest.get("format")) is not int or manifest.get("format") != 1 or manifest.get("product") != "SparkKeeper" or manifest.get("version") != version:
-            raise RuntimeError("manifest 格式、产品或版本不匹配")
-        files = manifest.get("files")
-        if not isinstance(files, dict) or not files:
-            raise RuntimeError("manifest 文件清单为空或无效")
+        files = validate_manifest(bundle.read(manifest_name), version)
         expected = {"更新.cmd", "update.ps1", manifest_name}
         for name, digest in files.items():
-            validate_member(name)
-            if name.casefold() == "release-manifest.json" or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-                raise ValueError("manifest 含自身或无效 SHA256")
             member = "SparkKeeper/" + name
             expected.add(member)
             if member not in members:
@@ -138,9 +117,6 @@ def validate_archive(archive: Path, version: str, *, root: Path = ROOT) -> Path:
                 raise RuntimeError(f"发行文件 SHA256 不符：{member}")
         if set(members) != expected:
             raise RuntimeError("ZIP 含 manifest 之外的额外文件")
-        required = {"SparkKeeper.exe", "THIRD_PARTY_NOTICES.txt", "使用说明.txt"}
-        if not required <= files.keys() or any(not any(name.startswith(prefix) for name in files) for prefix in ("_internal/", "browsers/", "licenses/")):
-            raise RuntimeError("发行包缺少程序、运行库、浏览器、许可或说明")
     return checksum
 
 
@@ -204,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--tag", help="正式版 vX.Y.Z；候选版 vX.Y.Z-rc.N")
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--installer", type=Path, help="Setup.exe；默认与 ZIP 位于同一目录；须保留本地 .exe.build.json 构建凭据")
     parser.add_argument("--qt-sources", type=Path, help="Qt 对应源码目录；默认从包内 Qt 版本确定")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="仅本地预检（默认）")
@@ -217,10 +194,15 @@ def main(argv: list[str] | None = None) -> int:
         archive = (args.archive or ROOT / "outputs" / "release" / f"SparkKeeper-{public_version}-win64.zip").resolve()
         head = validate_git(ROOT, repo, tag, version, args.remote)
         checksum = validate_archive(archive, version, root=ROOT)
+        installer = (args.installer or archive.with_name(f"SparkKeeper-{public_version}-Setup.exe")).resolve()
+        with zipfile.ZipFile(archive) as bundle:
+            manifest_digest = hashlib.sha256(bundle.read("SparkKeeper/release-manifest.json")).hexdigest()
+        installer_checksum = validate_installer(installer, version, manifest_digest, root=ROOT)
         source_assets = validate_qt_sources(archive, args.qt_sources, root=ROOT)
-        command = ["gh", "release", "create", tag, str(archive), str(checksum), *map(str, source_assets), "--repo", repo,
+        command = ["gh", "release", "create", tag, str(installer), str(installer_checksum),
+                   str(archive), str(checksum), *map(str, source_assets), "--repo", repo,
                    "--verify-tag", "--draft", "--title", f"SparkKeeper {public_version}",
-                   "--notes", "人工预发布草稿：请补充并核对更新说明、SHA256 与离线更新步骤后，在 GitHub 手动发布。"]
+                   "--notes", "人工预发布草稿：请核对安装/升级与便携说明、SHA256、用户数据保留策略后，在 GitHub 手动发布。"]
         if "rc" in version:
             command.append("--prerelease")
         print(f"本地预检通过：{repo} {tag} HEAD={head}\n{shlex.join(command)}")
@@ -235,6 +217,9 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("人工确认期间版本或提交发生变化")
         validate_archive(archive, version, root=ROOT)
         validate_qt_sources(archive, args.qt_sources, root=ROOT)
+        with zipfile.ZipFile(archive) as bundle:
+            current_manifest_digest = hashlib.sha256(bundle.read("SparkKeeper/release-manifest.json")).hexdigest()
+        validate_installer(installer, version, current_manifest_digest, root=ROOT)
         remote_ref = checked(["gh", "api", f"repos/{repo}/commits/refs/tags/{tag}", "--jq", ".sha"], root=ROOT)
         if remote_ref != head:
             raise RuntimeError("GitHub 远端 tag 与本地提交不一致；请人工核对并推送正确 tag")

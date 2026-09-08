@@ -140,6 +140,9 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
     playwright_license.write_bytes(b"Playwright license\n")
     dependency_license = root / "dependency-LICENSE.txt"
     dependency_license.write_bytes(b"Dependency license\n")
+    inno_license = root / "tools" / "installer" / "LICENSE.txt"
+    inno_license.parent.mkdir(parents=True)
+    inno_license.write_bytes(b"Unmodified Inno Setup translation license\r\n")
     qt_source = root / "third_party" / "qt-6.11.2"
     qt_source.mkdir(parents=True)
     for filename in ("LGPL-3.0-only.txt", "GPL-3.0-only.txt"):
@@ -163,6 +166,7 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
         "licenses/Playwright-LICENSE.txt": playwright_license,
         "licenses/Windows-Toasts-LICENSE.txt": dependency_license,
         "licenses/PyInstaller-COPYING.txt": dependency_license,
+        "licenses/InnoSetup/LICENSE.txt": inno_license,
         "licenses/Qt/LGPL-3.0-only.txt": qt_source / "LGPL-3.0-only.txt",
         "licenses/Qt/GPL-3.0-only.txt": qt_source / "GPL-3.0-only.txt",
         "licenses/Qt/manifest.json": qt_source / "manifest.json",
@@ -172,6 +176,9 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
     for name, source in expected.items():
         assert (release / name).read_bytes() == source.read_bytes()
         assert manifest["files"][name] == build_portable["sha256_file"](source)
+    inno_license.unlink()
+    with pytest.raises(FileNotFoundError, match="LICENSE.txt"):
+        copy_licenses(tmp_path / "missing-inno-license-release")
 
 
 def test_license_copy_rejects_missing_project_license(tmp_path, monkeypatch):

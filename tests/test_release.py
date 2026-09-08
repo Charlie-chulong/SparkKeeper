@@ -1,20 +1,42 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import runpy
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 build = runpy.run_path(str(ROOT / "tools" / "build_portable.py"))
 publish = runpy.run_path(str(ROOT / "tools" / "publish_release.py"))
+installer_build = runpy.run_path(str(ROOT / "tools" / "build_installer.py"))
+
+
+def setup_metadata(version="3.0.0"):
+    return {"execution_level": "asInvoker", "ProductName": "SparkKeeper",
+            "ProductVersion": version, "FileDescription": "SparkKeeper Setup"}
+
+
+def setup_artifacts(root, program, version="3.0.0"):
+    installer = root / f"SparkKeeper-{build['release_version'](version)}-Setup.exe"
+    installer.write_bytes(b"isolated compiler output fixture")
+    digest = build["sha256_file"](installer)
+    installer.with_suffix(".exe.sha256").write_text(f"{digest}  {installer.name}\n", "ascii")
+    installer_build["receipt_path"](installer).write_text(json.dumps({
+        "format": 1, "version": version, "installer_sha256": digest,
+        "inputs_sha256": installer_build["installer_inputs"](root),
+        "payload_manifest_sha256": build["sha256_file"](program / "release-manifest.json"),
+    }), "utf-8")
+    return installer
 
 
 @pytest.fixture
-def release_bundle(tmp_path):
+def release_bundle(tmp_path, monkeypatch):
     program = tmp_path / "arbitrary-version-directory"
     payload = {
         "SparkKeeper.exe": b"isolated packaging fixture",
@@ -32,6 +54,11 @@ def release_bundle(tmp_path):
     tools.mkdir()
     (tools / "update.cmd").write_bytes(b"@echo off\r\n")
     (tools / "update.ps1").write_bytes(b"Write-Output fixture\r\n")
+    for name in ("installer.iss", "installer_guard.ps1"):
+        (tools / name).write_text("isolated installer source fixture", "utf-8")
+    (tools / "installer").mkdir()
+    (tools / "installer" / "ChineseSimplified.isl").write_text("isolated language fixture", "utf-8")
+    (tools / "installer" / "LICENSE.txt").write_text("isolated language license fixture", "utf-8")
     sources = tmp_path / "outputs" / "release" / "qt-sources-6.11.2"
     sources.mkdir(parents=True)
     entries = []
@@ -51,6 +78,10 @@ def release_bundle(tmp_path):
     archive = tmp_path / "SparkKeeper-3.0.0-win64.zip"
     build["create_zip"](program, archive, updater_directory=tools)
     checksum(archive)
+    setup_artifacts(tmp_path, program)
+    for globals_ in (installer_build["validate_installer_metadata"].__globals__,
+                     publish["validate_installer"].__globals__):
+        monkeypatch.setitem(globals_, "read_installer_metadata", lambda path: setup_metadata())
     return tmp_path, program, archive
 
 
@@ -225,6 +256,14 @@ def test_publish_requires_confirmation_and_only_creates_draft(monkeypatch, relea
     assert calls[0][:2] == ["gh", "api"]
     assert calls[1][:3] == ["gh", "release", "create"]
     assert "--draft" in calls[1] and "--verify-tag" in calls[1]
+    expected_assets = {
+        archive.name, archive.with_suffix(".zip.sha256").name,
+        "SparkKeeper-3.0.0-Setup.exe", "SparkKeeper-3.0.0-Setup.exe.sha256",
+        "qtbase-everywhere-src-6.11.2.tar.xz", "pyside-setup-everywhere-src-6.11.2.tar.xz",
+        "SHA256SUMS.txt",
+    }
+    asset_args = calls[1][4:calls[1].index("--repo")]
+    assert {Path(argument).name for argument in asset_args} == expected_assets
 
 
 def test_qt_sources_are_verified_against_packaged_provenance(release_bundle):
@@ -266,3 +305,209 @@ def test_rc_archive_and_tag_derive_from_pep440_manifest(release_bundle, monkeypa
     assert publish["validate_git"](root, "owner/repo", "v3.0.1-rc.1", version) == "abc"
     with pytest.raises(ValueError, match="v3.0.1-rc.1"):
         publish["validate_git"](root, "owner/repo", "v3.0.1rc1", version)
+
+
+def test_payload_requires_existing_complete_directory(tmp_path):
+    with pytest.raises(FileNotFoundError, match="payload"):
+        installer_build["validate_payload"](tmp_path / "missing", "3.0.0")
+
+
+@pytest.mark.parametrize("change", ["version", "hash", "extra", "missing", "sensitive", "manifest", "case", "incomplete"])
+def test_installer_rejects_invalid_payload(release_bundle, change):
+    _, program, _ = release_bundle
+    version = "3.0.0"
+    if change == "version":
+        version = "3.0.1"
+    elif change == "hash":
+        (program / "SparkKeeper.exe").write_bytes(b"tampered")
+    elif change == "extra":
+        (program / "stale.dll").write_bytes(b"extra")
+    elif change == "missing":
+        (program / "SparkKeeper.exe").unlink()
+    elif change == "sensitive":
+        (program / "auth-state.bin").write_bytes(b"secret")
+    elif change == "manifest":
+        (program / "release-manifest.json").unlink()
+    else:
+        manifest = json.loads((program / "release-manifest.json").read_bytes())
+        if change == "case":
+            manifest["files"]["sparkkeeper.exe"] = manifest["files"]["SparkKeeper.exe"]
+        else:
+            del manifest["files"]["SparkKeeper.exe"]
+            (program / "SparkKeeper.exe").unlink()
+        (program / "release-manifest.json").write_text(json.dumps(manifest), "utf-8")
+    with pytest.raises((OSError, ValueError, RuntimeError)):
+        installer_build["validate_payload"](program, version)
+
+
+def test_installer_accepts_verified_payload(release_bundle):
+    _, program, _ = release_bundle
+    assert installer_build["validate_payload"](program, "3.0.0") == program / "release-manifest.json"
+
+
+def test_missing_compiler_is_actionable(tmp_path, monkeypatch):
+    for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    with pytest.raises(FileNotFoundError, match="--iscc"):
+        installer_build["find_iscc"]()
+    with pytest.raises(FileNotFoundError, match="--iscc"):
+        installer_build["find_iscc"](tmp_path / "missing.exe")
+
+
+def test_compiler_standard_user_location_and_explicit_override(tmp_path, monkeypatch):
+    for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    compiler = tmp_path / "LOCALAPPDATA" / "Programs" / "Inno Setup 6" / "ISCC.exe"
+    compiler.parent.mkdir(parents=True)
+    compiler.write_bytes(b"compiler fixture")
+    assert installer_build["find_iscc"]() == compiler.resolve()
+    other = tmp_path / "custom-iscc.exe"
+    other.write_bytes(b"compiler fixture")
+    assert installer_build["find_iscc"](other) == other.resolve()
+
+
+@pytest.mark.parametrize("change", ["missing", "hash", "receipt", "payload", "script", "guard", "updater", "language", "language_license", "version", "privileges", "product"])
+def test_publish_rejects_invalid_installer(release_bundle, monkeypatch, change):
+    root, program, _ = release_bundle
+    installer = root / "SparkKeeper-3.0.0-Setup.exe"
+    manifest_digest = build["sha256_file"](program / "release-manifest.json")
+    if change == "missing":
+        installer.unlink()
+    elif change == "hash":
+        installer.write_bytes(b"tampered")
+    elif change == "receipt":
+        installer_build["receipt_path"](installer).unlink()
+    elif change == "payload":
+        manifest_digest = "0" * 64
+    elif change in {"script", "guard", "updater", "language", "language_license"}:
+        name = {"script": "installer.iss", "guard": "installer_guard.ps1", "updater": "update.ps1",
+                "language": "installer/ChineseSimplified.isl", "language_license": "installer/LICENSE.txt"}[change]
+        (root / "tools" / name).write_bytes(b"changed source")
+    else:
+        metadata = setup_metadata()
+        metadata[{"version": "ProductVersion", "privileges": "execution_level", "product": "ProductName"}[change]] = "wrong"
+        monkeypatch.setitem(publish["validate_installer"].__globals__, "read_installer_metadata", lambda path: metadata)
+    with pytest.raises((OSError, ValueError, RuntimeError)):
+        publish["validate_installer"](installer, "3.0.0", manifest_digest, root=root)
+
+
+def test_rc_installer_name_and_resources_match_pep440(release_bundle, monkeypatch):
+    root, program, _ = release_bundle
+    version = "3.0.1rc2"
+    build["write_release_manifest"](program, version)
+    installer = setup_artifacts(root, program, version)
+    assert installer.name == "SparkKeeper-3.0.1-rc.2-Setup.exe"
+    monkeypatch.setitem(publish["validate_installer"].__globals__, "read_installer_metadata", lambda path: setup_metadata(version))
+    checksum_path = publish["validate_installer"](installer, version, build["sha256_file"](program / "release-manifest.json"), root=root)
+    assert checksum_path.name == installer.name + ".sha256"
+    with pytest.raises(ValueError, match="文件名"):
+        publish["validate_installer"](installer, "3.0.1", "", root=root)
+
+
+def test_build_stages_output_and_generates_bound_checksum(release_bundle, monkeypatch):
+    root, program, _ = release_bundle
+    globals_ = installer_build["main"].__globals__
+    monkeypatch.setitem(globals_, "ROOT", root)
+    monkeypatch.setitem(globals_, "project_version", lambda root: "3.0.0")
+    monkeypatch.setitem(globals_, "find_iscc", lambda explicit: root / "ISCC.exe")
+    calls = []
+
+    def compile_(command, **kwargs):
+        calls.append(command)
+        defines = dict(argument[2:].split("=", 1) for argument in command if argument.startswith("/D"))
+        assert defines["AppVersion"] == "3.0.0"
+        assert defines["PayloadDir"] == str(program.resolve())
+        assert "TestAppId" not in defines
+        (Path(defines["OutputDir"]) / (defines["OutputBaseFilename"] + ".exe")).write_bytes(b"compiled fixture")
+        return type("Completed", (), {"returncode": 0})()
+
+    monkeypatch.setattr(globals_["subprocess"], "run", compile_)
+    output = root / "setup-output"
+    assert installer_build["main"](["--payload", str(program), "--output-dir", str(output)]) == 0
+    assert len(calls) == 1
+    installer = output / "SparkKeeper-3.0.0-Setup.exe"
+    installer_build["validate_installer"](installer, "3.0.0", build["sha256_file"](program / "release-manifest.json"), root=root)
+    assert {path.name for path in output.iterdir()} == {
+        installer.name, installer.name + ".sha256", installer.name + ".build.json",
+    }
+
+
+def test_failed_compile_does_not_bless_stale_output(release_bundle, monkeypatch):
+    root, program, _ = release_bundle
+    installer = root / "SparkKeeper-3.0.0-Setup.exe"
+    original = installer.read_bytes()
+    original_sum = installer.with_suffix(".exe.sha256").read_bytes()
+    globals_ = installer_build["main"].__globals__
+    monkeypatch.setitem(globals_, "ROOT", root)
+    monkeypatch.setitem(globals_, "project_version", lambda root: "3.0.0")
+    monkeypatch.setitem(globals_, "find_iscc", lambda explicit: root / "ISCC.exe")
+    monkeypatch.setattr(globals_["subprocess"], "run", lambda *args, **kwargs: type("Completed", (), {"returncode": 2})())
+    assert installer_build["main"](["--payload", str(program), "--output-dir", str(root)]) == 1
+    assert installer.read_bytes() == original
+    assert installer.with_suffix(".exe.sha256").read_bytes() == original_sum
+
+
+def test_default_preflight_requires_installer_before_network(release_bundle, monkeypatch):
+    root, _, archive = release_bundle
+    (root / "SparkKeeper-3.0.0-Setup.exe").unlink()
+    globals_ = publish["main"].__globals__
+    monkeypatch.setitem(globals_, "ROOT", root)
+    monkeypatch.setitem(globals_, "project_version", lambda root: "3.0.0")
+    monkeypatch.setitem(globals_, "validate_git", lambda *args: "abc")
+    monkeypatch.setitem(globals_, "checked", lambda *args, **kwargs: pytest.fail("preflight must remain offline"))
+    assert publish["main"](["--repo", "owner/repo", "--archive", str(archive)]) == 1
+
+
+@pytest.mark.parametrize("name", [".installer/installer_guard.ps1", ".INSTALLER/update.ps1",
+                                  "unins000.exe", "UNINS001.DAT", "unins-custom.msg"])
+def test_installer_payload_cannot_overwrite_installer_management_files(release_bundle, name):
+    _, program, _ = release_bundle
+    path = program / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"unexpected installer management payload")
+    build["write_release_manifest"](program, "3.0.0")
+    with pytest.raises(ValueError, match="保留路径"):
+        installer_build["validate_payload"](program, "3.0.0")
+
+
+@pytest.mark.parametrize("product", ["SparkKeeper", " SparkKeeper", "SparkKeeper Other"])
+def test_pe_resource_padding_is_trimmed_without_weakening_identity(tmp_path, monkeypatch, product):
+    from ctypes import wintypes
+
+    # Match the actual Inno resource padding observed in compiled Setup.exe.
+    manifest = ctypes.create_string_buffer(
+        b'<assembly><requestedExecutionLevel level="asInvoker" uiAccess="false"/></assembly>'
+    )
+    translation = (ctypes.c_ushort * 2)(0x0409, 0x04B0)
+    values = {"ProductName": product + " " * 49, "ProductVersion": "3.0.2" + " " * 45,
+              "FileDescription": "SparkKeeper Setup" + " " * 43}
+    buffers = {name: ctypes.create_unicode_buffer(value) for name, value in values.items()}
+    kernel = SimpleNamespace(
+        LoadLibraryExW=Mock(return_value=1), FindResourceW=Mock(return_value=1),
+        LoadResource=Mock(return_value=1), LockResource=Mock(return_value=ctypes.addressof(manifest)),
+        SizeofResource=Mock(return_value=len(manifest.value)), FreeLibrary=Mock(return_value=True),
+    )
+
+    def query(_data, name, pointer, length):
+        if name == r"\VarFileInfo\Translation":
+            buffer, size = translation, ctypes.sizeof(translation)
+        else:
+            buffer = buffers[name.rsplit("\\", 1)[-1]]
+            size = len(buffer)
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(buffer)
+        ctypes.cast(length, ctypes.POINTER(wintypes.UINT))[0] = size
+        return True
+
+    version_api = SimpleNamespace(
+        GetFileVersionInfoSizeW=Mock(return_value=16), GetFileVersionInfoW=Mock(return_value=True),
+        VerQueryValueW=Mock(side_effect=query),
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kwargs: kernel if name == "kernel32" else version_api, raising=False)
+    monkeypatch.setitem(installer_build["read_installer_metadata"].__globals__, "sys", SimpleNamespace(platform="win32"))
+    executable = tmp_path / "fixture.exe"
+    if product == "SparkKeeper":
+        assert installer_build["validate_installer_metadata"](executable, "3.0.2") == setup_metadata("3.0.2")
+    else:
+        with pytest.raises(RuntimeError, match="不匹配"):
+            installer_build["validate_installer_metadata"](executable, "3.0.2")
+    kernel.FreeLibrary.assert_called_once_with(1)

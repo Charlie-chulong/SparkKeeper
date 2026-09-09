@@ -6,14 +6,17 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtCore import QEvent, QObject, QRectF, QSignalBlocker, Qt, QTimer
+from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainterPath, QPalette, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
+    QDialog,
     QFrame,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QSizePolicy,
     QTreeWidget,
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
 from spark_keeper.models import ThemeMode
 
 FONT_FAMILY = "Microsoft YaHei UI"
+_POPUP_RADIUS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,10 +174,13 @@ def resolve_mode(preference: ThemeMode, system_scheme: Qt.ColorScheme) -> ThemeM
 
 
 def _stylesheet(c: ThemeColors) -> str:
+    assets = (Path(__file__).resolve().parents[1] / "assets").as_posix()
+    arrow = "dark" if c is _DARK else "light"
     stylesheet = f"""
 QWidget {{ color: {c.text}; }}
 QWidget:disabled {{ color: {c.text_muted}; }}
 QMainWindow, QDialog, QWidget#page {{ background: {c.app_bg}; }}
+QDialog {{ border: 1px solid {c.card_border}; border-radius: 14px; }}
 QWidget#sidebar {{ background: {c.sidebar_bg}; }}
 QScrollArea {{ border: none; background: transparent; }}
 QFrame#card {{
@@ -228,10 +235,30 @@ QDoubleSpinBox:disabled, QComboBox:disabled, QTimeEdit:disabled, QDateEdit:disab
     color: {c.text_muted}; background: {c.row_alt};
 }}
 QPlainTextEdit[role="mono"] {{ font-family: Consolas; font-size: 10pt; }}
+QComboBox {{ padding-right: 34px; combobox-popup: 0; }}
+QComboBox:hover {{ border-color: {c.btn_active_border}; }}
+QComboBox:focus, QComboBox:on {{ border-color: {c.accent}; }}
+QComboBox::drop-down {{
+    subcontrol-origin: padding; subcontrol-position: top right;
+    width: 28px; border: none; background: transparent;
+    border-top-right-radius: 6px; border-bottom-right-radius: 6px;
+}}
+QComboBox::drop-down:hover {{ background: {c.row_alt}; }}
+QComboBox::drop-down:on {{ background: {c.btn_pressed_bg}; }}
+QComboBox::drop-down:disabled {{ background: transparent; }}
+QComboBox::down-arrow {{
+    image: url("{assets}/chevron-down-{arrow}.png"); width: 12px; height: 12px;
+}}
 QComboBox QAbstractItemView {{
     background: {c.card_bg}; color: {c.text};
+    border: 1px solid {c.card_border}; border-radius: {_POPUP_RADIUS}px;
+    padding: 5px; outline: none;
     selection-background-color: {c.accent_soft}; selection-color: {c.text};
 }}
+QComboBox QAbstractItemView::item {{
+    min-height: 24px; padding: 4px 10px; border-radius: 6px;
+}}
+QComboBox QAbstractItemView::item:selected {{ background: {c.accent_soft}; color: {c.text}; }}
 QCheckBox {{ background: transparent; spacing: 8px; min-height: 24px; padding: 4px 0; }}
 QCheckBox:disabled, QRadioButton:disabled {{ color: {c.text_muted}; }}
 QCheckBox::indicator {{
@@ -250,21 +277,53 @@ QTreeWidget {{
 QTreeWidget[bordered="false"] {{ border: none; border-radius: 0; }}
 QTreeWidget::item {{ min-height: 28px; padding: 2px 6px; }}
 QTreeWidget::item:selected {{ background: {c.accent_soft}; color: {c.text}; }}
-QHeaderView {{ background: {c.heading_bg}; }}
+QHeaderView {{ background: transparent; }}
 QHeaderView::section {{
     background: {c.heading_bg}; color: {c.text}; font-weight: bold;
     border: none; border-bottom: 1px solid {c.card_border}; padding: 7px 8px;
 }}
-QMenu {{ background: {c.card_bg}; color: {c.text}; border: 1px solid {c.card_border}; }}
+QHeaderView::section:first {{ border-top-left-radius: 6px; }}
+QHeaderView::section:last {{ border-top-right-radius: 6px; }}
+QMenu {{
+    background: {c.card_bg}; color: {c.text}; border: 1px solid {c.card_border};
+    border-radius: {_POPUP_RADIUS}px; padding: 5px;
+}}
+QMenu::item {{ border-radius: 6px; padding: 7px 12px; }}
 QMenu::item:selected {{ background: {c.accent_soft}; color: {c.text}; }}
 QMenu::item:disabled {{ color: {c.text_muted}; }}
-QMenu::separator {{ background: {c.card_border}; height: 1px; }}
+QMenu::separator {{ background: {c.card_border}; height: 1px; margin: 4px 8px; }}
+QScrollBar:vertical {{ background: {c.row_alt}; width: 12px; margin: 14px 0; }}
+QScrollBar:horizontal {{ background: {c.row_alt}; height: 12px; margin: 0 14px; }}
+QScrollBar::handle:vertical {{ background: {c.card_border}; border-radius: 5px; min-height: 28px; }}
+QScrollBar::handle:horizontal {{ background: {c.card_border}; border-radius: 5px; min-width: 28px; }}
+QScrollBar::handle:hover {{ background: {c.btn_active_border}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    background: transparent; border: none; height: 14px; subcontrol-origin: margin;
+}}
+QScrollBar::add-line:vertical {{ subcontrol-position: bottom; }}
+QScrollBar::sub-line:vertical {{ subcontrol-position: top; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    background: transparent; border: none; width: 14px; subcontrol-origin: margin;
+}}
+QScrollBar::add-line:horizontal {{ subcontrol-position: right; }}
+QScrollBar::sub-line:horizontal {{ subcontrol-position: left; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QScrollBar::add-line:hover, QScrollBar::sub-line:hover {{
+    background: {c.neutral_soft}; border-radius: 4px;
+}}
+QScrollBar::up-arrow {{ image: url("{assets}/chevron-up-{arrow}.png"); width: 8px; height: 8px; }}
+QScrollBar::down-arrow {{ image: url("{assets}/chevron-down-{arrow}.png"); width: 8px; height: 8px; }}
+QScrollBar::left-arrow {{ image: url("{assets}/chevron-left-{arrow}.png"); width: 8px; height: 8px; }}
+QScrollBar::right-arrow {{ image: url("{assets}/chevron-right-{arrow}.png"); width: 8px; height: 8px; }}
 QProgressBar {{
     background: {c.neutral_soft}; border: none; border-radius: 4px;
     min-height: 8px; max-height: 8px; text-align: center;
 }}
 QProgressBar::chunk {{ background: {c.accent}; border-radius: 4px; }}
-QToolTip {{ background: {c.card_bg}; color: {c.text}; border: 1px solid {c.card_border}; padding: 5px; }}
+QToolTip {{
+    background: {c.card_bg}; color: {c.text}; border: 1px solid {c.card_border};
+    border-radius: {_POPUP_RADIUS}px; padding: 7px;
+}}
 """ + "\n".join(
         f'QLabel#chip[tone="{tone}"] {{ color: '
         f"{c.text_muted if tone == 'neutral' else getattr(c, tone)}; "
@@ -294,6 +353,52 @@ QRadioButton::indicator:checked:disabled {{
     return stylesheet
 
 
+class _RoundedSurfaces(QObject):
+    """Clip floating surfaces after Qt has applied its native frame and mask."""
+
+    @staticmethod
+    def _round_popup(popup: QWidget) -> None:
+        if (
+            popup.windowType() == Qt.WindowType.Popup
+            and isinstance(popup.parentWidget(), QComboBox)
+            and isinstance(popup, QFrame)
+        ):
+            popup.setFrameShape(QFrame.Shape.NoFrame)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(popup.rect()), _POPUP_RADIUS, _POPUP_RADIUS)
+        popup.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+    def _finish_popup(self, popup: QWidget) -> None:
+        self._round_popup(popup)
+        popup.setProperty("spark-rounding-pending", False)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        kind = event.type()
+        if kind == QEvent.Type.Polish and isinstance(watched, QDialog):
+            watched.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        if kind not in (QEvent.Type.Show, QEvent.Type.Resize, QEvent.Type.StyleChange):
+            return False
+        if not isinstance(watched, QWidget):
+            return False
+        is_combo_popup = watched.windowType() == Qt.WindowType.Popup and isinstance(
+            watched.parentWidget(), QComboBox
+        )
+        if not (
+            is_combo_popup
+            or isinstance(watched, QMenu)
+            or watched.windowType() == Qt.WindowType.ToolTip
+        ):
+            return False
+        if kind == QEvent.Type.Show:
+            self._round_popup(watched)
+        # QComboBox's resize/style handlers can clear the mask or restore a native frame.
+        # The context-bound callback is discarded automatically when its window is deleted.
+        if not watched.property("spark-rounding-pending"):
+            watched.setProperty("spark-rounding-pending", True)
+            QTimer.singleShot(0, watched, lambda: self._finish_popup(watched))
+        return False
+
+
 def initialize_theme(app: QApplication) -> None:
     """Initialize native style, font and decoded application icon only once."""
     if app.property("spark-theme-initialized"):
@@ -305,6 +410,8 @@ def initialize_theme(app: QApplication) -> None:
     app.setStyle("Fusion")
     app.setWindowIcon(QIcon(pixmap))
     app.setFont(QFont(FONT_FAMILY, 9))
+    app._rounded_surfaces = _RoundedSurfaces(app)
+    app.installEventFilter(app._rounded_surfaces)
     app.setProperty("spark-theme-initialized", True)
 
 
@@ -368,6 +475,11 @@ def confirm(parent: QWidget, title: str, text: str) -> bool:
     dialog.setIcon(QMessageBox.Icon.Question)
     dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     dialog.setDefaultButton(QMessageBox.StandardButton.No)
+    for standard_button in (QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No):
+        button = dialog.button(standard_button)
+        shortcut = button.shortcut()
+        button.setText(button.text().replace("&", ""))
+        button.setShortcut(shortcut)
     return dialog.exec() == QMessageBox.StandardButton.Yes
 
 

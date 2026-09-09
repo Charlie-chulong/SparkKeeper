@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QStyle,
     QStyleOptionButton,
+    QToolTip,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -216,18 +217,27 @@ def test_enable_circle_is_twelve_logical_pixels_with_full_text_hit_area(
     assert not check.testAttribute(Qt.WidgetAttribute.WA_NativeWindow)
 
 
+@pytest.mark.parametrize("activation", ["mouse", "shortcut"])
 @pytest.mark.parametrize(
     ("button", "expected"),
     [(QMessageBox.StandardButton.Yes, True), (QMessageBox.StandardButton.No, False)],
 )
-def test_confirm_displays_literal_text_and_defaults_to_no(root, qapp, button, expected) -> None:
+def test_confirm_displays_literal_text_and_defaults_to_no(
+    root, qapp, button, expected, activation
+) -> None:
     text = "<b>保持原样</b>\n第二行 & <朋友>"
     observed = []
+    captions = []
+    clicked = []
 
     def answer() -> None:
         dialog = qapp.activeModalWidget()
         try:
             if isinstance(dialog, QMessageBox):
+                captions.extend(
+                    dialog.button(standard).text()
+                    for standard in (QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No)
+                )
                 observed.append(
                     (
                         dialog.windowTitle(),
@@ -238,13 +248,34 @@ def test_confirm_displays_literal_text_and_defaults_to_no(root, qapp, button, ex
                         dialog.standardButton(dialog.defaultButton()),
                     )
                 )
-                dialog.button(button).click()
+                action = dialog.button(button)
+                action.clicked.connect(lambda: clicked.append(True))
+                if activation == "shortcut":
+                    dialog.activateWindow()
+                    QTest.keySequence(dialog, action.shortcut())
+                else:
+                    action.click()
         finally:
-            if dialog is not None and dialog.isVisible():
+            if activation == "mouse" and dialog is not None and dialog.isVisible():
                 dialog.reject()
 
-    QTimer.singleShot(0, answer)
-    assert theme.confirm(root, "确认发送", text) is expected
+    def reject_unanswered() -> None:
+        dialog = qapp.activeModalWidget()
+        if isinstance(dialog, QMessageBox):
+            dialog.reject()
+
+    timeout = QTimer(root)
+    timeout.setSingleShot(True)
+    timeout.timeout.connect(reject_unanswered)
+    timeout.start(1500)
+    # Let the window activate, then let shortcut animateClick finish in the real event loop.
+    QTimer.singleShot(100, answer)
+    try:
+        assert theme.confirm(root, "确认发送", text) is expected
+    finally:
+        timeout.stop()
+    assert clicked == [True]
+    assert len(captions) == 2 and all("&" not in caption for caption in captions)
     assert observed == [
         (
             "确认发送",
@@ -747,3 +778,131 @@ def test_refresh_tree_tones_preserves_recursive_items_scroll_checks_and_signals(
         assert current.foreground(column).color() == QColor(colors.success)
         assert current.background(column).style() == Qt.BrushStyle.NoBrush
     changed.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", [ThemeMode.LIGHT, ThemeMode.DARK])
+def test_combo_arrow_has_flat_surface_and_visible_chevron(root, qapp, mode) -> None:
+    combo = QComboBox(root)
+    combo.addItems(["浅色模式", "暗夜模式", "跟随系统"])
+    root.layout().addWidget(combo)
+    theme.apply_theme(qapp, mode)
+    combo.clearFocus()
+    QTest.mouseMove(root, QPoint(1, 1))
+    qapp.processEvents()
+    image = combo.grab().toImage()
+    scale = image.devicePixelRatio()
+    colors = theme.current_colors()
+    center_y = combo.height() // 2
+    # The right-hand strip must not fall back to Fusion's raised button bevel.
+    for y in range(center_y - 4, center_y + 5):
+        assert image.pixelColor(round((combo.width() - 3) * scale), round(y * scale)) == QColor(
+            colors.card_bg
+        )
+    visible_arrow_pixels = sum(
+        _contrast(image.pixelColor(round(x * scale), round(y * scale)).name(), colors.card_bg) >= 3
+        for x in range(combo.width() - 24, combo.width() - 6)
+        for y in range(center_y - 5, center_y + 6)
+    )
+    assert visible_arrow_pixels >= 8
+
+
+def test_combo_popup_keeps_round_corners_and_selection_after_native_updates(root, qapp) -> None:
+    combo = QComboBox(root)
+    combo.addItems([f"筛选项 {index}" for index in range(30)])
+    combo.setMaxVisibleItems(6)
+    combo.setCurrentIndex(12)
+    root.layout().addWidget(combo)
+    qapp.processEvents()
+    combo.showPopup()
+    popup = combo.view().window()
+    try:
+        for mode in (ThemeMode.DARK, ThemeMode.LIGHT):
+            theme.apply_theme(qapp, mode)
+            QTest.qWait(20)
+            assert popup.isVisible()
+            assert popup.frameShape() == QFrame.Shape.NoFrame
+            assert not popup.mask().contains(QPoint(0, 0))
+            assert popup.mask().contains(popup.rect().center())
+            assert combo.currentIndex() == 12
+            assert combo.view().currentIndex().row() == 12
+            row = combo.view().visualRect(combo.view().currentIndex())
+            image = combo.view().viewport().grab().toImage()
+            scale = image.devicePixelRatio()
+            colors = theme.current_colors()
+            corner = image.pixelColor(
+                round((row.left() + 1) * scale), round((row.top() + 1) * scale)
+            ).getRgb()
+            background = QColor(colors.card_bg).getRgb()
+            selection = QColor(colors.accent_soft).getRgb()
+            # Rounded antialiased corners approach the background, unlike a square highlight.
+            assert sum(abs(a - b) for a, b in zip(corner, background)) < sum(
+                abs(a - b) for a, b in zip(corner, selection)
+            )
+            assert image.pixelColor(
+                round((row.right() - 10) * scale), round(row.center().y() * scale)
+            ) == QColor(colors.accent_soft)
+            popup.resize(popup.width() + 24, popup.height() + 12)
+            QTest.qWait(20)
+            assert not popup.mask().contains(popup.rect().bottomRight())
+            assert popup.mask().contains(QPoint(popup.width() - 1, popup.height() // 2))
+        QTest.keyClick(combo.view(), Qt.Key.Key_Escape)
+        assert not popup.isVisible() and combo.currentIndex() == 12
+        combo.showPopup()
+        QTest.qWait(20)
+        assert not popup.mask().contains(QPoint(0, 0))
+        assert popup.mask().contains(popup.rect().center())
+    finally:
+        combo.hidePopup()
+
+
+@pytest.mark.parametrize("mode", [ThemeMode.LIGHT, ThemeMode.DARK])
+def test_rounded_menu_retains_keyboard_activation(root, qapp, mode) -> None:
+    theme.apply_theme(qapp, mode)
+    menu = QMenu(root)
+    triggered = Mock()
+    action = menu.addAction("菜单操作")
+    action.triggered.connect(triggered)
+    menu.addAction("不可用").setEnabled(False)
+    try:
+        menu.popup(root.mapToGlobal(QPoint(20, 20)))
+        QTest.qWait(20)
+        assert not menu.mask().contains(QPoint(0, 0))
+        assert menu.mask().contains(menu.rect().center())
+        menu.setActiveAction(action)
+        QTest.keyClick(menu, Qt.Key.Key_Return)
+        triggered.assert_called_once()
+        assert not menu.isVisible()
+    finally:
+        menu.close()
+
+
+@pytest.mark.parametrize("mode", [ThemeMode.LIGHT, ThemeMode.DARK])
+def test_tooltip_owned_by_combo_keeps_text_space_and_rounded_corners(root, qapp, mode) -> None:
+    theme.apply_theme(qapp, mode)
+    combo = QComboBox(root)
+    combo.addItem("模式")
+    root.layout().addWidget(combo)
+    qapp.processEvents()
+    try:
+        QToolTip.showText(combo.mapToGlobal(QPoint(0, 40)), "圆润提示：完整说明", combo)
+        for _ in range(200):
+            QTest.qWait(10)
+            tips = [
+                widget
+                for widget in qapp.topLevelWidgets()
+                if widget.isVisible()
+                and widget.windowType() == Qt.WindowType.ToolTip
+                and widget.sizeHint().isValid()
+            ]
+            if tips:
+                break
+        # Native tooltip animation uses a temporary window without a layout size hint.
+        assert len(tips) == 1
+        tip = tips[0]
+        assert not tip.mask().contains(QPoint(0, 0))
+        assert tip.mask().contains(tip.rect().center())
+        # A tooltip owned by a combo is not the combo's popup frame.
+        assert tip.height() >= tip.fontMetrics().height() + 12
+    finally:
+        QToolTip.hideText()
+        QTest.qWait(350)

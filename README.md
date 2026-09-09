@@ -37,7 +37,7 @@
 | 账号与网络 | 本人完成扫码登录；网页操作需要能够正常访问抖音 |
 | 程序目录 | 当前用户可写的固定目录，避免需要管理员权限的位置 |
 
-1. 打开 [最新 Release](https://github.com/Charlie-chulong/SparkKeeper/releases/latest)，**推荐下载 `SparkKeeper-3.0.6-Setup.exe`**（以后选择对应新版的 `Setup.exe`），并取得同页 SHA-256 校验文件。**不要把 GitHub 的 `Source code` 压缩包当作 Windows 程序。**
+1. 打开 [最新 Release](https://github.com/Charlie-chulong/SparkKeeper/releases/latest)，**推荐下载 `SparkKeeper-3.0.7-Setup.exe`**（以后选择对应新版的 `Setup.exe`），并取得同页 SHA-256 校验文件。**不要把 GitHub 的 `Source code` 压缩包当作 Windows 程序。**
 2. 双击安装 EXE，按向导安装到当前用户目录；默认是 `%LOCALAPPDATA%\Programs\SparkKeeper`，不需要管理员权限。已有安装会识别原安装路径；不要另建带版本号的目录。
 3. 从安装目录运行 `SparkKeeper.exe`；如果在向导中勾选了快捷方式，也可从开始菜单或桌面启动。由本人完成扫码登录和可能出现的人工验证。
 4. 在“好友管理”中按备注名或昵称搜索确认好友，或先“扫描火花好友（不发送）”再预览导入。搜索不使用抖音号；发送前仍须以规范抖音个人主页或可信单聊 SDK 会话摘要核验身份，昵称相同不自动选第一项。扫描导入的新好友默认停用，核对后再启用。
@@ -46,13 +46,15 @@
 
 原生“续火花”不是小表情“[续火花吧]”。界面中的预览图不代表已经发送。发送结果不确定也不代表未发送，请先人工核对，不要直接覆盖重发。
 
-**ZIP 备用方案：** 下载 `SparkKeeper-3.0.6-win64.zip`，完整解压，将包内 `SparkKeeper` 文件夹放到当前用户可写的固定目录，再运行其中的 `SparkKeeper.exe`。不要只复制 EXE，也不要直接把 ZIP 合并覆盖到安装器管理的目录。
+**ZIP 备用方案：** 下载 `SparkKeeper-3.0.7-win64.zip`，完整解压，将包内 `SparkKeeper` 文件夹放到当前用户可写的固定目录，再运行其中的 `SparkKeeper.exe`。不要只复制 EXE，也不要直接把 ZIP 合并覆盖到安装器管理的目录。
 
 安装包目前**没有代码签名**，Windows SmartScreen 可能提示“未知发布者”或阻止运行。先核对仓库、Release 版本及校验值；来源或告警有疑问时停止安装并反馈。SHA-256 只能检测文件变化，不能代替发布者签名。不要关闭杀毒软件、SmartScreen 或绕过组织安全策略。
 
 ### 外观与中文记录
 
 左侧导航底部的 **“外观”** 可选择“浅色模式”“暗夜模式”或“跟随系统”。切换立即作用于主界面、已打开的预览、菜单及状态颜色，忙碌时也可切换。偏好自动保存在本地数据库，重启后恢复；首次使用、偏好缺失或无效时默认浅色。“跟随系统”响应系统配色通知，无法识别系统配色时使用浅色；固定浅色或暗夜不随系统改变，也不会修改 Windows 全局主题。
+
+四个页面、模式与筛选展开列表、操作及右键菜单、提示框和预览/确认窗口统一使用圆润边框与浅暗配色；选中项、表头和滚动条也采用相同风格。保留原生标题栏、窗口拖动与缩放，以及原有鼠标和键盘操作。
 
 关闭窗口时会等待外观偏好写入完成；保存失败则恢复上次成功保存的选择，并保留完整错误详情。发送历史、运行日志列表和详情、本次进度中的机器状态使用中文；好友昵称、消息正文等用户内容和原始异常、调用栈等诊断原文不翻译、不改写。
 
@@ -157,7 +159,7 @@ python -m venv .venv
 
 先运行 `build_portable.py` 生成 `outputs/release/SparkKeeper` 和备用 ZIP，再运行 `build_installer.py` 包装同一程序目录；构建工具不会执行安装器。它自动查找 `Program Files`、`Program Files (x86)` 或 `%LOCALAPPDATA%\Programs` 下的 `Inno Setup 6\ISCC.exe`，也可用 `--iscc` 指定编译器完整路径；`--payload`、`--output-dir` 可指定程序目录和输出目录。
 
-默认输出 `outputs/release/SparkKeeper-3.0.6-Setup.exe`、`SparkKeeper-3.0.6-Setup.exe.sha256` 和本地构建凭据 `SparkKeeper-3.0.6-Setup.exe.build.json`。构建凭据绑定安装 EXE、安装脚本/安全辅助脚本、编译器和程序清单内的构建来源，发布预检需要保留它，但不上传到 Release。即使版本号不变，业务源码、资源或便携构建输入改变后也必须重建便携包，再构建安装器；仅安装器专属输入变化时重建安装器。PE 产品/版本与 `asInvoker` 检查不是代码签名认证，也不替代实际安装验收。
+默认输出 `outputs/release/SparkKeeper-3.0.7-Setup.exe`、`SparkKeeper-3.0.7-Setup.exe.sha256` 和本地构建凭据 `SparkKeeper-3.0.7-Setup.exe.build.json`。构建凭据绑定安装 EXE、安装脚本/安全辅助脚本、编译器和程序清单内的构建来源，发布预检需要保留它，但不上传到 Release。即使版本号不变，业务源码、资源或便携构建输入改变后也必须重建便携包，再构建安装器；仅安装器专属输入变化时重建安装器。PE 产品/版本与 `asInvoker` 检查不是代码签名认证，也不替代实际安装验收。
 
 便携构建使用项目 `.venv` 中的 Python（如上面的 `.venv\Scripts\python.exe`），以记录实际打包环境的依赖和工具版本；构建前后核对输入内容未变化。来源绑定使用内容摘要而非提交号，仍允许先构建后提交；仅无关文档或 Git HEAD 变化不要求重建。缺少来源记录的旧产物不能用于新的安装器构建或发布，但已发行旧包的运行期升级维护读取仍受支持。
 

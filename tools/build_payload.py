@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import sys
-import zipfile
 from importlib.metadata import distribution, distributions
 from pathlib import Path
 
@@ -36,7 +35,7 @@ def validate_version(version: str) -> str:
 
 
 def release_version(version: str) -> str:
-    """Derive public ZIP/tag spelling from the sole PEP 440 version source."""
+    """Derive public installer/tag spelling from the sole PEP 440 version source."""
     return validate_version(version).replace("rc", "-rc.")
 
 
@@ -46,9 +45,15 @@ def project_version(root: Path = ROOT) -> str:
         node.value
         for node in tree.body
         if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+        and any(
+            isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets
+        )
     ]
-    if len(values) != 1 or not isinstance(values[0], ast.Constant) or not isinstance(values[0].value, str):
+    if (
+        len(values) != 1
+        or not isinstance(values[0], ast.Constant)
+        or not isinstance(values[0].value, str)
+    ):
         raise ValueError("__version__ 必须是唯一的字符串常量")
     return validate_version(values[0].value)
 
@@ -69,28 +74,57 @@ def is_sensitive_path(name: str) -> bool:
     )
 
 
-def portable_command(root: Path, python: Path) -> list[str]:
+def payload_command(root: Path, python: Path) -> list[str]:
     build_root = root / "work" / "pyinstaller"
     return [
-        str(python), "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
-        "--onedir", "--name", "SparkKeeper",
-        "--icon", str(root / "src" / "spark_keeper" / "assets" / "app-icon.ico"),
-        "--paths", str(root / "src"),
-        "--add-data", f"{root / 'src' / 'spark_keeper' / 'assets'}{os.pathsep}spark_keeper/assets",
-        "--distpath", str(build_root / "dist"), "--workpath", str(build_root / "build"),
-        "--specpath", str(build_root),
-        "--collect-all", "playwright", "--collect-all", "windows_toasts",
-        "--exclude-module", "pytest", "--exclude-module", "ruff",
-        "--exclude-module", "tkinter", "--exclude-module", "PySide6.QtPdf",
-        "--exclude-module", "PySide6.QtPdfWidgets", "--exclude-module", "PySide6.QtSvg",
-        "--exclude-module", "PySide6.QtSvgWidgets", "--exclude-module", "PySide6.QtTest",
+        str(python),
+        "-m",
+        "PyInstaller",
+        "--noconfirm",
+        "--clean",
+        "--windowed",
+        "--onedir",
+        "--name",
+        "SparkKeeper",
+        "--icon",
+        str(root / "src" / "spark_keeper" / "assets" / "app-icon.ico"),
+        "--paths",
+        str(root / "src"),
+        "--add-data",
+        f"{root / 'src' / 'spark_keeper' / 'assets'}{os.pathsep}spark_keeper/assets",
+        "--distpath",
+        str(build_root / "dist"),
+        "--workpath",
+        str(build_root / "build"),
+        "--specpath",
+        str(build_root),
+        "--collect-all",
+        "playwright",
+        "--collect-all",
+        "windows_toasts",
+        "--exclude-module",
+        "pytest",
+        "--exclude-module",
+        "ruff",
+        "--exclude-module",
+        "tkinter",
+        "--exclude-module",
+        "PySide6.QtPdf",
+        "--exclude-module",
+        "PySide6.QtPdfWidgets",
+        "--exclude-module",
+        "PySide6.QtSvg",
+        "--exclude-module",
+        "PySide6.QtSvgWidgets",
+        "--exclude-module",
+        "PySide6.QtTest",
         str(root / "tools" / "portable_entry.py"),
     ]
 
 
-def portable_configuration(root: Path) -> dict:
+def payload_configuration(root: Path) -> dict:
     # Normalize locations, not options: relocating a checkout is not a source change.
-    command = portable_command(root, root / ".venv" / "Scripts" / "python.exe")
+    command = payload_command(root, root / ".venv" / "Scripts" / "python.exe")
     return {
         "command": [argument.replace(str(root), "${ROOT}") for argument in command],
         "environment": {"PLAYWRIGHT_BROWSERS_PATH": "0"},
@@ -102,16 +136,24 @@ def source_snapshot(root: Path, qt_version: str) -> dict:
     if not re.fullmatch(r"\d+\.\d+\.\d+", qt_version):
         raise ValueError("构建来源 Qt 版本无效")
     names = {
-        "pyproject.toml", "LICENSE", "THIRD_PARTY_NOTICES.txt",
-        "tools/build_portable.py", "tools/portable_entry.py",
-        "tools/update.cmd", "tools/update.ps1", "tools/installer/LICENSE.txt",
+        "pyproject.toml",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.txt",
+        "tools/build_payload.py",
+        "tools/portable_entry.py",
+        "tools/installer/LICENSE.txt",
     }
     # These are exactly the project trees consumed by PyInstaller/copy_licenses.
     # Never scan the checkout root (outputs, caches and user data are not inputs).
     for directory in (root / "src" / "spark_keeper", root / "third_party" / f"qt-{qt_version}"):
         if not directory.is_dir():
             raise FileNotFoundError(f"缺少构建来源目录：{directory}")
-        if directory.is_symlink() or directory.is_junction() or directory.parent.is_symlink() or directory.parent.is_junction():
+        if (
+            directory.is_symlink()
+            or directory.is_junction()
+            or directory.parent.is_symlink()
+            or directory.parent.is_junction()
+        ):
             raise ValueError(f"构建来源目录不能是链接：{directory}")
         for parent, directories, filenames in os.walk(directory, followlinks=False):
             directories[:] = sorted(name for name in directories if name != "__pycache__")
@@ -122,9 +164,11 @@ def source_snapshot(root: Path, qt_version: str) -> dict:
             for name in filenames:
                 path = Path(parent) / name
                 relative = path.relative_to(root)
-                packaged = (relative.parts[0] == "third_party"
-                            or relative.parts[:3] == ("src", "spark_keeper", "assets")
-                            or path.suffix.lower() in {".py", ".pyd", ".dll"})
+                packaged = (
+                    relative.parts[0] == "third_party"
+                    or relative.parts[:3] == ("src", "spark_keeper", "assets")
+                    or path.suffix.lower() in {".py", ".pyd", ".dll"}
+                )
                 if packaged and path.suffix.lower() not in {".pyc", ".pyo"}:
                     names.add(relative.as_posix())
     files = {}
@@ -133,7 +177,9 @@ def source_snapshot(root: Path, qt_version: str) -> dict:
         if path.is_symlink() or path.is_junction() or not path.is_file():
             raise ValueError(f"构建来源必须是普通文件：{name}")
         files[name] = sha256_file(path)
-    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    digest = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return {"sha256": digest, "files": files}
 
 
@@ -143,35 +189,48 @@ def build_provenance(root: Path) -> dict:
         "format": 1,
         "qt_version": qt_version,
         "source": source_snapshot(root, qt_version),
-        "configuration": portable_configuration(root),
+        "configuration": payload_configuration(root),
         "toolchain": {
             "python": sys.version,
             "platform": platform.platform(),
-            "distributions": dict(sorted(
-                (package.metadata["Name"], package.version) for package in distributions()
-            )),
+            "distributions": dict(
+                sorted((package.metadata["Name"], package.version) for package in distributions())
+            ),
         },
     }
 
 
 def validate_provenance(provenance: object, *, root: Path) -> dict:
-    if not isinstance(provenance, dict) or type(provenance.get("format")) is not int or provenance.get("format") != 1:
-        raise RuntimeError("缺少有效构建来源；请重新构建便携包")
+    if (
+        not isinstance(provenance, dict)
+        or type(provenance.get("format")) is not int
+        or provenance.get("format") != 1
+    ):
+        raise RuntimeError("缺少有效构建来源；请重新构建内部程序 payload")
     qt_version = provenance.get("qt_version")
     toolchain = provenance.get("toolchain")
-    if (not isinstance(qt_version, str) or not isinstance(toolchain, dict)
-            or not isinstance(toolchain.get("python"), str) or not toolchain["python"]
-            or not isinstance(toolchain.get("platform"), str) or not toolchain["platform"]
-            or not isinstance(toolchain.get("distributions"), dict)
-            or not all(isinstance(name, str) and isinstance(version, str) and name and version
-                       for name, version in toolchain["distributions"].items())
-            or not {"pyinstaller", "playwright", "pyside6-essentials", "windows-toasts"} <= {
-                name.lower().replace("_", "-") for name in toolchain["distributions"]
-            }):
+    if (
+        not isinstance(qt_version, str)
+        or not isinstance(toolchain, dict)
+        or not isinstance(toolchain.get("python"), str)
+        or not toolchain["python"]
+        or not isinstance(toolchain.get("platform"), str)
+        or not toolchain["platform"]
+        or not isinstance(toolchain.get("distributions"), dict)
+        or not all(
+            isinstance(name, str) and isinstance(version, str) and name and version
+            for name, version in toolchain["distributions"].items()
+        )
+        or not {"pyinstaller", "playwright", "pyside6-essentials", "windows-toasts"}
+        <= {name.lower().replace("_", "-") for name in toolchain["distributions"]}
+    ):
         raise RuntimeError("构建来源缺少依赖或构建工具版本")
-    if (provenance.get("source") != source_snapshot(root, qt_version)
-            or provenance.get("configuration") != portable_configuration(root)):
-        raise RuntimeError("构建来源与当前业务源码、资源或构建配置不一致；请重新构建便携包")
+    if provenance.get("source") != source_snapshot(root, qt_version) or provenance.get(
+        "configuration"
+    ) != payload_configuration(root):
+        raise RuntimeError(
+            "构建来源与当前业务源码、资源或构建配置不一致；请重新构建内部程序 payload"
+        )
     return provenance
 
 
@@ -190,11 +249,17 @@ def write_release_manifest(release_directory: Path, version: str, *, provenance:
     destination = release_directory / "release-manifest.json"
     destination.write_text(
         json.dumps(
-            {"format": 1, "product": "SparkKeeper", "version": validate_version(version),
-             "files": files, "build_provenance": provenance},
+            {
+                "format": 1,
+                "product": "SparkKeeper",
+                "version": validate_version(version),
+                "files": files,
+                "build_provenance": provenance,
+            },
             ensure_ascii=False,
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     return destination
@@ -210,8 +275,8 @@ def write_user_guide(destination: Path, version: str) -> None:
 3. 本地自用版未进行代码签名，Windows SmartScreen 可能显示未知发布者提示。
 
 开始使用
-1. 将整个文件夹解压到固定位置，例如 D:\\SparkKeeper；不要直接在压缩包内运行。
-2. 双击 SparkKeeper.exe。
+1. 从可信来源下载 SparkKeeper-{release_version(version)}-Setup.exe，双击安装；仅为当前 Windows 用户安装，无需管理员权限。
+2. 从开始菜单或安装完成页启动 SparkKeeper；后续仅使用 Setup 安装包安装和升级，不使用便携 ZIP。
 3. 点击“扫码登录”，由本人完成扫码和可能出现的安全验证。
 4. 逐个添加好友，或在“好友管理”点击“扫描火花好友（不发送）”，预览并勾选后导入。
 5. 选择文本或“续火花（原生表情）”，设置每日时间与好友间随机等待范围，确认完整预览后再启用每日计划。
@@ -228,19 +293,18 @@ def write_user_guide(destination: Path, version: str) -> None:
 - 默认勾选身份可靠的新有效火花（含GRAY）和RECOVER好友；待恢复仍可独立筛选。扫描后可任意勾选或取消，新增好友仍停用。
 - 账号或登录状态变化后必须重新扫描；选中群聊或身份未确认/冲突对象时会明确阻止导入，不会悄悄跳过。
 - Setup 原位升级：先等待发送、扫描、登录及独立计划任务正常结束，退出全部旧程序和浏览器；不要强杀进程。双击可信新版 Setup，沿用原安装目录，无需先卸载。
-- 3.0.3 Setup 自动暂停经严格归属核对的本安装 Windows 计划，程序文件完整校验通过后恢复原 Enabled；原停用保持、无任务不新建，不修改业务计划、不自动补跑。普通原位升级无需先手动停用或为恢复任务重新保存计划。
+- Setup 自动暂停经严格归属核对的本安装 Windows 计划，程序文件完整校验通过后恢复原 Enabled；原停用保持、无任务不新建，不修改业务计划、不自动补跑。普通原位升级无需先手动停用或为恢复任务重新保存计划。
 - 安装取消仅在未改程序文件或验证原文件完整时安全恢复计划；部分更新、崩溃、校验或任务恢复失败保留 maintenance\\pending.json 并保持暂停。请重跑原目录同版或更新版 Setup 修复，不要删维护记录、手动启用任务或混合新旧文件绕过保护。旧版不认识维护互斥，安装期间不要启动旧副本。
-- 首次从 ZIP 迁入不同安装目录：先在旧版手动停用并保存计划、正常结束任务并退出。异路径或归属不明的已启用同名任务会阻止安装，不自动绑定；迁入后在新版核对配置、按需启用并重新保存计划，更新快捷方式。
-- ZIP 便携更新仍须先手动停用并保存每日计划，等待任务结束并正常退出。新版 ZIP 解压到旧目录之外，双击包根目录“更新.cmd”并选择原便携目录；整目录替换，不逐文件覆盖、不只替换 EXE，也不要用 ZIP 覆盖安装器管理的目录。
-- ZIP 更新器验证文件 SHA256，保留旧程序旁路备份；不会自动暂停/恢复计划、强杀进程或自动回滚数据库。校验值只能防损坏，不能代替可信下载来源。首次从 dev18 迁移须明确确认旧目录；更新后核对版本、好友和配置，再人工启用并保存计划。
-- 已迁移数据库不得直接用旧程序/旧快照覆盖回退。设置了 SPARK_KEEPER_ROOT 时拒绝正式 Setup 安装及 ZIP 更新；正式用户数据外置于 AppData，不放在程序目录。
+- 首次从旧便携目录迁入不同安装目录：先在旧版手动停用并保存计划、正常结束任务并退出。异路径或归属不明的已启用同名任务会阻止安装，不自动绑定；迁入后在新版核对配置、按需启用并重新保存计划，更新快捷方式。不要用旧便携文件覆盖安装器管理的目录。
+- 安装器验证程序文件 SHA256；校验值只能防损坏，不能代替可信下载来源。
+- 已迁移数据库不得直接用旧程序/旧快照覆盖回退。设置了 SPARK_KEEPER_ROOT 时拒绝正式 Setup 安装；正式用户数据外置于 AppData，不放在程序目录。
 - 默认在两次实际发送尝试之间随机等待 3–8 秒，可在任务台设置 0–120 秒；0–0 表示关闭。
 - 随机等待只能降低连续发送频率，不能保证避免平台限制或封禁。
 - 事件按用户要求保留真实对象、完整错误、原因链和调用栈，不再脱敏；请在“运行日志”的完整原文区域查看并妥善保管。
 - 登录态和数据库只保存在当前 Windows 用户的 %LOCALAPPDATA%\\SparkKeeper 中，登录态使用 DPAPI 保护。
-- 压缩包不包含制作者的账号、好友、消息、数据库、登录态或任务 XML。
+- 安装包不包含制作者的账号、好友、消息、数据库、登录态或任务 XML。
 - 界面使用 PySide6 / Qt Widgets；相关开源许可与来源见 licenses\\Qt 和 THIRD_PARTY_NOTICES.txt。
-- 启用每日计划后不要移动或重命名解压文件夹；如需移动，先在软件中停用计划，移动后再启用。
+- 不要手动移动或重命名安装目录；原位升级沿用原目录，不逐文件覆盖或只替换 EXE。
 - 发送触发后不会自动重试；无法确认的结果会记录为 unknown，并阻止当天自动重发。
 - 好友查找只在首轮搜索结果为空时重新提交同一查询一次；身份核验仍严格，这不是发送重试。
 - 同一天重复发送默认拦截，只有桌面程序中的人工二次确认才能覆盖。
@@ -248,15 +312,10 @@ def write_user_guide(destination: Path, version: str) -> None:
 
 安装版卸载（不可逆清理）
 1. 等待全部任务正常结束、退出所有副本，从 Windows“已安装的应用”卸载 SparkKeeper。明确确认后删除本安装程序、严格归属本安装且未被另改的 Windows 计划，以及本用户 %LOCALAPPDATA%\\SparkKeeper 全部共享数据（数据库、登录态、好友、配置、历史、防重复记录、日志、诊断、备份、维护记录等），不提供保留选项。
-2. 同用户 ZIP 便携版也共享这份数据，清理会一并影响它们。另一副本运行、异路径/归属不明同名任务（即使已停用）或其他关联计划仍引用共享数据时会中止；不擅改其他任务、不强杀进程。
+2. 同用户旧便携副本也共享这份数据，清理会一并影响它们。另一副本运行、异路径/归属不明同名任务（即使已停用）或其他关联计划仍引用共享数据时会中止；不擅改其他任务、不强杀进程。
 3. 交互卸载必须确认；静默卸载须显式 /PURGEUSERDATA（不带值）。正常安装、原位升级及取消卸载不删除用户数据。开始清理后的失败不承诺恢复已删数据，也不会恢复计划。
 4. 卸载失败请保留维护记录与错误信息，优先重跑原目录中保留的卸载器并再次确认，静默仍须 /PURGEUSERDATA。仅原卸载器损坏或无法使用时用同目录同版或更新版 Setup 兜底修复，继续此前未完成的授权全清，不重建旧任务、不启动程序；按完成页提示再次卸载修复后的程序。
 5. 修复不能找回已删除的数据；重新使用须重新登录和配置，历史防重复依据已清除，发送前必须人工核对。
-
-ZIP 便携版手动卸载（不适用于安装器管理的目录）
-1. 在便携版停用并保存每日计划，核对属于该便携目录的 Windows 任务已移除，等待任务结束并正常退出；不要误删其他副本的任务。
-2. 删除该便携解压目录。
-3. 如需手动清除登录态、配置及历史，可删除 %LOCALAPPDATA%\\SparkKeeper；这是不可逆清理，安装版和同用户其他便携副本也共享该目录，都会受影响。先退出所有副本并核对没有计划引用共享数据，不要用此步骤绕过未完成的安装维护记录。
 
 本版本仅供本人小规模测试，不提供平台风控绕过或批量营销能力。
 """,
@@ -344,22 +403,6 @@ def reject_sensitive_files(release_directory: Path) -> None:
         raise RuntimeError(f"发行目录含运行数据：{rendered}")
 
 
-def create_zip(release_directory: Path, archive: Path, *, updater_directory: Path = ROOT / "tools") -> None:
-    updater_files = {"更新.cmd": updater_directory / "update.cmd", "update.ps1": updater_directory / "update.ps1"}
-    for source in updater_files.values():
-        if not source.is_file():
-            raise FileNotFoundError(f"缺少离线更新器：{source}")
-    reject_sensitive_files(release_directory)
-    if archive.exists():
-        archive.unlink()
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
-        for path in sorted(release_directory.rglob("*")):
-            if path.is_file():
-                output.write(path, "SparkKeeper/" + path.relative_to(release_directory).as_posix())
-        for name, source in updater_files.items():
-            output.write(source, name)
-
-
 def main() -> None:
     if not PYTHON.is_file() or not PLAYWRIGHT.is_file():
         raise RuntimeError("缺少项目虚拟环境，请先安装开发依赖")
@@ -376,16 +419,12 @@ def main() -> None:
     release_root = ROOT / "outputs" / "release"
     build_root = ROOT / "work" / "pyinstaller"
     pyinstaller_dist = build_root / "dist"
-    command = portable_command(ROOT, PYTHON)
-    release_name = f"SparkKeeper-{release_version(version)}-win64"
+    command = payload_command(ROOT, PYTHON)
     release_directory = release_root / "SparkKeeper"
-    archive = release_root / f"{release_name}.zip"
 
     shutil.rmtree(build_root, ignore_errors=True)
     shutil.rmtree(release_directory, ignore_errors=True)
     release_root.mkdir(parents=True, exist_ok=True)
-    archive.unlink(missing_ok=True)
-    archive.with_suffix(archive.suffix + ".sha256").unlink(missing_ok=True)
     build_root.mkdir(parents=True, exist_ok=True)
 
     run(command, env=env)
@@ -409,24 +448,15 @@ def main() -> None:
     write_user_guide(release_directory / "使用说明.txt", version)
     reject_sensitive_files(release_directory)
     verify_build_unchanged(provenance, root=ROOT)
-    write_release_manifest(release_directory, version, provenance=provenance)
-    create_zip(release_directory, archive, updater_directory=ROOT / "tools")
     try:
+        write_release_manifest(release_directory, version, provenance=provenance)
         verify_build_unchanged(provenance, root=ROOT)
     except (OSError, ValueError, RuntimeError):
-        archive.unlink(missing_ok=True)
         (release_directory / "release-manifest.json").unlink(missing_ok=True)
         raise
 
-    digest = sha256_file(archive)
-    archive.with_suffix(archive.suffix + ".sha256").write_text(
-        f"{digest}  {archive.name}\n",
-        encoding="ascii",
-    )
     shutil.rmtree(build_root, ignore_errors=True)
     print(release_directory)
-    print(archive)
-    print(digest)
 
 
 if __name__ == "__main__":

@@ -14,16 +14,17 @@ import spark_keeper.scheduler as scheduler_module
 import spark_keeper.worker as worker_module
 from spark_keeper.__main__ import main
 from spark_keeper.automation.errors import AutomationError
+from spark_keeper.models import ErrorCode
 from spark_keeper.paths import AppPaths
 from spark_keeper.scheduler import TASK_XML_NAMESPACE, build_task_xml
 
-build_portable = runpy.run_path(
-    str(Path(__file__).resolve().parents[1] / "tools" / "build_portable.py")
+build_payload = runpy.run_path(
+    str(Path(__file__).resolve().parents[1] / "tools" / "build_payload.py")
 )
-reject_sensitive_files = build_portable["reject_sensitive_files"]
-copy_licenses = build_portable["copy_licenses"]
-copy_qt_licenses = build_portable["copy_qt_licenses"]
-trim_unused_qt_plugins = build_portable["trim_unused_qt_plugins"]
+reject_sensitive_files = build_payload["reject_sensitive_files"]
+copy_licenses = build_payload["copy_licenses"]
+copy_qt_licenses = build_payload["copy_qt_licenses"]
+trim_unused_qt_plugins = build_payload["trim_unused_qt_plugins"]
 
 
 def test_frozen_paths_keep_runtime_data_outside_install_directory(tmp_path, monkeypatch) -> None:
@@ -73,7 +74,7 @@ def test_frozen_browser_uses_bundled_playwright_browsers(tmp_path, monkeypatch) 
     assert browser_module.os.environ["PLAYWRIGHT_BROWSERS_PATH"] == str(browsers)
 
 
-def test_frozen_browser_rejects_incomplete_archive(tmp_path, monkeypatch) -> None:
+def test_frozen_browser_rejects_incomplete_payload(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(browser_module.sys, "frozen", True, raising=False)
     monkeypatch.setattr(
         browser_module.sys,
@@ -81,8 +82,15 @@ def test_frozen_browser_rejects_incomplete_archive(tmp_path, monkeypatch) -> Non
         str(tmp_path / "SparkKeeper.exe"),
     )
 
-    with pytest.raises(AutomationError, match="缺少 Chromium"):
+    with pytest.raises(AutomationError, match="缺少 Chromium") as caught:
         browser_module._configure_bundled_browser_path()
+    assert caught.value.code == ErrorCode.CONFIGURATION_INVALID
+    assert caught.value.fatal is True
+    message = caught.value.safe_message
+    assert "可信来源的同版或更新版 Setup" in message
+    assert "原安装目录修复" in message
+    assert "不要先卸载" in message
+    assert "卸载会删除用户数据" in message
 
 
 def test_frozen_scheduler_uses_executable_entrypoint(tmp_path, monkeypatch) -> None:
@@ -133,9 +141,7 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
     )
     python_license = root / "LICENSE.txt"
     python_license.write_bytes(b"Python license\r\n")
-    playwright_license = (
-        root / "Lib" / "site-packages" / "playwright" / "driver" / "LICENSE"
-    )
+    playwright_license = root / "Lib" / "site-packages" / "playwright" / "driver" / "LICENSE"
     playwright_license.parent.mkdir(parents=True)
     playwright_license.write_bytes(b"Playwright license\n")
     dependency_license = root / "dependency-LICENSE.txt"
@@ -151,7 +157,9 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
     monkeypatch.setitem(copy_licenses.__globals__, "ROOT", root)
     monkeypatch.setitem(copy_licenses.__globals__, "VENV", root)
     monkeypatch.setitem(
-        copy_licenses.__globals__, "sys", SimpleNamespace(base_prefix=root, version="3.12.0 fixture")
+        copy_licenses.__globals__,
+        "sys",
+        SimpleNamespace(base_prefix=root, version="3.12.0 fixture"),
     )
     monkeypatch.setitem(
         copy_licenses.__globals__, "distribution_license", lambda *_args: dependency_license
@@ -160,19 +168,29 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
         copy_licenses.__globals__, "distribution", lambda _name: SimpleNamespace(version="6.11.2")
     )
     monkeypatch.setitem(
-        copy_licenses.__globals__, "distributions",
-        lambda: [SimpleNamespace(metadata={"Name": name}, version=version) for name, version in (
-            ("PyInstaller", "6.15.0"), ("playwright", "1.50.0"),
-            ("PySide6-Essentials", "6.11.2"), ("windows-toasts", "1.3.0"),
-        )],
+        copy_licenses.__globals__,
+        "distributions",
+        lambda: [
+            SimpleNamespace(metadata={"Name": name}, version=version)
+            for name, version in (
+                ("PyInstaller", "6.15.0"),
+                ("playwright", "1.50.0"),
+                ("PySide6-Essentials", "6.11.2"),
+                ("windows-toasts", "1.3.0"),
+            )
+        ],
     )
-    for name in ("pyproject.toml", "THIRD_PARTY_NOTICES.txt", "tools/build_portable.py",
-                 "tools/portable_entry.py", "tools/update.cmd", "tools/update.ps1",
-                 "src/spark_keeper/__init__.py"):
+    for name in (
+        "pyproject.toml",
+        "THIRD_PARTY_NOTICES.txt",
+        "tools/build_payload.py",
+        "tools/portable_entry.py",
+        "src/spark_keeper/__init__.py",
+    ):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"isolated build input")
-    provenance = build_portable["build_provenance"](root)
+    provenance = build_payload["build_provenance"](root)
 
     release = tmp_path / "release"
     copy_licenses(release)
@@ -187,13 +205,11 @@ def test_license_copy_preserves_project_and_third_party_terms_in_manifest(tmp_pa
         "licenses/Qt/GPL-3.0-only.txt": qt_source / "GPL-3.0-only.txt",
         "licenses/Qt/manifest.json": qt_source / "manifest.json",
     }
-    manifest_path = build_portable["write_release_manifest"](
-        release, "3.0.0", provenance=provenance
-    )
+    manifest_path = build_payload["write_release_manifest"](release, "3.0.0", provenance=provenance)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     for name, source in expected.items():
         assert (release / name).read_bytes() == source.read_bytes()
-        assert manifest["files"][name] == build_portable["sha256_file"](source)
+        assert manifest["files"][name] == build_payload["sha256_file"](source)
     inno_license.unlink()
     with pytest.raises(FileNotFoundError, match="LICENSE.txt"):
         copy_licenses(tmp_path / "missing-inno-license-release")

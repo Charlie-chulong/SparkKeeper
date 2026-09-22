@@ -37,7 +37,7 @@
 | 账号与网络 | 本人完成扫码登录；网页操作需要能够正常访问抖音 |
 | 程序目录 | 当前用户可写的固定目录，避免需要管理员权限的位置 |
 
-1. 打开 [最新 Release](https://github.com/Charlie-chulong/SparkKeeper/releases/latest)，**推荐下载 `SparkKeeper-3.0.7-Setup.exe`**（以后选择对应新版的 `Setup.exe`），并取得同页 SHA-256 校验文件。**不要把 GitHub 的 `Source code` 压缩包当作 Windows 程序。**
+1. 打开 [最新 Release](https://github.com/Charlie-chulong/SparkKeeper/releases/latest)，**下载 `SparkKeeper-3.0.8-Setup.exe`**（以后选择对应新版的 `Setup.exe`），并取得同页 SHA-256 校验文件。**不要把 GitHub 的 `Source code` 压缩包当作 Windows 程序。**
 2. 双击安装 EXE，按向导安装到当前用户目录；默认是 `%LOCALAPPDATA%\Programs\SparkKeeper`，不需要管理员权限。已有安装会识别原安装路径；不要另建带版本号的目录。
 3. 从安装目录运行 `SparkKeeper.exe`；如果在向导中勾选了快捷方式，也可从开始菜单或桌面启动。由本人完成扫码登录和可能出现的人工验证。
 4. 在“好友管理”中按备注名或昵称搜索确认好友，或先“扫描火花好友（不发送）”再预览导入。搜索不使用抖音号；发送前仍须以规范抖音个人主页或可信单聊 SDK 会话摘要核验身份，昵称相同不自动选第一项。扫描导入的新好友默认停用，核对后再启用。
@@ -46,7 +46,7 @@
 
 原生“续火花”不是小表情“[续火花吧]”。界面中的预览图不代表已经发送。发送结果不确定也不代表未发送，请先人工核对，不要直接覆盖重发。
 
-**ZIP 备用方案：** 下载 `SparkKeeper-3.0.7-win64.zip`，完整解压，将包内 `SparkKeeper` 文件夹放到当前用户可写的固定目录，再运行其中的 `SparkKeeper.exe`。不要只复制 EXE，也不要直接把 ZIP 合并覆盖到安装器管理的目录。
+后续仅提供安装 EXE，不再生成或发布便携 ZIP。已发布的历史附件保持原样；旧便携版用户按下方迁入步骤改用安装版，不要将旧 ZIP 合并覆盖到安装器管理的目录。
 
 安装包目前**没有代码签名**，Windows SmartScreen 可能提示“未知发布者”或阻止运行。先核对仓库、Release 版本及校验值；来源或告警有疑问时停止安装并反馈。SHA-256 只能检测文件变化，不能代替发布者签名。不要关闭杀毒软件、SmartScreen 或绕过组织安全策略。
 
@@ -60,7 +60,7 @@
 
 ## 如何更新
 
-### 推荐：双击新版安装 EXE
+### 双击新版安装 EXE
 
 1. 等待发送、扫描、登录及独立计划任务正常结束，关闭所有旧窗口。**使用 3.0.3 或更新的 Setup 原位升级时，无需先手动停用属于本安装目录的每日计划。**
 2. 从可信 Release 下载新版 `SparkKeeper-版本号-Setup.exe` 并核对 SHA-256，双击安装。安装器使用固定 AppId 识别已有安装，必须沿用原安装路径升级，无需先卸载旧版；不允许通过另选目录或 `/DIR` 绕过，也拒绝降级。
@@ -81,17 +81,7 @@
 
 **安装版换位置：** 不要直接移动目录或在升级时指定另一目录。3.0.3 卸载会彻底清除当前用户的共享数据，**不要为保留配置而采用“先卸载再安装”**。只有接受删除全部本地数据后，才卸载并安装到新位置；新位置需重新登录、配置好友及计划并更新快捷方式。普通升级始终沿用原目录。
 
-### 备用：继续使用 ZIP 离线更新
-
-仅更新便携目录时，将新 ZIP 完整解压到**另外的临时目录**，双击新包根目录的 **`更新.cmd`** 并选择已有便携程序目录，不要直接合并覆盖旧文件；**ZIP 流程没有 Setup 的自动暂停/恢复能力**，更新前仍必须手动停用并保存计划、等待任务结束并正常退出，更新后核对配置再人工启用计划。
-
-ZIP 更新入口检查产品、版本、文件 SHA-256、额外文件、目录路径、程序占用和计划状态，准备同卷副本后完整替换，旧程序目录保留为备份。不会强杀发送中的进程、覆盖用户数据库或自动补跑。此目录备份机制不是安装器的自动回滚承诺。
-
-从旧开发版首次升级时必须先退出旧版，它们没有单实例协议。ZIP 更新中没有文件清单的旧包需要明确接受迁入。后续不要随意移动程序目录，因为 Windows 计划任务使用绝对路径。
-
 更新失败时不要手工拼接新旧依赖。数据库迁移前会做一致性备份，但新版已有发送记录后不能直接恢复旧数据库，否则可能丢失当天防重复依据。遇到拒绝降级或不兼容数据库，请使用兼容修复版。
-
-`更新.cmd` 调用系统 Windows PowerShell，仅对当前进程设置执行策略，不提权、不联网、不永久修改系统策略。组织策略禁用脚本时不绕过限制。SHA-256 用于检测损坏，不是发布者数字签名；请只从可信 Release 下载。
 
 ### 卸载与彻底清理
 
@@ -117,7 +107,7 @@ ZIP 更新入口检查产品、版本、文件 SHA-256、额外文件、目录�
 
 **扫码登录可以取消吗？** 可以点击“取消登录”，等待浏览器正常关闭。交互阶段取消或尚未删除旧凭据就失败时，保留原状态；旧凭据删除后若账号或新凭据保存失败，则保持不可发送，需要重新扫码。发送前账号无法核验或与保存账号不一致时，整批停止，不尝试用旧好友配置继续发送。
 
-**安装、更新或卸载提示文件占用怎么办？** 等待任务正常结束并退出旧版，包括独立计划任务。Setup 原位升级会自动暂停归属本安装的计划；ZIP 更新和首次便携迁入仍须先手动停用并保存计划。不要强杀正在确认发送结果的程序，也不要只覆盖 EXE。
+**安装、更新或卸载提示文件占用怎么办？** 等待任务正常结束并退出旧版，包括独立计划任务。Setup 原位升级会自动暂停归属本安装的计划；首次从旧便携版迁入仍须先手动停用并保存旧计划。不要强杀正在确认发送结果的程序，也不要只覆盖 EXE。
 
 **为什么仍打开旧版？** 检查窗口显示的版本和程序目录；目录单行显示，较长时省略，悬停可查看完整路径。旧快捷方式或任务栏固定项可能仍指向旧路径，应改为新版，并在新路径重新保存计划。
 
@@ -153,15 +143,27 @@ python -m venv .venv
 .venv\Scripts\python.exe -m playwright install chromium
 .venv\Scripts\python.exe -m pytest
 .venv\Scripts\python.exe -m ruff check src tests tools
-.venv\Scripts\python.exe tools\build_portable.py
+.venv\Scripts\python.exe tools\build_payload.py
 .venv\Scripts\python.exe tools\build_installer.py
 ```
 
-先运行 `build_portable.py` 生成 `outputs/release/SparkKeeper` 和备用 ZIP，再运行 `build_installer.py` 包装同一程序目录；构建工具不会执行安装器。它自动查找 `Program Files`、`Program Files (x86)` 或 `%LOCALAPPDATA%\Programs` 下的 `Inno Setup 6\ISCC.exe`，也可用 `--iscc` 指定编译器完整路径；`--payload`、`--output-dir` 可指定程序目录和输出目录。
+### 只搜索诊断（开发工具）
 
-默认输出 `outputs/release/SparkKeeper-3.0.7-Setup.exe`、`SparkKeeper-3.0.7-Setup.exe.sha256` 和本地构建凭据 `SparkKeeper-3.0.7-Setup.exe.build.json`。构建凭据绑定安装 EXE、安装脚本/安全辅助脚本、编译器和程序清单内的构建来源，发布预检需要保留它，但不上传到 Release。即使版本号不变，业务源码、资源或便携构建输入改变后也必须重建便携包，再构建安装器；仅安装器专属输入变化时重建安装器。PE 产品/版本与 `asInvoker` 检查不是代码签名认证，也不替代实际安装验收。
+`tools/diagnose_chat_search.py` 使用现有登录态、只读查询指定联系人，再在独立无头浏览器中执行现有搜索流程。它不点击好友、不输入消息、不更新数据库或登录态，也不会自动安装到正式 EXE。
 
-便携构建使用项目 `.venv` 中的 Python（如上面的 `.venv\Scripts\python.exe`），以记录实际打包环境的依赖和工具版本；构建前后核对输入内容未变化。来源绑定使用内容摘要而非提交号，仍允许先构建后提交；仅无关文档或 Git HEAD 变化不要求重建。缺少来源记录的旧产物不能用于新的安装器构建或发布，但已发行旧包的运行期升级维护读取仍受支持。
+```powershell
+.venv\Scripts\python.exe tools\diagnose_chat_search.py --database "$env:LOCALAPPDATA\SparkKeeper\data\spark-keeper.sqlite3" --auth-state "$env:LOCALAPPDATA\SparkKeeper\data\auth-state.bin" --target-id 1 --output "$env:LOCALAPPDATA\SparkKeeper\outputs\diagnostics"
+```
+
+每次产生独立时间戳目录，保存搜索区域截图、结构化 DOM、逐轮提取计数、输入事件和 XHR/fetch 请求时间线。网络记录不含查询参数、请求头或请求/响应正文；截图和 DOM 仍可能含私人联系人信息，仅限本机分析。原搜索为空时额外观察 5 秒，不重新输入，不点击结果。`candidate_count=1` 仅表示搜到一个候选，不代表已确认收件人或发送成功。此工具用于捕获新现场，不能还原历史失败页面。
+
+### 构建产物
+
+先运行 `build_payload.py` 生成安装器内部程序目录 `outputs/release/SparkKeeper`，再运行 `build_installer.py` 包装该目录；不生成便携 ZIP，内部程序目录不是额外的发行渠道。构建工具不会执行安装器。它自动查找 `Program Files`、`Program Files (x86)` 或 `%LOCALAPPDATA%\Programs` 下的 `Inno Setup 6\ISCC.exe`，也可用 `--iscc` 指定编译器完整路径；`--payload`、`--output-dir` 可指定程序目录和输出目录。
+
+默认输出 `outputs/release/SparkKeeper-3.0.8-Setup.exe`、`SparkKeeper-3.0.8-Setup.exe.sha256` 和本地构建凭据 `SparkKeeper-3.0.8-Setup.exe.build.json`。构建凭据绑定安装 EXE、安装脚本/安全辅助脚本、编译器和程序清单内的构建来源，发布预检需要保留它及对应内部程序目录，但不上传到 Release。即使版本号不变，业务源码、资源或程序构建输入改变后也必须重建内部程序目录，再构建安装器；仅安装器专属输入变化时重建安装器。PE 产品/版本与 `asInvoker` 检查不是代码签名认证，也不替代实际安装验收。
+
+程序构建使用项目 `.venv` 中的 Python（如上面的 `.venv\Scripts\python.exe`），以记录实际打包环境的依赖和工具版本；构建前后核对输入内容未变化。来源绑定使用内容摘要而非提交号，仍允许先构建后提交；仅无关文档或 Git HEAD 变化不要求重建。缺少来源记录的旧产物不能用于新的安装器构建或发布，但已发行旧包的运行期升级维护读取仍受支持。
 
 测试和复现必须使用临时目录、合成数据，不访问真实登录态或触发真实发送。`--smoke` 使用临时数据检查当前构建的独立窗口，不用于正常单实例验收。
 
@@ -169,10 +171,10 @@ python -m venv .venv
 
 ## 维护者发布流程
 
-1. 修改唯一版本号和 `CHANGELOG.md`，完成回归、构建、安装/原位升级保留数据、确认卸载清空隔离测试数据及 ZIP 解压更新验证；卸载验收仅使用私有 TestAppId 与专用数据目录，不操作真实用户数据。文档说明不等于已完成安装验收。
+1. 修改唯一版本号和 `CHANGELOG.md`，完成回归、构建、安装/原位升级保留数据及确认卸载清空隔离测试数据的验证；卸载验收仅使用私有 TestAppId 与专用数据目录，不操作真实用户数据。文档说明不等于已完成安装验收。
 2. 检查没有跟踪运行数据，提交源码并创建对应 Git 标签，再推送分支和标签。
-3. 运行 `tools/publish_release.py --repo Charlie-chulong/SparkKeeper --dry-run`。安装器默认取 ZIP 同目录中的对应版本文件，也可用 `--installer` 指定；确保安装 EXE、ZIP、各自校验、本地安装器构建凭据及 Qt 对应源码齐全。
-4. 明确使用 `--publish` 并确认目标，工具才会创建 Release 草稿并上传安装 EXE、备用 ZIP、对应校验文件及 Qt 对应源码。
+3. 运行 `tools/publish_release.py --repo Charlie-chulong/SparkKeeper --dry-run`。内部程序目录默认 `outputs/release/SparkKeeper`，可用 `--payload` 指定；安装器默认取该目录的父目录中的对应版本文件，也可用 `--installer` 指定。保留完整内部程序目录、安装 EXE、校验、本地安装器构建凭据及 Qt 对应源码；预检会核对实际程序文件、来源、安装器凭据与 Qt 源码之间的一致性。
+4. 明确使用 `--publish` 并确认目标，工具才会创建 Release 草稿并上传五项附件：安装 EXE、其 SHA-256 文件、Qt/PySide 对应的两份源码压缩包及 `SHA256SUMS.txt`。不上传便携 ZIP、内部程序目录或本地构建凭据。
 5. 检查草稿中的版本、说明、许可和资产，人工发布后再分发链接。
 
 不在软件中嵌入 GitHub Token，不在每次提交后自动发布，不提供联网自动更新。已经发布的历史标签和资产不因本次文档、许可更新被静默替换。

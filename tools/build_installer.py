@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_build = runpy.run_path(str(ROOT / "tools" / "build_portable.py"))
+_build = runpy.run_path(str(ROOT / "tools" / "build_payload.py"))
 project_version = _build["project_version"]
 release_version = _build["release_version"]
 sha256_file = _build["sha256_file"]
@@ -25,11 +25,17 @@ validate_provenance = _build["validate_provenance"]
 
 def validate_member(name: str) -> None:
     parts = name.split("/")
-    if not name or "\\" in name or any(
-        not part or part in {".", ".."} or part.endswith((".", " "))
-        or any(ord(char) < 32 or char in ':*?"<>|' for char in part)
-        or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part, re.IGNORECASE)
-        for part in parts
+    if (
+        not name
+        or "\\" in name
+        or any(
+            not part
+            or part in {".", ".."}
+            or part.endswith((".", " "))
+            or any(ord(char) < 32 or char in ':*?"<>|' for char in part)
+            or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part, re.IGNORECASE)
+            for part in parts
+        )
     ):
         raise ValueError(f"发行包含不安全路径：{name!r}")
     if parts[0].casefold() == ".installer" or (
@@ -49,7 +55,13 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict:
 
 def validate_manifest(content: bytes, version: str) -> dict[str, str]:
     manifest = json.loads(content, object_pairs_hook=unique_object)
-    if not isinstance(manifest, dict) or type(manifest.get("format")) is not int or manifest.get("format") != 1 or manifest.get("product") != "SparkKeeper" or manifest.get("version") != version:
+    if (
+        not isinstance(manifest, dict)
+        or type(manifest.get("format")) is not int
+        or manifest.get("format") != 1
+        or manifest.get("product") != "SparkKeeper"
+        or manifest.get("version") != version
+    ):
         raise RuntimeError("manifest 格式、产品或版本不匹配")
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
@@ -62,17 +74,24 @@ def validate_manifest(content: bytes, version: str) -> dict[str, str]:
         folded.add(name.casefold())
         if is_sensitive_path(name):
             raise RuntimeError(f"发行包含运行数据：{name}")
-        if name.casefold() == "release-manifest.json" or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        if (
+            name.casefold() == "release-manifest.json"
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
             raise ValueError("manifest 含自身或无效 SHA256")
     required = {"SparkKeeper.exe", "THIRD_PARTY_NOTICES.txt", "使用说明.txt"}
-    if not required <= files.keys() or any(not any(name.startswith(prefix) for name in files) for prefix in ("_internal/", "browsers/", "licenses/")):
+    if not required <= files.keys() or any(
+        not any(name.startswith(prefix) for name in files)
+        for prefix in ("_internal/", "browsers/", "licenses/")
+    ):
         raise RuntimeError("发行包缺少程序、运行库、浏览器、许可或说明")
     return files
 
 
 def validate_payload(payload: Path, version: str) -> Path:
     if not payload.is_dir():
-        raise FileNotFoundError(f"缺少便携 payload，请先运行 tools/build_portable.py：{payload}")
+        raise FileNotFoundError(f"缺少内部程序 payload，请先运行 tools/build_payload.py：{payload}")
     if payload.is_symlink() or payload.is_junction():
         raise ValueError("payload 目录不能是链接")
     reject_sensitive_files(payload)
@@ -116,7 +135,9 @@ def find_iscc(explicit: Path | None = None) -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
-    raise FileNotFoundError("未找到 Inno Setup 6 ISCC.exe；请安装 Inno Setup 6，或使用 --iscc 指定编译器完整路径")
+    raise FileNotFoundError(
+        "未找到 Inno Setup 6 ISCC.exe；请安装 Inno Setup 6，或使用 --iscc 指定编译器完整路径"
+    )
 
 
 def read_installer_metadata(installer: Path) -> dict[str, str]:
@@ -154,8 +175,16 @@ def read_installer_metadata(installer: Path) -> dict[str, str]:
             tree = ET.fromstring(ctypes.string_at(address, size))
         except ET.ParseError as exc:
             raise RuntimeError("安装器 PE manifest 不是有效 XML") from exc
-        levels = [node.attrib for node in tree.iter() if node.tag.rsplit("}", 1)[-1] == "requestedExecutionLevel"]
-        if len(levels) != 1 or levels[0].get("level") != "asInvoker" or levels[0].get("uiAccess", "false") != "false":
+        levels = [
+            node.attrib
+            for node in tree.iter()
+            if node.tag.rsplit("}", 1)[-1] == "requestedExecutionLevel"
+        ]
+        if (
+            len(levels) != 1
+            or levels[0].get("level") != "asInvoker"
+            or levels[0].get("uiAccess", "false") != "false"
+        ):
             raise RuntimeError("安装器必须声明 asInvoker 且不能请求 uiAccess")
     finally:
         kernel.FreeLibrary(module)
@@ -167,13 +196,25 @@ def read_pe_version(installer: Path) -> dict[str, str]:
         raise RuntimeError("PE 编译器版本资源读取需要 Windows")
     from ctypes import wintypes
 
-
     version_api = ctypes.WinDLL("version", use_last_error=True)
-    version_api.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    version_api.GetFileVersionInfoSizeW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     version_api.GetFileVersionInfoSizeW.restype = wintypes.DWORD
-    version_api.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    version_api.GetFileVersionInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
     version_api.GetFileVersionInfoW.restype = wintypes.BOOL
-    version_api.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+    version_api.VerQueryValueW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.UINT),
+    ]
     version_api.VerQueryValueW.restype = wintypes.BOOL
     size = version_api.GetFileVersionInfoSizeW(str(installer), None)
     if not size:
@@ -203,7 +244,12 @@ def read_pe_version(installer: Path) -> dict[str, str]:
 
 def validate_installer_metadata(installer: Path, version: str) -> dict[str, str]:
     metadata = read_installer_metadata(installer)
-    expected = {"execution_level": "asInvoker", "ProductName": "SparkKeeper", "ProductVersion": version, "FileDescription": "SparkKeeper Setup"}
+    expected = {
+        "execution_level": "asInvoker",
+        "ProductName": "SparkKeeper",
+        "ProductVersion": version,
+        "FileDescription": "SparkKeeper Setup",
+    }
     if metadata != expected:
         raise RuntimeError(f"安装器权限、产品或版本资源不匹配：{metadata}")
     return metadata
@@ -214,16 +260,27 @@ def receipt_path(installer: Path) -> Path:
 
 
 def installer_inputs(root: Path) -> dict[str, str]:
-    return {name: sha256_file(root / "tools" / name)
-            for name in ("build_installer.py", "installer.iss", "installer_guard.ps1", "update.ps1",
-                         "installer/ChineseSimplified.isl", "installer/LICENSE.txt", "maintenance_tasks.ps1")}
+    return {
+        name: sha256_file(root / "tools" / name)
+        for name in (
+            "build_installer.py",
+            "installer.iss",
+            "installer_guard.ps1",
+            "update.ps1",
+            "installer/ChineseSimplified.isl",
+            "installer/LICENSE.txt",
+            "maintenance_tasks.ps1",
+        )
+    }
 
 
 def compiler_identity(compiler: Path) -> dict[str, str]:
     return {"sha256": sha256_file(compiler), "version": read_pe_version(compiler)["ProductVersion"]}
 
 
-def validate_installer(installer: Path, version: str, manifest_content: bytes, *, root: Path = ROOT) -> Path:
+def validate_installer(
+    installer: Path, version: str, manifest_content: bytes, *, root: Path = ROOT
+) -> Path:
     if installer.name != f"SparkKeeper-{release_version(version)}-Setup.exe":
         raise ValueError("安装器文件名与版本不一致")
     checksum = installer.with_suffix(".exe.sha256")
@@ -237,25 +294,40 @@ def validate_installer(installer: Path, version: str, manifest_content: bytes, *
     manifest = json.loads(manifest_content, object_pairs_hook=unique_object)
     provenance = validate_provenance(manifest.get("build_provenance"), root=root)
     compiler = receipt.get("compiler")
-    if (not isinstance(compiler, dict) or set(compiler) != {"sha256", "version"}
-            or not isinstance(compiler.get("version"), str) or not compiler["version"]
-            or not isinstance(compiler.get("sha256"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", compiler["sha256"])):
+    if (
+        not isinstance(compiler, dict)
+        or set(compiler) != {"sha256", "version"}
+        or not isinstance(compiler.get("version"), str)
+        or not compiler["version"]
+        or not isinstance(compiler.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", compiler["sha256"])
+    ):
         raise RuntimeError("安装器构建凭据缺少编译器版本或摘要")
-    expected = {"format": 2, "version": version, "installer_sha256": digest,
-                "inputs_sha256": installer_inputs(root),
-                "payload_manifest_sha256": hashlib.sha256(manifest_content).hexdigest(),
-                "payload_build_provenance": provenance, "compiler": compiler}
+    expected = {
+        "format": 2,
+        "version": version,
+        "installer_sha256": digest,
+        "inputs_sha256": installer_inputs(root),
+        "payload_manifest_sha256": hashlib.sha256(manifest_content).hexdigest(),
+        "payload_build_provenance": provenance,
+        "compiler": compiler,
+    }
     if receipt != expected:
-        raise RuntimeError("安装器构建凭据与 EXE、当前安装脚本或 ZIP payload 不一致；请重新构建安装器")
+        raise RuntimeError(
+            "安装器构建凭据与 EXE、当前安装脚本或 ZIP payload 不一致；请重新构建安装器"
+        )
     validate_installer_metadata(installer, version)
     return checksum
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="由已验证的便携 payload 构建当前用户 Inno Setup 安装器（不会运行安装器）")
+    parser = argparse.ArgumentParser(
+        description="由已验证的内部程序 payload 构建当前用户 Inno Setup 安装器（不会运行安装器）"
+    )
     parser.add_argument("--iscc", type=Path, help="Inno Setup 6 ISCC.exe 完整路径")
-    parser.add_argument("--payload", type=Path, help="默认 outputs/release/SparkKeeper")
+    parser.add_argument(
+        "--payload", type=Path, help="内部程序目录，默认 outputs/release/SparkKeeper"
+    )
     parser.add_argument("--output-dir", type=Path, help="默认 outputs/release")
     args = parser.parse_args(argv)
     try:
@@ -265,7 +337,9 @@ def main(argv: list[str] | None = None) -> int:
         manifest = validate_payload(payload, version)
         manifest_digest = sha256_file(manifest)
         provenance = validate_provenance(
-            json.loads(manifest.read_bytes(), object_pairs_hook=unique_object).get("build_provenance"),
+            json.loads(manifest.read_bytes(), object_pairs_hook=unique_object).get(
+                "build_provenance"
+            ),
             root=ROOT,
         )
         compiler = find_iscc(args.iscc)
@@ -279,8 +353,14 @@ def main(argv: list[str] | None = None) -> int:
         # A failed compiler must never leave a new checksum blessing an older EXE.
         with tempfile.TemporaryDirectory(prefix="sparkkeeper-setup-", dir=output) as temporary:
             staging = Path(temporary)
-            command = [str(compiler), f"/DAppVersion={version}", f"/DPayloadDir={payload}",
-                       f"/DOutputDir={staging}", f"/DOutputBaseFilename={base}", str(script)]
+            command = [
+                str(compiler),
+                f"/DAppVersion={version}",
+                f"/DPayloadDir={payload}",
+                f"/DOutputDir={staging}",
+                f"/DOutputBaseFilename={base}",
+                str(script),
+            ]
             result = subprocess.run(command, cwd=ROOT, check=False)
             if result.returncode:
                 raise RuntimeError(f"ISCC 编译失败，退出码 {result.returncode}")
@@ -289,19 +369,34 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("ISCC 未生成预期的 Setup.exe")
             validate_payload(payload, version)
             validate_provenance(provenance, root=ROOT)
-            if (sha256_file(manifest) != manifest_digest or installer_inputs(ROOT) != inputs
-                    or project_version(ROOT) != version or compiler_identity(compiler) != compiler_info):
+            if (
+                sha256_file(manifest) != manifest_digest
+                or installer_inputs(ROOT) != inputs
+                or project_version(ROOT) != version
+                or compiler_identity(compiler) != compiler_info
+            ):
                 raise RuntimeError("编译期间版本、payload 或安装脚本发生变化")
             validate_installer_metadata(installer, version)
             digest = sha256_file(installer)
             checksum = installer.with_suffix(".exe.sha256")
             checksum.write_text(f"{digest}  {installer.name}\n", encoding="ascii")
             receipt = receipt_path(installer)
-            receipt.write_text(json.dumps({
-                "format": 2, "version": version, "installer_sha256": digest,
-                "inputs_sha256": inputs, "payload_manifest_sha256": manifest_digest,
-                "payload_build_provenance": provenance, "compiler": compiler_info,
-            }, indent=2) + "\n", encoding="utf-8")
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "format": 2,
+                        "version": version,
+                        "installer_sha256": digest,
+                        "inputs_sha256": inputs,
+                        "payload_manifest_sha256": manifest_digest,
+                        "payload_build_provenance": provenance,
+                        "compiler": compiler_info,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             for artifact in (installer, checksum, receipt):
                 artifact.replace(output / artifact.name)
         print(output / f"{base}.exe")

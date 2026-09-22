@@ -1060,15 +1060,43 @@ class DouyinChatAdapter:
         raise PageStructureChanged()
 
     @staticmethod
-    async def _enter_chat_search_query(search: Locator, query: str) -> None:
+    async def _enter_chat_search_query(
+        search: Locator,
+        query: str,
+        *,
+        recovery: bool = False,
+    ) -> None:
         # Unicode insertion lacks a complete key cycle in Chromium. Finish with
         # a normal keyboard edit, preserving the query and never pressing Enter.
         await search.click()
-        await search.press("Control+A")
-        await search.press("Backspace")
-        await search.press_sequentially(query, delay=100)
+        if recovery:
+            # A fresh input sequence re-arms the live-search handler after the
+            # initial chat data load races the first query.
+            await search.fill("")
+            await search.fill(query)
+            await search.press("ArrowLeft")
+            await search.press("ArrowRight")
+        else:
+            await search.press("Control+A")
+            await search.press("Backspace")
+            await search.press_sequentially(query, delay=100)
         await search.press("Space")
         await search.press("Backspace")
+
+    async def _refresh_chat_for_search(self) -> Locator:
+        # The chat search box can render before the IM conversation data is
+        # hydrated. Refresh only after a complete lookup miss, before any
+        # target row is clicked or any message is triggered.
+        await self.page.reload(wait_until="domcontentloaded")
+        state = await self._wait_for_page_state(15)
+        if state is PageState.LOGIN_REQUIRED:
+            raise AuthenticationRequired()
+        if state is PageState.HUMAN_VERIFICATION:
+            raise HumanVerificationRequired()
+        if state is not PageState.READY:
+            raise PageNotReady()
+        await self.page.wait_for_timeout(1500)
+        return await self._chat_search_input()
 
     async def _wait_for_candidate_rows(
         self,
@@ -1098,9 +1126,39 @@ class DouyinChatAdapter:
                 )
                 if rows:
                     return rows
-            if not submission:
-                previous_search_attempts.append(self._last_candidate_diagnostics.copy())
+            previous_search_attempts.append(self._last_candidate_diagnostics.copy())
+
+        if not self.page.url.startswith(CHAT_URL):
+            return []
+        # A first target can race chat-data hydration even though the search
+        # box already made the page look ready. One fresh page load is allowed
+        # for navigation-only recovery; it never retries a send.
+        recovery_diagnostic = {
+            "strategy": "reload_and_fill",
+            "attempted": True,
+        }
+        self._last_candidate_diagnostics["recovery"] = recovery_diagnostic
+        search = await self._refresh_chat_for_search()
+        await self._enter_chat_search_query(search, query, recovery=True)
+        for attempt in range(20):
+            await self.page.wait_for_timeout(250)
+            rows = await self._extract_candidate_rows(query, search)
+            self._last_candidate_diagnostics.update(
+                poll_count=attempt + 1,
+                poll_wait_ms=(attempt + 1) * 250,
+                query_submissions=3,
+                total_poll_count=40 + attempt + 1,
+                total_poll_wait_ms=10_000 + (attempt + 1) * 250,
+                previous_search_attempts=list(previous_search_attempts),
+            )
+            if rows:
+                recovery_diagnostic["result"] = "found"
+                self._last_candidate_diagnostics["recovery"] = recovery_diagnostic
+                return rows
+        recovery_diagnostic["result"] = "empty"
+        self._last_candidate_diagnostics["recovery"] = recovery_diagnostic
         return []
+
 
     async def _wait_for_composer(self) -> Locator:
         for _ in range(40):

@@ -28,7 +28,8 @@ def _configure_bundled_browser_path() -> None:
     if not bundled_browsers.is_dir():
         raise AutomationError(
             ErrorCode.CONFIGURATION_INVALID,
-            "程序包缺少 Chromium 组件，请重新解压完整便携包",
+            "程序包缺少 Chromium 组件，请使用可信来源的同版或更新版 Setup 沿原安装目录修复；"
+            "不要先卸载，卸载会删除用户数据",
             fatal=True,
         )
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_browsers)
@@ -72,6 +73,7 @@ class BrowserSessionFactory:
             page = await context.new_page()
             yield BrowserSession(page=page, context=context)
         finally:
+
             async def close_session() -> None:
                 try:
                     if context is not None:

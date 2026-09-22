@@ -21,9 +21,9 @@
 - Windows Toast 通知；通知实现失败时写入本地事件并返回明确错误
 - pytest + pytest-asyncio
 
-源码开发仍直接运行；Windows 版使用 PyInstaller `onedir` 生成程序目录，3.0.2 起以用户级 Inno Setup 安装 EXE 为推荐分发方式，保留便携 ZIP；不制作需要管理员权限的安装程序。
+源码开发仍直接运行；Windows 版使用 PyInstaller `onedir` 生成安装器内部程序目录，以用户级 Inno Setup 安装 EXE 为唯一分发方式，不再生成便携 ZIP；不制作需要管理员权限的安装程序。
 
-正式版本从 3.0.0 开始，以 `src/spark_keeper/__init__.py` 的 `__version__` 为唯一来源，hatch 动态读取。安装器文件名为 `SparkKeeper-版本号-Setup.exe`，备用 ZIP 为 `SparkKeeper-版本号-win64.zip`；ZIP 内部固定 `SparkKeeper/` 加根目录 `更新.cmd`/`update.ps1`，由用户主动离线完整替换便携目录。GitHub 发布工具默认仅预检，显式授权才建立草稿并上传校验通过的安装 EXE、ZIP、各自 SHA-256 文件及 Qt 对应源码，不修改历史标签与资产。
+正式版本从 3.0.0 开始，以 `src/spark_keeper/__init__.py` 的 `__version__` 为唯一来源，hatch 动态读取。安装器文件名为 `SparkKeeper-版本号-Setup.exe`，内部程序目录固定为 `outputs/release/SparkKeeper`。GitHub 发布工具默认仅预检，显式授权才建立草稿并上传五项附件：安装 EXE、其 SHA-256 文件、Qt/PySide 对应的两份源码压缩包及 `SHA256SUMS.txt`；不上传内部程序目录或构建凭据，不修改历史标签与资产。
 
 ## 3. 目录设计
 
@@ -58,13 +58,15 @@ requirements.md
    worker.py
  tests/
 tools/
-  build_portable.py
+  build_payload.py
+  build_installer.py
+  publish_release.py
   portable_entry.py
  work/
  outputs/
 ```
 
-源码运行时，`work` 保存项目内临时内容，运行数据位于 `work/local-data`。冻结后的便携自用版以可执行文件目录作为程序根目录，数据库、DPAPI 登录态、任务 XML 和本地输出全部写入当前用户 `%LOCALAPPDATA%\SparkKeeper`；发行目录保持只读且不携带制作者运行数据。
+源码运行时，`work` 保存项目内临时内容，运行数据位于 `work/local-data`。冻结程序以可执行文件目录作为程序根目录，数据库、DPAPI 登录态、任务 XML 和本地输出全部写入当前用户 `%LOCALAPPDATA%\SparkKeeper`；发行目录保持只读且不携带制作者运行数据。历史便携副本仍使用同一用户数据目录，迁入安装版和卸载时必须保留相关风险提示。
 
 ## 4. 进程结构
 
@@ -392,7 +394,7 @@ PREPARED
 - 源码模式使用绝对 Python、模块参数和项目工作目录。
 - 冻结程序使用固定程序目录中的 `SparkKeeper.exe --scheduled` 和该目录作为工作目录；首次从便携目录迁入安装目录后重新保存计划以更新绝对路径。
 
-### 14.1 Windows 分发与便携更新
+### 14.1 Windows 程序构建
 
 - PyInstaller `onedir` 打包 Python、PySide6/Qt Widgets、Playwright 驱动和 Windows-Toasts；Qt 使用可替换的动态库，发行包附开源许可及来源说明，不捆绑 Tk。
 - 仅捆绑实际使用的 Chromium、Headless Shell、FFmpeg 和 Playwright 辅助组件。
@@ -400,19 +402,19 @@ PREPARED
 - 冻结程序把 `PLAYWRIGHT_BROWSERS_PATH` 指向 EXE 同级 `browsers`，缺失时以固定安全错误拒绝启动网页任务。
 - `SparkKeeper.exe` 同时承载桌面入口和隐藏的 `--scheduled` worker 入口。
 - 分发构建前扫描并拒绝数据库、登录 DPAPI 密文、任务 XML 及 `local-data`。
-- 发行包包含项目及第三方许可、使用说明；安装 EXE 与 ZIP 分别提供 SHA-256 校验文件，校验不等同于发布者数字签名。
+- 安装包包含项目及第三方许可、使用说明，安装 EXE 提供 SHA-256 校验文件；校验不等同于发布者数字签名。
 - 程序目录包含 `release-manifest.json`：产品、版本及全部发行文件的 SHA-256（不含清单自身），用于更新包完整性核验，不作为数字签名或运行时库替换限制。
-- 更新器拒绝危险/重叠/重解析路径、损坏或额外文件、降级、运行中程序及启用的计划；先同卷暂存，再将旧目录保留为备份并换入新版。失败恢复目录，不自动恢复数据库。旧开发包无清单时需显式接受迁入，完整旧目录保留。
-- 用户启用计划后不得移动解压目录；移动前需先停用计划，移动后重新启用。
+- 程序目录构建前后核对来源稳定性，写入清单后仍复查；失败撤销清单，不生成 ZIP 或触碰已有历史发行文件。发布预检直接完整验证该目录，并由安装器凭据绑定来源；Qt 源码附件对应目录内的 Qt 来源清单，人工确认后再次执行全部检查。
+- 已安装程序不直接移动目录；升级沿用原安装路径。旧便携版只保留迁入与共享数据安全边界，不再提供便携 ZIP 更新入口。
 
 ### 14.2 用户级安装器
 
 - 使用 Inno Setup 包装同一 PyInstaller 程序目录，默认安装到 `%LOCALAPPDATA%\Programs\SparkKeeper`；固定 AppId 关联已有安装，不提权。已有安装必须沿用注册路径升级，拒绝另选目录或 `/DIR` 改道，并核对注册 DisplayVersion 防止降级。3.0.3 标准卸载会清空共享用户数据，不得把先卸载再安装作为保留配置的迁移方案；仅在用户接受全部清理后重新安装到新位置。
-- 构建顺序为 `tools/build_portable.py` 后 `tools/build_installer.py`，需要 Inno Setup 6.5+（6.x）编译器，可用 `--iscc` 指定。简体中文语言文件固定于 `tools/installer/ChineseSimplified.isl`，保留上游翻译者说明及许可，不在构建时联网下载。默认产物在 `outputs/release`，安装 EXE 附 `.exe.sha256`；本地 `.exe.build.json` 绑定 EXE、安装脚本/辅助脚本及 payload 清单，发布预检使用但不上传。构建工具不执行安装器。
-- 3.0.3 Setup 原位升级自动暂停/恢复归属本安装的 Windows 任务，不再要求用户先手动停用业务计划；用户仍须等待发送/扫描/登录及独立 worker 结束、正常退出 GUI。禁用任务只阻止新触发，不终止已有实例；互斥忙或进程占用时拒绝/重试，不强杀、不自动补跑。ZIP 的 `update.ps1` 仍使用手动停用检查，不共用自动维护策略。
+- 构建顺序为 `tools/build_payload.py` 后 `tools/build_installer.py`，需要 Inno Setup 6.5+（6.x）编译器，可用 `--iscc` 指定。简体中文语言文件固定于 `tools/installer/ChineseSimplified.isl`，保留上游翻译者说明及许可，不在构建时联网下载。默认产物在 `outputs/release`，安装 EXE 附 `.exe.sha256`；本地 `.exe.build.json` 绑定 EXE、安装脚本/辅助脚本及 payload 清单，发布预检使用但不上传。构建工具不执行安装器。
+- 3.0.3 Setup 原位升级自动暂停/恢复归属本安装的 Windows 任务，不再要求用户先手动停用业务计划；用户仍须等待发送/扫描/登录及独立 worker 结束、正常退出 GUI。禁用任务只阻止新触发，不终止已有实例；互斥忙或进程占用时拒绝/重试，不强杀、不自动补跑。`update.ps1` 保留为安装器实际复用的完整性与维护安全辅助代码，不再通过便携 ZIP 的 `更新.cmd` 分发。
 - 普通升级与卸载要求原目录发行清单和所列文件 SHA-256 正确；未知额外文件拒绝处理，只排除已知安装器自身文件。持久维护事务的同目标修复使用已记录的旧/新清单判断部分更新，不把损坏当正常安装放行。无清单旧便携目录不得原地覆盖，改为新默认目录安装并保留原便携目录；失败保留日志，不盲目清理未知文件。
 - 安装目录与 `%LOCALAPPDATA%\SparkKeeper` 数据目录分离。首次便携迁入不复制或覆盖用户数据，也不自动迁移异路径任务：先人工停用旧计划并退出，安装后在新目录重新保存计划并更新快捷方式。正常安装、原位升级与取消卸载不删除用户数据；3.0.3 经明确确认的卸载彻底清理共享数据，影响同用户便携副本，不提供保留选项。
-- 不把 ZIP 更新器的旧目录备份机制当作安装器自动回滚保证；数据库迁移沿用程序现有一致性备份与拒绝未知高版本 schema 的保护，不自动恢复旧业务数据。
+- 安装器不承诺自动回滚；数据库迁移沿用程序现有一致性备份与拒绝未知高版本 schema 的保护，不自动恢复旧业务数据。
 - 安装包未签名，用户文档说明 SmartScreen 风险及可信来源/校验要求，不要求关闭安全软件或绕过组织策略。
 - 安装引擎依照 Inno Setup 自身许可使用；SparkKeeper 自有代码的非商业许可不重新许可第三方组件，也不因安装引擎允许商业使用而放宽项目许可。
 

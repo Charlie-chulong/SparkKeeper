@@ -5,10 +5,10 @@ import hashlib
 import threading
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime
 
 from playwright.async_api import Error as PlaywrightError
 
+from ..clock import now_beijing
 from ..identity import canonical_profile_url, identity_key
 from ..models import Account, ErrorCode, SparkContact, SparkScanResult, SparkScanStatus, SparkState
 from .douyin_chat import _CONVERSATION_IDENTITY_JS, DouyinChatAdapter
@@ -305,7 +305,7 @@ async def scan_contacts(
     contacts: list[SparkContact] = []
     stable: dict[str, int] = {}
     weak_observations: set[tuple] = set()
-    scanned_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    scanned_at = now_beijing().isoformat(timespec="seconds")
     status = SparkScanStatus.PARTIAL
     detail = "达到扫描轮数上限，未证明列表完整"
     previous = None

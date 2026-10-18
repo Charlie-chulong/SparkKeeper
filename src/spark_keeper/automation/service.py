@@ -4,7 +4,6 @@ import asyncio
 import random
 import threading
 from collections.abc import Awaitable, Callable, Iterable
-from datetime import datetime
 
 from ..database import Database, today_iso
 from ..display_labels import progress_failure_label, status_label
@@ -658,7 +657,7 @@ class BatchService:
             ErrorCode.HUMAN_VERIFICATION_REQUIRED,
             ErrorCode.LOGIN_STATE_UNAVAILABLE,
         }:
-            day = datetime.now().astimezone().date().isoformat()
+            day = today_iso()
             self.database.create_pending_action(
                 "login_required",
                 f"login:{day}",

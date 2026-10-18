@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+from .clock import BEIJING_TZ, now_beijing
 from .database import Database
 from .models import Plan
 from .paths import AppPaths
@@ -89,9 +90,11 @@ def build_task_xml(
     arguments: str = "-m spark_keeper.worker --scheduled",
 ) -> bytes:
     parsed_time = _parse_send_time(send_time)
+    # Windows honors an explicit StartBoundary offset independently of local time and DST.
     start = datetime.combine(
-        start_date or datetime.now().astimezone().date(),
+        start_date or now_beijing().date(),
         parsed_time,
+        tzinfo=BEIJING_TZ,
     )
     root = ET.Element(_tag("Task"), {"version": "1.4"})
     registration = _child(root, "RegistrationInfo")
@@ -180,6 +183,32 @@ class TaskScheduler:
     def exists(self) -> bool:
         return self._run(["/Query", "/TN", TASK_NAME]).returncode == 0
 
+    def has_beijing_daily_trigger(self, send_time: str) -> bool:
+        """Reject legacy local-time registrations without changing the Windows task."""
+        completed = self._run(["/Query", "/TN", TASK_NAME, "/XML"])
+        if completed.returncode != 0:
+            return False
+        try:
+            # Windows exports offset-aware boundaries in the computer's time zone.
+            document = ET.fromstring(completed.stdout, parser=ET.XMLParser(encoding="utf-8"))
+            triggers = document.find(_tag("Triggers"))
+            if triggers is None or len(triggers) != 1:
+                return False
+            trigger = triggers[0]
+            if trigger.tag != _tag("CalendarTrigger"):
+                return False
+            boundary = datetime.fromisoformat(trigger.findtext(_tag("StartBoundary"), ""))
+            return (
+                trigger.findtext(f"{_tag('ScheduleByDay')}/{_tag('DaysInterval')}") == "1"
+                and document.findtext(
+                    f"{_tag('Settings')}/{_tag('StartWhenAvailable')}", "false"
+                ) == "false"
+                and boundary.tzinfo is not None
+                and boundary.astimezone(BEIJING_TZ).time() == _parse_send_time(send_time)
+            )
+        except (ET.ParseError, ValueError):
+            return False
+
     def run_now(self) -> None:
         completed = self._run(["/Run", "/TN", TASK_NAME])
         if completed.returncode != 0:
@@ -209,7 +238,7 @@ class TaskScheduler:
 
 def scheduled_datetime(plan: Plan, on_date: date) -> datetime:
     parsed = _parse_send_time(plan.send_time)
-    return datetime.combine(on_date, parsed).astimezone()
+    return datetime.combine(on_date, parsed, tzinfo=BEIJING_TZ)
 
 
 def detect_missed_schedule(
@@ -218,9 +247,8 @@ def detect_missed_schedule(
     now: datetime | None = None,
     grace: timedelta = timedelta(minutes=5),
 ) -> MissedSchedule | None:
-    current = now or datetime.now().astimezone()
-    if current.tzinfo is None:
-        current = current.astimezone()
+    # astimezone interprets a supplied naive datetime as system-local time.
+    current = (now or now_beijing()).astimezone(BEIJING_TZ)
     plan = database.get_plan()
     if not plan.enabled or not plan.confirmed_at:
         return None

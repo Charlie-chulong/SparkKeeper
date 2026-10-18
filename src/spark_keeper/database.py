@@ -12,6 +12,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
+from .clock import beijing_date_iso, now_beijing
 from .identity import canonical_profile_url, identities_match, identity_key
 from .models import (
     Account,
@@ -30,11 +31,21 @@ from .mutex import AlreadyRunningError, WindowsTaskMutex
 
 
 def now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return now_beijing().isoformat(timespec="seconds")
 
 
 def today_iso() -> str:
-    return datetime.now().astimezone().date().isoformat()
+    return beijing_date_iso()
+
+
+def _beijing_day_sql(column: str) -> str:
+    """Convert aware instants, but retain recorded dates for unknown-zone legacy values."""
+    return f"""CASE
+        WHEN substr({column}, -6, 1) IN ('+', '-')
+             OR substr({column}, -1) = 'Z'
+        THEN date({column}, '+8 hours')
+        ELSE substr({column}, 1, 10)
+    END"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,14 +310,19 @@ class Database:
 
                 INSERT INTO app_meta(key, value) VALUES ('schema_version', '1')
                     ON CONFLICT(key) DO NOTHING;
-                INSERT INTO plan(singleton, enabled, send_time, message_text, confirmed_at, updated_at)
-                    VALUES (1, 0, '09:00', '', NULL, strftime('%Y-%m-%dT%H:%M:%S', 'now', 'localtime'))
-                    ON CONFLICT(singleton) DO NOTHING;
 
                 """
         for statement in schema.split(";"):
             if statement.strip():
                 connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO plan(singleton, enabled, send_time, message_text, confirmed_at, updated_at)
+            VALUES (1, 0, '09:00', '', NULL, ?)
+            ON CONFLICT(singleton) DO NOTHING
+            """,
+            (now_iso(),),
+        )
 
     @classmethod
     def _migrate_schema(cls, connection: sqlite3.Connection) -> None:
@@ -877,6 +893,50 @@ class Database:
             )
         return attempt_id
 
+    @staticmethod
+    def _find_daily_guard(
+        connection: sqlite3.Connection,
+        account_key: str,
+        target_id: int,
+        run_date: str,
+    ) -> sqlite3.Row | None:
+        guard = connection.execute(
+            """
+            SELECT source_attempt_id, status FROM daily_send_guards
+            WHERE account_key = ? AND target_id = ? AND run_date = ?
+            """,
+            (account_key, target_id, run_date),
+        ).fetchone()
+        if guard is not None:
+            return guard
+        # Old local-day keys stay intact; their aware source instant can also
+        # protect the corresponding Beijing day after the timezone cutover.
+        # A recorded trigger takes precedence over an earlier reservation day.
+        return connection.execute(
+            """
+            SELECT g.source_attempt_id, g.status
+            FROM daily_send_guards g
+            JOIN send_attempts a ON a.id = g.source_attempt_id
+            WHERE g.account_key = ? AND g.target_id = ?
+              AND g.status IN (?, ?, ?)
+              AND (
+                  substr(COALESCE(a.triggered_at, a.started_at), -6, 1) IN ('+', '-')
+                  OR substr(COALESCE(a.triggered_at, a.started_at), -1) = 'Z'
+              )
+              AND date(COALESCE(a.triggered_at, a.started_at), '+8 hours') = ?
+            ORDER BY julianday(COALESCE(a.triggered_at, a.started_at)) DESC, a.rowid DESC
+            LIMIT 1
+            """,
+            (
+                account_key,
+                target_id,
+                AttemptStatus.SENDING.value,
+                AttemptStatus.SUCCESS.value,
+                AttemptStatus.UNKNOWN.value,
+                run_date,
+            ),
+        ).fetchone()
+
     def reserve_attempt(
         self,
         *,
@@ -895,13 +955,7 @@ class Database:
         timestamp = now_iso()
         with self.connect(immediate=True) as connection:
             self._require_confirmed_target(connection, target_id)
-            guard = connection.execute(
-                """
-                SELECT source_attempt_id, status FROM daily_send_guards
-                WHERE account_key = ? AND target_id = ? AND run_date = ?
-                """,
-                (account_key, target_id, run_date),
-            ).fetchone()
+            guard = self._find_daily_guard(connection, account_key, target_id, run_date)
             if guard and not manual_override:
                 connection.execute(
                     """
@@ -990,13 +1044,9 @@ class Database:
             self._require_confirmed_target(connection, int(row["target_id"]))
             run_date = today_iso()
             timestamp = now_iso()
-            guard = connection.execute(
-                """
-                SELECT source_attempt_id FROM daily_send_guards
-                WHERE account_key = ? AND target_id = ? AND run_date = ?
-                """,
-                (row["account_key"], row["target_id"], run_date),
-            ).fetchone()
+            guard = self._find_daily_guard(
+                connection, str(row["account_key"]), int(row["target_id"]), run_date
+            )
             changed_day = run_date != row["run_date"]
             owns_guard = guard is not None and guard["source_attempt_id"] == attempt_id
             authorized_override = (
@@ -1032,7 +1082,7 @@ class Database:
                     (attempt_id, AttemptStatus.SENDING.value),
                 )
                 return False
-            if changed_day:
+            if changed_day and not owns_guard:
                 connection.execute(
                     "DELETE FROM daily_send_guards WHERE source_attempt_id = ? AND status = ?",
                     (attempt_id, AttemptStatus.SENDING.value),
@@ -1091,13 +1141,9 @@ class Database:
                 """,
                 (status.value, timestamp, error_code.value if error_code else None, attempt_id),
             )
-            guard = connection.execute(
-                """
-                SELECT source_attempt_id FROM daily_send_guards
-                WHERE account_key = ? AND target_id = ? AND run_date = ?
-                """,
-                (str(row["account_key"]), int(row["target_id"]), str(row["run_date"])),
-            ).fetchone()
+            guard = self._find_daily_guard(
+                connection, str(row["account_key"]), int(row["target_id"]), str(row["run_date"])
+            )
             owns_guard = bool(guard and str(guard["source_attempt_id"]) == attempt_id)
             if status in {AttemptStatus.SUCCESS, AttemptStatus.UNKNOWN}:
                 if owns_guard:
@@ -1169,13 +1215,7 @@ class Database:
 
     def has_daily_guard(self, account_key: str, target_id: int, run_date: str) -> bool:
         with self.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT 1 FROM daily_send_guards
-                WHERE account_key = ? AND target_id = ? AND run_date = ?
-                """,
-                (account_key, target_id, run_date),
-            ).fetchone()
+            row = self._find_daily_guard(connection, account_key, target_id, run_date)
         return row is not None
 
     def record_event(
@@ -1215,7 +1255,7 @@ class Database:
                 FROM send_attempts a
                 JOIN targets t ON t.id = a.target_id
                 JOIN batch_runs b ON b.id = a.batch_id
-                ORDER BY a.started_at DESC
+                ORDER BY julianday(a.started_at) DESC, a.rowid DESC
                 LIMIT ?
                 """,
                 (safe_limit,),
@@ -1283,9 +1323,9 @@ class Database:
     def scheduled_batch_exists(self, schedule_date: str) -> bool:
         with self.connect() as connection:
             row = connection.execute(
-                """
+                f"""
                 SELECT 1 FROM batch_runs
-                WHERE mode = ? AND substr(scheduled_for, 1, 10) = ?
+                WHERE mode = ? AND {_beijing_day_sql("scheduled_for")} = ?
                 LIMIT 1
                 """,
                 (BatchMode.SCHEDULED.value, schedule_date),
@@ -1301,25 +1341,44 @@ class Database:
         return [dict(row) for row in rows]
 
     def clear_history_preserving_today(self, current_date: date | None = None) -> dict[str, int]:
-        date_text = (current_date or datetime.now().astimezone().date()).isoformat()
+        date_text = current_date.isoformat() if current_date is not None else beijing_date_iso()
         with self.connect(immediate=True) as connection:
             deleted_events = connection.execute(
-                "DELETE FROM events WHERE substr(created_at, 1, 10) < ?", (date_text,)
+                f"DELETE FROM events WHERE {_beijing_day_sql('created_at')} < ?", (date_text,)
             ).rowcount
-            connection.execute("DELETE FROM daily_send_guards WHERE run_date < ?", (date_text,))
+            connection.execute(
+                f"""
+                DELETE FROM daily_send_guards
+                WHERE run_date < ?
+                  AND source_attempt_id IN (
+                      SELECT id FROM send_attempts
+                      WHERE {_beijing_day_sql("COALESCE(triggered_at, started_at)")} < ?
+                  )
+                """,
+                (date_text, date_text),
+            )
             deleted_attempts = connection.execute(
-                "DELETE FROM send_attempts WHERE run_date < ?", (date_text,)
+                f"""
+                DELETE FROM send_attempts
+                WHERE run_date < ?
+                  AND {_beijing_day_sql("COALESCE(triggered_at, started_at)")} < ?
+                  AND id NOT IN (SELECT source_attempt_id FROM daily_send_guards)
+                """,
+                (date_text, date_text),
             ).rowcount
             deleted_batches = connection.execute(
-                """
+                f"""
                 DELETE FROM batch_runs
-                WHERE substr(started_at, 1, 10) < ?
+                WHERE {_beijing_day_sql("started_at")} < ?
                   AND id NOT IN (SELECT DISTINCT batch_id FROM send_attempts)
                 """,
                 (date_text,),
             ).rowcount
             deleted_pending = connection.execute(
-                "DELETE FROM pending_actions WHERE status != 'pending' AND substr(created_at, 1, 10) < ?",
+                f"""
+                DELETE FROM pending_actions
+                WHERE status != 'pending' AND {_beijing_day_sql("created_at")} < ?
+                """,
                 (date_text,),
             ).rowcount
         return {

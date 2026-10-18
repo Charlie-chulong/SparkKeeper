@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 import spark_keeper.worker as worker_module
 from spark_keeper import maintenance
+from spark_keeper.clock import BEIJING_TZ
 from spark_keeper.database import Database
 from spark_keeper.models import AttemptStatus, BatchMode, BatchResult, BatchStatus, TargetResult
 from spark_keeper.mutex import WindowsTaskMutex
-from spark_keeper.notifications import notify_batch
+from spark_keeper.notifications import NotificationResult, notify_batch
 from spark_keeper.paths import AppPaths
+from spark_keeper.scheduler import SchedulerError
 from spark_keeper.worker import main
 
 
@@ -20,6 +24,9 @@ def isolated_maintenance_gate(tmp_path, monkeypatch):
     name = rf"Global\SparkKeeper.Maintenance.Test.{uuid.uuid4().hex}"
     monkeypatch.setattr(maintenance, "maintenance_mutex_name", lambda: name)
     monkeypatch.setenv("SPARK_KEEPER_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        worker_module.TaskScheduler, "has_beijing_daily_trigger", Mock(return_value=True)
+    )
 
 
 def test_batch_notification_contains_counts_not_private_content(monkeypatch) -> None:
@@ -72,9 +79,79 @@ async def test_scheduled_worker_skips_when_plan_is_disabled(tmp_path, monkeypatc
         raise AssertionError("停用计划不得启动批次")
 
     monkeypatch.setattr(worker_module.BatchService, "run_batch", fail_if_called)
+    monkeypatch.setattr(
+        worker_module.TaskScheduler,
+        "has_beijing_daily_trigger",
+        Mock(side_effect=AssertionError("停用计划不得核验或重建系统任务")),
+    )
 
     assert await worker_module.run_scheduled() == 0
     assert any(event["category"] == "schedule_disabled" for event in database.list_events(limit=20))
+
+
+@pytest.mark.asyncio
+async def test_scheduled_worker_uses_beijing_date_when_pacific_date_is_previous(
+    tmp_path, monkeypatch
+) -> None:
+    pacific_now = datetime(2026, 9, 4, 21, 30, tzinfo=timezone(timedelta(hours=-7)))
+    beijing_now = pacific_now.astimezone(BEIJING_TZ)
+    assert pacific_now.date() != beijing_now.date()
+    monkeypatch.setattr(worker_module, "now_beijing", lambda: beijing_now)
+    paths = AppPaths.discover()
+    paths.ensure_runtime_dirs()
+    database = Database(paths.database)
+    database.save_plan(enabled=True, send_time="12:00", message_text="不发送", confirmed=True)
+    plan = database.get_plan()
+    result = BatchResult("offline-batch", BatchMode.SCHEDULED, BatchStatus.SKIPPED, ())
+    run_batch = AsyncMock(return_value=result)
+    notify = Mock(return_value=NotificationResult(True))
+    monkeypatch.setattr(worker_module.BatchService, "run_batch", run_batch)
+    monkeypatch.setattr(worker_module, "notify_batch", notify)
+
+    assert await worker_module.run_scheduled() == 0
+
+    run_batch.assert_awaited_once_with(
+        BatchMode.SCHEDULED, scheduled_for="2026-09-05T12:00:00+08:00"
+    )
+    notify.assert_called_once_with(result)
+    assert database.get_plan() == plan
+    assert database.list_batches() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_fails", [False, True], ids=["legacy-task", "query-failure"])
+async def test_scheduled_worker_skips_unverified_beijing_task_without_mutating_plan(
+    tmp_path, monkeypatch, query_fails
+) -> None:
+    paths = AppPaths.discover()
+    database = Database(paths.database)
+    database.save_plan(enabled=True, send_time="12:00", message_text="不发送", confirmed=True)
+    before = database.get_plan()
+    guard = Mock(return_value=False)
+    if query_fails:
+        guard.side_effect = SchedulerError("系统任务查询失败")
+    service = Mock(side_effect=AssertionError("未核验北京时间任务不得构造发送服务"))
+    notify = Mock()
+    monkeypatch.setattr(worker_module.TaskScheduler, "has_beijing_daily_trigger", guard)
+    monkeypatch.setattr(worker_module, "BatchService", service)
+    monkeypatch.setattr(worker_module, "notify_batch", notify)
+
+    assert await worker_module.run_scheduled() == 0
+
+    guard.assert_called_once_with("12:00")
+    service.assert_not_called()
+    notify.assert_not_called()
+    assert database.get_plan() == before
+    assert database.list_batches() == []
+    event = next(
+        event for event in database.list_events()
+        if event["category"] == "schedule_timezone_unverified"
+    )
+    assert event["level"] == "WARNING"
+    assert "重新保存每日计划" in event["message"]
+    if query_fails:
+        assert "系统任务查询失败" in event["message"]
+
 
 
 @pytest.mark.asyncio

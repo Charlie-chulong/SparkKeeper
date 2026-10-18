@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import subprocess
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import pytest
 from PySide6.QtWidgets import QCheckBox, QLineEdit, QMainWindow
 
 from spark_keeper import scheduler as scheduler_module
+from spark_keeper.clock import BEIJING_TZ
 from spark_keeper.database import Database
 from spark_keeper.models import BatchMode, FriendCandidate, MessageKind, Plan
 from spark_keeper.scheduler import (
@@ -16,15 +17,37 @@ from spark_keeper.scheduler import (
     SchedulerError,
     build_task_xml,
     detect_missed_schedule,
+    scheduled_datetime,
 )
 from spark_keeper.ui.app import SparkKeeperApp
+
+PACIFIC_TZ = timezone(timedelta(hours=-7))
+
+
+@pytest.fixture
+def pacific_local_clock(monkeypatch):
+    class PacificLocalDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            moment = cls(2026, 9, 4, 21, 30, tzinfo=PACIFIC_TZ)
+            return moment.replace(tzinfo=None) if tz is None else moment.astimezone(tz)
+
+        def astimezone(self, tz=None):
+            moment = self.replace(tzinfo=PACIFIC_TZ) if self.tzinfo is None else self
+            return datetime.astimezone(moment, tz if tz is not None else PACIFIC_TZ)
+
+    monkeypatch.setattr(scheduler_module, "datetime", PacificLocalDatetime)
+    beijing_now = PacificLocalDatetime.now(BEIJING_TZ)
+    monkeypatch.setattr(scheduler_module, "now_beijing", lambda: beijing_now)
+    return PacificLocalDatetime
+
 
 
 def test_task_xml_uses_interactive_user_and_wake_without_catchup(tmp_path) -> None:
     python = tmp_path / "python.exe"
     root = tmp_path / "project"
     xml = build_task_xml(
-        send_time="08:35",
+        send_time="12:00",
         python_executable=python,
         working_directory=root,
         user_sid="S-1-5-21-1234",
@@ -32,6 +55,9 @@ def test_task_xml_uses_interactive_user_and_wake_without_catchup(tmp_path) -> No
     )
     document = ET.fromstring(xml)
     namespace = {"t": TASK_XML_NAMESPACE}
+    assert document.findtext(".//t:StartBoundary", namespaces=namespace) == (
+        "2026-09-04T12:00:00+08:00"
+    )
     assert document.findtext(".//t:LogonType", namespaces=namespace) == "InteractiveToken"
     assert document.findtext(".//t:RunLevel", namespaces=namespace) == "LeastPrivilege"
     assert document.findtext(".//t:WakeToRun", namespaces=namespace) == "true"
@@ -42,7 +68,109 @@ def test_task_xml_uses_interactive_user_and_wake_without_catchup(tmp_path) -> No
     assert document.findtext(".//t:WorkingDirectory", namespaces=namespace) == str(root.resolve())
 
 
-def configured_database(tmp_path, kind: MessageKind = MessageKind.TEXT) -> Database:
+def test_task_xml_default_date_uses_beijing_calendar(tmp_path, pacific_local_clock) -> None:
+    assert pacific_local_clock.now().date() == date(2026, 9, 4)
+    xml = build_task_xml(
+        send_time="12:00",
+        python_executable=tmp_path / "python.exe",
+        working_directory=tmp_path,
+        user_sid="S-1-5-21-1234",
+    )
+    document = ET.fromstring(xml)
+    assert document.findtext(
+        ".//t:StartBoundary", namespaces={"t": TASK_XML_NAMESPACE}
+    ) == "2026-09-05T12:00:00+08:00"
+
+
+def test_scheduled_datetime_is_beijing_aware_under_pacific_local_clock(pacific_local_clock) -> None:
+    plan = Plan(True, "12:00", "测试消息", "2026-09-01T08:00:00+08:00", "now")
+    scheduled = scheduled_datetime(plan, date(2026, 9, 5))
+    assert scheduled.isoformat(timespec="seconds") == "2026-09-05T12:00:00+08:00"
+    assert scheduled.tzinfo == BEIJING_TZ
+
+
+@pytest.fixture
+def registered_daily_task(tmp_path, monkeypatch):
+    document = ET.fromstring(
+        build_task_xml(
+            send_time="12:00",
+            python_executable=tmp_path / "python.exe",
+            working_directory=tmp_path,
+            user_sid="S-1-5-21-1234",
+            start_date=date(2026, 9, 4),
+        )
+    )
+    query = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    scheduler = scheduler_module.TaskScheduler(Mock())
+    monkeypatch.setattr(scheduler, "_run", query)
+    return scheduler, document, query
+
+
+@pytest.mark.parametrize(
+    ("boundary", "verified"),
+    [
+        ("2026-09-04T12:00:00+08:00", True),
+        ("2026-09-03T21:00:00-07:00", True),
+        ("2026-11-02T20:00:00-08:00", True),
+        ("2026-09-04T12:00:00", False),
+        ("2026-09-04T12:00:00-07:00", False),
+        ("2026-09-04T11:00:00+08:00", False),
+        ("invalid", False),
+    ],
+)
+def test_registered_daily_task_requires_matching_beijing_boundary(
+    registered_daily_task, boundary, verified
+) -> None:
+    scheduler, document, query = registered_daily_task
+    start = document.find(f".//{{{TASK_XML_NAMESPACE}}}StartBoundary")
+    assert start is not None
+    start.text = boundary
+    query.return_value.stdout = ET.tostring(document, encoding="unicode")
+
+    assert scheduler.has_beijing_daily_trigger("12:00") is verified
+
+    query.assert_called_once_with(["/Query", "/TN", scheduler_module.TASK_NAME, "/XML"])
+
+
+@pytest.mark.parametrize("registration", ["weekly", "extra-trigger", "catchup", "missing", "invalid"])
+def test_registered_daily_task_rejects_unverified_registration(
+    registered_daily_task, registration
+) -> None:
+    scheduler, document, query = registered_daily_task
+    namespace = {"t": TASK_XML_NAMESPACE}
+    if registration == "weekly":
+        daily = document.find(".//t:ScheduleByDay", namespace)
+        assert daily is not None
+        daily.tag = f"{{{TASK_XML_NAMESPACE}}}ScheduleByWeek"
+    elif registration == "extra-trigger":
+        triggers = document.find("t:Triggers", namespace)
+        assert triggers is not None
+        ET.SubElement(triggers, f"{{{TASK_XML_NAMESPACE}}}LogonTrigger")
+    elif registration == "catchup":
+        catchup = document.find(".//t:StartWhenAvailable", namespace)
+        assert catchup is not None
+        catchup.text = "true"
+    elif registration == "missing":
+        query.return_value.returncode = 1
+    query.return_value.stdout = (
+        "not xml" if registration == "invalid" else ET.tostring(document, encoding="unicode")
+    )
+
+    assert not scheduler.has_beijing_daily_trigger("12:00")
+
+
+def test_registered_daily_task_accepts_exported_utf16_declaration(registered_daily_task) -> None:
+    scheduler, document, query = registered_daily_task
+    query.return_value.stdout = ET.tostring(
+        document, encoding="utf-16", xml_declaration=True
+    ).decode("utf-16")
+
+    assert scheduler.has_beijing_daily_trigger("12:00")
+
+
+def configured_database(
+    tmp_path, kind: MessageKind = MessageKind.TEXT, *, send_time: str = "09:00"
+) -> Database:
     database = Database(tmp_path / "state.sqlite3")
     database.save_account("account-key", "测试账号")
     database.add_target(
@@ -53,7 +181,7 @@ def configured_database(tmp_path, kind: MessageKind = MessageKind.TEXT) -> Datab
     )
     database.save_plan(
         enabled=True,
-        send_time="09:00",
+        send_time=send_time,
         message_text="测试消息",
         confirmed=True,
         message_kind=kind,
@@ -69,8 +197,7 @@ def configured_database(tmp_path, kind: MessageKind = MessageKind.TEXT) -> Datab
 @pytest.mark.parametrize("kind", list(MessageKind))
 def test_missed_schedule_creates_one_deduplicated_action(tmp_path, kind) -> None:
     database = configured_database(tmp_path, kind)
-    timezone = datetime.now().astimezone().tzinfo
-    now = datetime(2026, 9, 4, 10, 0, tzinfo=timezone)
+    now = datetime(2026, 9, 4, 10, 0, tzinfo=BEIJING_TZ)
     first = detect_missed_schedule(database, now=now)
     second = detect_missed_schedule(database, now=now)
     assert first is not None
@@ -98,10 +225,71 @@ def test_missed_schedule_creates_one_deduplicated_action(tmp_path, kind) -> None
     assert database.list_pending_actions("missed_schedule")[0]["payload"] == action["payload"]
 
 
+@pytest.mark.parametrize("naive_local", [False, True], ids=["aware-pacific", "naive-local"])
+@pytest.mark.parametrize(
+    ("local_time", "candidate_date"),
+    [
+        ("2026-09-04T20:30:00-07:00", "2026-09-04"),
+        ("2026-09-04T21:05:00-07:00", "2026-09-04"),
+        ("2026-09-04T21:05:01-07:00", "2026-09-05"),
+        ("2026-09-04T21:30:00-07:00", "2026-09-05"),
+    ],
+)
+def test_missed_schedule_uses_beijing_calendar_and_grace_boundary(
+    tmp_path, pacific_local_clock, local_time, candidate_date, naive_local
+) -> None:
+    database = configured_database(tmp_path, send_time="12:00")
+    now = pacific_local_clock.fromisoformat(local_time)
+    if naive_local:
+        now = now.replace(tzinfo=None)
+    assert now.date() == date(2026, 9, 4)
+
+    missed = detect_missed_schedule(database, now=now)
+
+    assert missed is not None
+    expected = f"{candidate_date}T12:00:00+08:00"
+    assert missed.scheduled_for == expected
+    action = database.list_pending_actions("missed_schedule")[0]
+    assert action["payload"]["scheduled_for"] == expected
+    assert database.list_batches() == []
+
+
+def test_missed_schedule_default_clock_uses_beijing_date(tmp_path, pacific_local_clock) -> None:
+    database = configured_database(tmp_path, send_time="12:00")
+
+    missed = detect_missed_schedule(database)
+
+    assert missed is not None
+    assert missed.scheduled_for == "2026-09-05T12:00:00+08:00"
+
+
+@pytest.mark.parametrize(
+    ("confirmed_at", "missed_expected"),
+    [
+        ("2026-09-04T20:59:59-07:00", True),
+        ("2026-09-04T21:00:00-07:00", True),
+        ("2026-09-04T21:00:01-07:00", False),
+    ],
+)
+def test_missed_schedule_compares_confirmation_by_instant(
+    tmp_path, confirmed_at, missed_expected
+) -> None:
+    database = configured_database(tmp_path, send_time="12:00")
+    with database.connect(immediate=True) as connection:
+        connection.execute("UPDATE plan SET confirmed_at = ?", (confirmed_at,))
+
+    missed = detect_missed_schedule(
+        database, now=datetime(2026, 9, 5, 12, 30, tzinfo=BEIJING_TZ)
+    )
+
+    assert (missed is not None) is missed_expected
+    if missed is not None:
+        assert missed.scheduled_for == "2026-09-05T12:00:00+08:00"
+
+
 def test_existing_scheduled_batch_is_not_missed(tmp_path) -> None:
     database = configured_database(tmp_path)
-    timezone = datetime.now().astimezone().tzinfo
-    now = datetime(2026, 9, 4, 10, 0, tzinfo=timezone)
+    now = datetime(2026, 9, 4, 10, 0, tzinfo=BEIJING_TZ)
     database.start_batch(
         BatchMode.SCHEDULED,
         target_count=1,

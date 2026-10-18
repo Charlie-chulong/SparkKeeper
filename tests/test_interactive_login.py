@@ -6,10 +6,12 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
+from playwright.async_api import async_playwright
 
 from spark_keeper.automation import browser as browser_module
 from spark_keeper.automation.browser import BrowserSessionFactory
 from spark_keeper.automation.douyin_chat import (
+    CHAT_URL,
     DouyinChatAdapter,
     LoginResult,
     PageState,
@@ -18,6 +20,45 @@ from spark_keeper.automation.douyin_chat import (
 )
 from spark_keeper.automation.errors import AutomationError
 from spark_keeper.models import ErrorCode
+
+
+@pytest.mark.asyncio
+async def test_login_wait_finishes_on_inbox_without_selected_chat() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.route(
+                CHAT_URL,
+                lambda route: route.fulfill(
+                    body='<input placeholder="请输入手机号"><div>扫码登录</div><div>密码登录</div>',
+                    content_type="text/html",
+                ),
+            )
+            login_prompt = asyncio.Event()
+            statuses: list[str] = []
+
+            def status(value: str) -> None:
+                statuses.append(value)
+                if "扫码登录" in value:
+                    login_prompt.set()
+
+            async def finish_scan() -> None:
+                await asyncio.wait_for(login_prompt.wait(), timeout=3)
+                await page.set_content(
+                    '<input data-e2e="searchbar-input" placeholder="搜索">'
+                    '<div class="conversationConversationListwrapper">会话</div>'
+                )
+
+            scan = asyncio.create_task(finish_scan())
+            await asyncio.wait_for(DouyinChatAdapter(page).wait_for_interactive_login(status), 5)
+            await scan
+            assert statuses == [
+                "请在打开的浏览器中使用抖音 App 扫码登录",
+                "登录成功，正在读取账号状态",
+            ]
+        finally:
+            await browser.close()
 
 
 class LoginFactory:

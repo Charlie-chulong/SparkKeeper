@@ -203,7 +203,7 @@ async def test_worker_holds_gate_through_notification_and_exception_cleanup(
         database=Path("unused.sqlite3"), auth_state=Path("unused.bin"),
         ensure_runtime_dirs=lambda: assert_held("directories"),
     )
-    plan = SimpleNamespace(enabled=True, confirmed_at="confirmed")
+    plan = SimpleNamespace(enabled=True, confirmed_at="confirmed", send_time="09:00")
     database = Mock()
     database.recover_inflight_if_idle.side_effect = lambda: assert_held("recovery")
     database.get_plan.return_value = plan
@@ -232,6 +232,11 @@ async def test_worker_holds_gate_through_notification_and_exception_cleanup(
     database.record_event.side_effect = event
     monkeypatch.setattr(worker.AppPaths, "discover", lambda: paths)
     monkeypatch.setattr(worker, "Database", make_database)
+    monkeypatch.setattr(
+        worker.TaskScheduler,
+        "has_beijing_daily_trigger",
+        lambda _scheduler, _send_time: (assert_held("task-check"), True)[1],
+    )
     monkeypatch.setattr(worker, "DpapiJsonStore", Mock())
     monkeypatch.setattr(worker, "BatchService", lambda *_args: SimpleNamespace(run_batch=run_batch))
     monkeypatch.setattr(worker, "scheduled_datetime", lambda *_args: SimpleNamespace(isoformat=lambda **_kw: "2026-09-08T09:00:00"))

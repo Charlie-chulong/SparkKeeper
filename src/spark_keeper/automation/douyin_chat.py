@@ -417,7 +417,10 @@ class DouyinChatAdapter:
                     const r = element.getBoundingClientRect();
                     return r.top > window.innerHeight * 0.45;
                 });
-                if (chatSearch || composer) return 'ready';
+                const inbox = [...document.querySelectorAll(
+                    '.conversationConversationListwrapper, .conversationConversationItemwrapper'
+                )].some(visible);
+                if (chatSearch || composer || inbox) return 'ready';
                 return 'not_ready';
             }"""
         )

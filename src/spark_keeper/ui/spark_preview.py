@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..clock import display_beijing_time
 from ..models import SparkContact, SparkScanResult, SparkScanStatus, SparkState
 from . import theme
 
@@ -79,7 +80,7 @@ class SparkImportPreview(QDialog):
             "默认勾选身份可靠的新有效火花（含灰色）和待恢复好友；其他火花状态可自行勾选。"
             "\n仅保存、不发送；新好友默认停用，既有好友保持原状态。请只启用获授权好友。"
             "\n所有行可选择；选中群聊或身份未确认项时会明确阻止导入，不会悄悄跳过。"
-            f"\n扫描时间：{scan.scanned_at}"
+            f"\n扫描时间（北京时间）：{display_beijing_time(scan.scanned_at)}"
             + (f"\n{scan.detail}" if scan.detail else "")
             + (
                 "\n本次没有满足导入身份条件的好友：需要明确单聊及可靠稳定身份；"

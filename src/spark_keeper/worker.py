@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import datetime
 
 from .automation.service import BatchService
+from .clock import now_beijing
 from .database import Database
 from .dpapi import DpapiJsonStore
 from .logging_safe import format_error
@@ -18,7 +18,7 @@ from .maintenance import (
 from .models import BatchMode, BatchStatus, ErrorCode
 from .notifications import notify_batch
 from .paths import AppPaths
-from .scheduler import scheduled_datetime
+from .scheduler import SchedulerError, TaskScheduler, scheduled_datetime
 
 _MAINTENANCE_WAIT_SECONDS = 5.0
 
@@ -79,13 +79,25 @@ async def _run_scheduled_under_maintenance() -> int:
     if not plan.enabled or not plan.confirmed_at:
         database.record_event("INFO", "schedule_disabled", "每日计划未启用，本次任务跳过")
         return 0
+    registration_error = ""
+    try:
+        beijing_task = TaskScheduler(paths).has_beijing_daily_trigger(plan.send_time)
+    except SchedulerError as exc:
+        beijing_task = False
+        registration_error = f"\n{format_error(exc)}"
+    if not beijing_task:
+        database.record_event(
+            "WARNING",
+            "schedule_timezone_unverified",
+            "无法确认已注册任务为北京时间每日计划，本次任务跳过；"
+            f"请打开应用重新保存每日计划。{registration_error}",
+        )
+        return 0
     service = BatchService(
         database,
         DpapiJsonStore(paths.auth_state),
     )
-    scheduled_for = scheduled_datetime(plan, datetime.now().astimezone().date()).isoformat(
-        timespec="seconds"
-    )
+    scheduled_for = scheduled_datetime(plan, now_beijing().date()).isoformat(timespec="seconds")
     try:
         result = await service.run_batch(
             BatchMode.SCHEDULED,

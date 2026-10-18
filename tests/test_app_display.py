@@ -323,6 +323,64 @@ def history_row():
     }
 
 
+@pytest.mark.parametrize(
+    ("stored_time", "displayed_time"),
+    [
+        ("2026-09-04T18:30:45-07:00", "2026-09-05 09:30:45"),
+        ("2026-09-05T09:30:45+08:00", "2026-09-05 09:30:45"),
+        (
+            "2026-09-04T18:30:45",
+            "2026-09-04T18:30:45（原记录未标注时区）",
+        ),
+    ],
+)
+def test_history_and_logs_display_beijing_without_rewriting_records(
+    app, monkeypatch, stored_time, displayed_time
+):
+    monkeypatch.setattr("spark_keeper.database.now_iso", lambda: stored_time)
+    monkeypatch.setattr(app.service, "run_batch", AsyncMock())
+    account = app.database.save_account("display-fixture", "本地显示测试账号")
+    saved = save_targets(app, count=1)[0]
+    batch_id = app.database.start_batch(BatchMode.SCHEDULED, target_count=1)
+    reservation = app.database.reserve_attempt(
+        batch_id=batch_id,
+        account_key=account.platform_user_id,
+        target_id=saved.id,
+        run_date="2026-09-05",
+        message_text="仅本地记录，不执行发送",
+        manual_override=False,
+    )
+    app.database.mark_attempt_triggered(reservation.attempt_id)
+    app.database.finish_attempt(reservation.attempt_id, AttemptStatus.UNKNOWN)
+    app.database.create_pending_action(
+        "unknown_send",
+        f"unknown:{reservation.attempt_id}",
+        {"attempt_id": reservation.attempt_id, "batch_id": batch_id},
+    )
+    app.database.record_event("WARNING", "send_unknown", "仅本地显示记录，不执行发送")
+    history_before = app.database.list_history()
+    events_before = app.database.list_events()
+    attempt_before = app.database.get_attempt(reservation.attempt_id)
+    pending_before = app.database.list_pending_actions()
+    assert history_before[0]["started_at"] == stored_time
+    assert events_before[0]["created_at"] == stored_time
+
+    app._refresh_history()
+    app._refresh_logs()
+
+    assert app.history_tree.headerItem().text(0) == "时间（北京时间）"
+    assert app.logs_tree.headerItem().text(0) == "时间（北京时间）"
+    assert item(app.history_tree, reservation.attempt_id).text(0) == displayed_time
+    assert item(app.logs_tree, str(events_before[0]["id"])).text(0) == displayed_time
+    assert app.database.list_history() == history_before
+    assert app.database.list_events() == events_before
+    assert app.database.get_attempt(reservation.attempt_id) == attempt_before
+    assert app.database.list_pending_actions() == pending_before
+    assert app.database.get_account() == account
+    assert app.database.list_targets() == [saved]
+    app.service.run_batch.assert_not_called()
+
+
 @pytest.mark.parametrize("page", ["friends", "history", "logs"])
 def test_identical_rows_do_not_rebuild_or_mutate_tree(app, page):
     if page == "friends":
@@ -1253,6 +1311,49 @@ def test_native_plan_save_and_reload_preserve_hidden_text_draft(app, monkeypatch
     assert app._current_message() == "旧文本"
 
 
+@pytest.mark.parametrize("size", [(940, 650), (1120, 780)])
+def test_daily_plan_labels_and_confirmation_explicitly_use_beijing_time(app, monkeypatch, size):
+    save_targets(app, count=1)
+    previous = app.database.get_plan()
+    confirm = Mock(return_value=False)
+    monkeypatch.setattr(theme, "confirm", confirm)
+    monkeypatch.setattr(app, "_start_async", Mock())
+    monkeypatch.setattr(app, "_persist_plan", Mock())
+    monkeypatch.setattr(app.scheduler, "sync", Mock())
+    monkeypatch.setattr(app.service, "run_batch", AsyncMock())
+    app.resize(*size)
+    show_app(app)
+
+    label = app.schedule_time_label
+    field = app.schedule_time_input
+    save_button = app.findChild(QPushButton, "btn-save-plan")
+    assert label.text() == "每天（北京时间）"
+    assert label.buddy() is field
+    assert field.accessibleName() == "每日发送时间（北京时间）"
+    assert "UTC+08:00" in field.toolTip()
+    assert (app.width(), app.height()) == size
+    assert label.width() >= label.fontMetrics().horizontalAdvance(label.text())
+    for widget in (label, field, save_button):
+        assert widget.isVisible()
+        assert widget.parentWidget().contentsRect().contains(widget.geometry())
+    assert label.geometry().right() < field.geometry().left()
+    assert field.geometry().right() < save_button.geometry().left()
+
+    app.schedule_enabled.setChecked(True)
+    field.setText("09:30")
+    app._save_plan()
+
+    confirm.assert_called_once()
+    assert "每天 09:30（北京时间，UTC+08:00）自动发送" in confirm.call_args.args[2]
+    assert "不随电脑时区变化" in confirm.call_args.args[2]
+    assert app.database.get_plan() == previous
+    assert not previous.enabled
+    app._start_async.assert_not_called()
+    app._persist_plan.assert_not_called()
+    app.scheduler.sync.assert_not_called()
+    app.service.run_batch.assert_not_called()
+
+
 @pytest.mark.parametrize("previous_kind", list(MessageKind))
 def test_plan_scheduler_failure_restores_previous_message_kind(app, monkeypatch, previous_kind):
     previous = app.database.save_plan(
@@ -1374,6 +1475,50 @@ async def test_validate_uses_current_unsaved_message_without_saving(app, monkeyp
     app._persist_plan.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("stored_time", "displayed_time"),
+    [
+        ("2026-09-04T18:30:45-07:00", "2026-09-05 09:30:45"),
+        (
+            "2026-09-04T18:30:45",
+            "2026-09-04T18:30:45（原记录未标注时区）",
+        ),
+    ],
+)
+def test_missed_schedule_preview_displays_beijing_without_changing_payload(
+    app, monkeypatch, stored_time, displayed_time
+):
+    saved = save_targets(app, count=1)[0]
+    payload = {
+        "scheduled_for": stored_time,
+        "target_ids": [saved.id],
+        "target_count": 1,
+        "message_kind": "text",
+        "message_text": "仅本地预览，不执行发送",
+    }
+    action_id = app.database.create_pending_action("missed_schedule", "missed:display", payload)
+    pending_before = app.database.list_pending_actions()
+    confirm = Mock(return_value=True)
+    monkeypatch.setattr(theme, "confirm", confirm)
+    monkeypatch.setattr(app_module, "detect_missed_schedule", Mock())
+    monkeypatch.setattr(app, "_run_missed_action", Mock())
+    monkeypatch.setattr(app, "_start_async", Mock())
+    monkeypatch.setattr(app.service, "run_batch", AsyncMock())
+
+    app._check_pending_actions()
+
+    confirm.assert_called_once()
+    assert (
+        f"检测到错过的每日任务（北京时间）：{displayed_time}"
+        in confirm.call_args.args[2]
+    )
+    app._run_missed_action.assert_called_once_with(action_id, payload)
+    assert app.database.list_pending_actions() == pending_before
+    assert pending_before[0]["payload"]["scheduled_for"] == stored_time
+    app._start_async.assert_not_called()
+    app.service.run_batch.assert_not_called()
+
+
 @pytest.mark.parametrize("payload_kind", [None, "text", "spark_sticker"])
 async def test_missed_action_uses_payload_kind_not_current_mode(app, monkeypatch, payload_kind):
     app.sticker_mode_button.setChecked(payload_kind != "spark_sticker")
@@ -1391,6 +1536,7 @@ async def test_missed_action_uses_payload_kind_not_current_mode(app, monkeypatch
     app._run_missed_action("missed", payload)
     await app._start_async.call_args.args[1]()
     kwargs = app.service.run_batch.call_args.kwargs
+    assert kwargs["scheduled_for"] == payload["scheduled_for"]
     assert kwargs["message_kind_override"] == MessageKind(payload_kind or "text")
     assert kwargs["message_text_override"] == (
         "" if payload_kind == "spark_sticker" else "错过任务的文本"
@@ -1719,6 +1865,9 @@ def test_login_cancel_reaches_worker_and_is_not_success_or_error(app, monkeypatc
         assert "取消登录" in confirm.call_args.args[2]
     assert app.cancel_event.is_set()
     assert "取消登录" in app.status_label.text()
+    assert not app.cancel_button.isEnabled()
+    assert app.cancel_button.text() == "正在取消登录…"
+    assert "只关闭本次由助手打开的浏览器窗口" in app.status_label.text()
     wait_until(lambda: (app._poll_messages(), not app.busy)[1])
     assert exited.is_set()
     assert app.status_label.text() == "登录已取消"

@@ -3,14 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from spark_keeper.clock import BEIJING_TZ
 from spark_keeper.database import (
     Database,
     DatabaseCompatibilityError,
     DatabaseInitializationError,
+    today_iso,
 )
 from spark_keeper.identity import canonical_profile_url, identities_match, identity_key
 from spark_keeper.models import AttemptStatus, BatchMode, BatchStatus, FriendCandidate, MessageKind
@@ -20,6 +22,24 @@ from spark_keeper.mutex import AlreadyRunningError, WindowsTaskMutex
 @pytest.fixture(autouse=True)
 def fixed_send_day(monkeypatch):
     monkeypatch.setattr("spark_keeper.database.today_iso", lambda: "2026-09-04")
+
+
+@pytest.fixture
+def previous_machine_day(monkeypatch, fixed_send_day):
+    machine_zone = timezone(timedelta(hours=-7))
+
+    class MachineDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 17, 17, 30, tzinfo=machine_zone).astimezone(tz)
+
+        def astimezone(self, tz=None):
+            return super().astimezone(tz or machine_zone)
+
+    monkeypatch.setattr("spark_keeper.clock.datetime", MachineDateTime)
+    monkeypatch.setattr("spark_keeper.database.datetime", MachineDateTime)
+    monkeypatch.setattr("spark_keeper.database.today_iso", today_iso)
+    return MachineDateTime.now()
 
 
 def candidate(key: str, name: str = "测试好友") -> FriendCandidate:
@@ -46,6 +66,107 @@ def test_initialize_is_idempotent(tmp_path) -> None:
     assert second.get_meta("schema_version") == "4"
     assert (first.get_plan().delay_min_seconds, first.get_plan().delay_max_seconds) == (3, 8)
     assert not (tmp_path / "backups").exists()
+
+
+def test_new_timestamps_and_send_day_use_beijing_not_machine_zone(
+    tmp_path, previous_machine_day
+) -> None:
+    assert previous_machine_day.date().isoformat() == "2026-10-17"
+    assert previous_machine_day.astimezone(BEIJING_TZ).date().isoformat() == "2026-10-18"
+    assert today_iso() == "2026-10-18"
+    timestamp = "2026-10-18T08:30:00+08:00"
+    database = Database(tmp_path / "state.sqlite3")
+    initial_plan = database.get_plan()
+    assert initial_plan.updated_at == timestamp
+    assert not initial_plan.enabled
+    assert initial_plan.confirmed_at is None
+    account, target = setup_target(database)
+    batch_id = database.start_batch(BatchMode.MANUAL, target_count=1)
+    reservation = database.reserve_attempt(
+        batch_id=batch_id,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date=today_iso(),
+        message_text="测试消息",
+        manual_override=False,
+    )
+    assert database.mark_attempt_triggered(reservation.attempt_id)
+    database.finish_attempt(reservation.attempt_id, AttemptStatus.SUCCESS)
+    database.finish_batch(batch_id, BatchStatus.SUCCESS)
+    database.record_event("INFO", "test", "北京时间")
+    action_id = database.create_pending_action("login_required", "login:2026-10-18", {})
+    database.resolve_pending_action(action_id, "completed")
+
+    columns_by_table = {
+        "account": ("logged_in_at",),
+        "targets": ("confirmed_at",),
+        "plan": ("confirmed_at", "updated_at"),
+        "batch_runs": ("started_at", "finished_at"),
+        "send_attempts": ("started_at", "triggered_at", "finished_at"),
+        "daily_send_guards": ("created_at", "updated_at"),
+        "events": ("created_at",),
+        "pending_actions": ("created_at", "resolved_at"),
+    }
+    with database.connect() as connection:
+        for table, columns in columns_by_table.items():
+            row = connection.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchone()
+            assert tuple(row) == (timestamp,) * len(columns)
+    assert database.get_attempt(reservation.attempt_id)["run_date"] == "2026-10-18"
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-10-18")
+    assert not database.has_daily_guard(account.platform_user_id, target.id, "2026-10-17")
+
+
+def test_history_orders_legacy_offsets_by_instant_and_breaks_ties_by_rowid(tmp_path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch_id = database.start_batch(BatchMode.MANUAL, target_count=2)
+    attempt_ids = [
+        database.record_terminal_attempt(
+            batch_id=batch_id,
+            account_key=account.platform_user_id,
+            target_id=target.id,
+            run_date="2026-10-18",
+            message_text="测试消息",
+            status=AttemptStatus.FAILED,
+        )
+        for _ in range(2)
+    ]
+    with database.connect(immediate=True) as connection:
+        connection.execute(
+            "UPDATE send_attempts SET started_at = ? WHERE id = ?",
+            ("2026-10-17T18:30:00-07:00", attempt_ids[0]),
+        )
+        connection.execute(
+            "UPDATE send_attempts SET started_at = ? WHERE id = ?",
+            ("2026-10-18T09:00:00+08:00", attempt_ids[1]),
+        )
+    assert [row["id"] for row in database.list_history()] == attempt_ids
+    with database.connect(immediate=True) as connection:
+        connection.execute(
+            "UPDATE send_attempts SET started_at = ? WHERE id = ?",
+            ("2026-10-17T18:00:00-07:00", attempt_ids[0]),
+        )
+    assert [row["id"] for row in database.list_history()] == attempt_ids[::-1]
+
+
+@pytest.mark.parametrize(
+    ("scheduled_for", "matching_day", "different_day"),
+    [
+        ("2026-10-17T18:00:00-07:00", "2026-10-18", "2026-10-17"),
+        ("2026-10-17T17:00:00Z", "2026-10-18", "2026-10-17"),
+        ("2026-10-18T09:00:00+08:00", "2026-10-18", "2026-10-17"),
+        ("2026-10-17T23:00:00", "2026-10-17", "2026-10-18"),
+    ],
+)
+def test_scheduled_batch_lookup_normalizes_only_aware_legacy_dates(
+    tmp_path, scheduled_for, matching_day, different_day
+) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.start_batch(BatchMode.SCHEDULED, target_count=0, scheduled_for=scheduled_for)
+
+    assert database.scheduled_batch_exists(matching_day)
+    assert not database.scheduled_batch_exists(different_day)
+    assert database.list_batches()[0]["scheduled_for"] == scheduled_for
 
 
 def test_v1_database_migrates_inter_target_delay_defaults(tmp_path) -> None:
@@ -135,6 +256,124 @@ def test_success_creates_daily_guard_and_blocks_duplicate(tmp_path) -> None:
     assert database.get_attempt(second.attempt_id)["status"] == AttemptStatus.DUPLICATE.value
 
 
+@pytest.mark.parametrize(
+    "legacy_started_at", ["2026-10-17T17:30:00-07:00", "2026-10-17T08:30:00-07:00"]
+)
+@pytest.mark.parametrize(
+    "legacy_status", [AttemptStatus.SENDING, AttemptStatus.SUCCESS, AttemptStatus.UNKNOWN]
+)
+def test_legacy_local_day_guard_protects_beijing_day_without_rewriting(
+    tmp_path, previous_machine_day, legacy_status, legacy_started_at
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    database = Database(path)
+    account, target = setup_target(database)
+    batch_id = database.start_batch(BatchMode.MANUAL, target_count=1)
+    legacy = database.reserve_attempt(
+        batch_id=batch_id,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-10-17",
+        message_text="旧消息",
+        manual_override=False,
+    )
+    if legacy_status is not AttemptStatus.SENDING:
+        database.finish_attempt(legacy.attempt_id, legacy_status)
+    legacy_timestamp = "2026-10-17T17:30:00-07:00"
+    with database.connect(immediate=True) as connection:
+        connection.execute(
+            "UPDATE send_attempts SET started_at = ?, triggered_at = ?, finished_at = ? WHERE id = ?",
+            (
+                legacy_started_at,
+                legacy_timestamp,
+                None if legacy_status is AttemptStatus.SENDING else legacy_timestamp,
+                legacy.attempt_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE daily_send_guards SET created_at = ?, updated_at = ?",
+            (legacy_timestamp, legacy_timestamp),
+        )
+        original_guard = dict(connection.execute("SELECT * FROM daily_send_guards").fetchone())
+    original_attempt = database.get_attempt(legacy.attempt_id)
+
+    database = Database(path)
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-10-17")
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-10-18")
+    assert not database.has_daily_guard("another-account", target.id, "2026-10-18")
+    assert not database.has_daily_guard(account.platform_user_id, target.id, "2026-10-19")
+    next_batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    duplicate = database.reserve_attempt(
+        batch_id=next_batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-10-18",
+        message_text="新消息",
+        manual_override=False,
+    )
+    assert not duplicate.allowed
+    assert duplicate.conflicting_attempt_id == legacy.attempt_id
+    assert database.get_attempt(duplicate.attempt_id)["override_of"] == legacy.attempt_id
+
+    override_batch = database.start_batch(BatchMode.MANUAL, target_count=1)
+    override = database.reserve_attempt(
+        batch_id=override_batch,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-10-18",
+        message_text="人工确认补发",
+        manual_override=True,
+    )
+    assert override.allowed
+    assert override.conflicting_attempt_id == legacy.attempt_id
+    assert database.mark_attempt_triggered(override.attempt_id)
+    database.finish_attempt(override.attempt_id, AttemptStatus.SUCCESS)
+    assert database.get_attempt(legacy.attempt_id) == original_attempt
+    with database.connect() as connection:
+        guards = [dict(row) for row in connection.execute("SELECT * FROM daily_send_guards")]
+    assert guards == [original_guard]
+
+
+def test_triggering_legacy_reservation_keeps_its_original_guard_key(
+    tmp_path, previous_machine_day
+) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    account, target = setup_target(database)
+    batch_id = database.start_batch(BatchMode.MANUAL, target_count=1)
+    legacy = database.reserve_attempt(
+        batch_id=batch_id,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-10-17",
+        message_text="测试消息",
+        manual_override=False,
+    )
+    legacy_timestamp = "2026-10-17T17:30:00-07:00"
+    with database.connect(immediate=True) as connection:
+        connection.execute(
+            "UPDATE send_attempts SET started_at = ? WHERE id = ?",
+            (legacy_timestamp, legacy.attempt_id),
+        )
+        connection.execute(
+            "UPDATE daily_send_guards SET created_at = ?, updated_at = ?",
+            (legacy_timestamp, legacy_timestamp),
+        )
+    assert database.mark_attempt_triggered(legacy.attempt_id)
+    database.finish_attempt(legacy.attempt_id, AttemptStatus.SUCCESS)
+
+    attempt = database.get_attempt(legacy.attempt_id)
+    assert attempt["run_date"] == "2026-10-18"
+    assert attempt["started_at"] == legacy_timestamp
+    with database.connect() as connection:
+        guards = list(connection.execute("SELECT * FROM daily_send_guards"))
+    assert len(guards) == 1
+    assert guards[0]["run_date"] == "2026-10-17"
+    assert guards[0]["source_attempt_id"] == legacy.attempt_id
+    assert guards[0]["created_at"] == legacy_timestamp
+    assert guards[0]["updated_at"] == "2026-10-18T08:30:00+08:00"
+    assert database.has_daily_guard(account.platform_user_id, target.id, "2026-10-18")
+
+
 def test_manual_override_is_audited_without_removing_original_guard(tmp_path) -> None:
     database = Database(tmp_path / "state.sqlite3")
     account, target = setup_target(database)
@@ -209,6 +448,75 @@ def test_pending_action_is_deduplicated(tmp_path) -> None:
     second = database.create_pending_action("login_required", "login:today", {"reason": "again"})
     assert first == second
     assert len(database.list_pending_actions()) == 1
+
+
+@pytest.mark.parametrize(
+    "legacy_timestamp",
+    ["2026-10-17T17:30:00-07:00", "2026-10-18T08:30:00"],
+)
+def test_cleanup_preserves_current_beijing_day_legacy_records_without_rewriting(
+    tmp_path, previous_machine_day, legacy_timestamp
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    database = Database(path)
+    account, target = setup_target(database)
+    batch_id = database.start_batch(BatchMode.MANUAL, target_count=1)
+    legacy = database.reserve_attempt(
+        batch_id=batch_id,
+        account_key=account.platform_user_id,
+        target_id=target.id,
+        run_date="2026-10-17",
+        message_text="旧消息",
+        manual_override=False,
+    )
+    database.finish_attempt(legacy.attempt_id, AttemptStatus.SUCCESS)
+    database.finish_batch(batch_id, BatchStatus.SUCCESS)
+    orphan_batch = database.start_batch(BatchMode.MANUAL, target_count=0)
+    database.finish_batch(orphan_batch, BatchStatus.SUCCESS)
+    database.record_event("INFO", "test", "旧时区记录")
+    action_id = database.create_pending_action("login_required", "login:2026-10-17", {})
+    database.resolve_pending_action(action_id, "completed")
+    columns_by_table = {
+        "account": ("logged_in_at",),
+        "targets": ("confirmed_at",),
+        "plan": ("confirmed_at", "updated_at"),
+        "batch_runs": ("started_at", "finished_at"),
+        "send_attempts": ("started_at", "triggered_at", "finished_at"),
+        "daily_send_guards": ("created_at", "updated_at"),
+        "events": ("created_at",),
+        "pending_actions": ("created_at", "resolved_at"),
+    }
+    with database.connect(immediate=True) as connection:
+        for table, columns in columns_by_table.items():
+            assignments = ", ".join(f"{column} = ?" for column in columns)
+            connection.execute(
+                f"UPDATE {table} SET {assignments}", (legacy_timestamp,) * len(columns)
+            )
+        connection.execute(
+            "UPDATE send_attempts SET started_at = ?", ("2026-10-17T08:30:00-07:00",)
+        )
+        original_rows = {
+            table: list(connection.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+            for table in columns_by_table
+        }
+
+    database = Database(path)
+    assert database.clear_history_preserving_today() == {
+        "events": 0,
+        "attempts": 0,
+        "batches": 0,
+        "pending": 0,
+    }
+    with database.connect() as connection:
+        for table, rows in original_rows.items():
+            assert list(connection.execute(f"SELECT * FROM {table} ORDER BY rowid")) == rows
+    assert database.clear_history_preserving_today(date(2026, 10, 19)) == {
+        "events": 1,
+        "attempts": 1,
+        "batches": 2,
+        "pending": 1,
+    }
+    assert database.count_rows("daily_send_guards") == 0
 
 
 def test_clear_history_preserves_current_day_guard(tmp_path) -> None:

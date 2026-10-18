@@ -33,6 +33,24 @@ async def test_page_classifier_distinguishes_login_ready_and_verification() -> N
             )
             assert await DouyinChatAdapter(page).classify_page() is PageState.LOGIN_REQUIRED
 
+            # The signed-in chat sidebar exists even with no conversation selected.
+            # Its search field may share the global search's data-e2e.
+            await page.set_content(
+                '<input placeholder="搜索" data-e2e="searchbar-input">'
+                '<div class="conversationConversationListwrapper">好友会话</div>'
+            )
+            assert await DouyinChatAdapter(page).classify_page() is PageState.READY
+
+            await page.set_content('<input placeholder="搜索" data-e2e="searchbar-input">')
+            assert await DouyinChatAdapter(page).classify_page() is PageState.NOT_READY
+
+            await page.set_content(
+                '<input placeholder="请输入手机号"><div>扫码登录</div>'
+                '<div>密码登录</div>'
+                '<div class="conversationConversationListwrapper">旧会话</div>'
+            )
+            assert await DouyinChatAdapter(page).classify_page() is PageState.LOGIN_REQUIRED
+
             await page.set_content("<div>请完成安全验证</div>")
             assert await DouyinChatAdapter(page).classify_page() is PageState.HUMAN_VERIFICATION
 

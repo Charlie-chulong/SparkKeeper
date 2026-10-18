@@ -5,6 +5,7 @@ import hashlib
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from spark_keeper.automation.errors import (
     TargetNotFound,
 )
 from spark_keeper.automation.service import BatchService, wait_for_delay
+from spark_keeper.automation.spark_scan import scan_contacts
 from spark_keeper.database import Database, today_iso
 from spark_keeper.dpapi import DpapiJsonStore
 from spark_keeper.identity import identity_key
@@ -29,10 +31,28 @@ from spark_keeper.models import (
     ErrorCode,
     FriendCandidate,
     MessageKind,
+    SparkScanStatus,
 )
 
 ACCOUNT_PROFILE = "https://www.douyin.com/user/test-account"
 ACCOUNT_KEY = hashlib.sha256(ACCOUNT_PROFILE.encode("utf-8")).hexdigest()
+
+
+@pytest.fixture
+def previous_machine_day(monkeypatch):
+    machine_zone = timezone(timedelta(hours=-7))
+
+    class MachineDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 17, 17, 30, tzinfo=machine_zone).astimezone(tz)
+
+        def astimezone(self, tz=None):
+            return super().astimezone(tz or machine_zone)
+
+    monkeypatch.setattr("spark_keeper.clock.datetime", MachineDateTime)
+    monkeypatch.setattr("spark_keeper.database.datetime", MachineDateTime)
+    return MachineDateTime.now()
 
 
 class IdentityPage:
@@ -115,6 +135,52 @@ def setup_service(tmp_path) -> tuple[BatchService, Database]:
     service = BatchService(database, state, delay_sampler=lambda _minimum, _maximum: 0.0)
     service.browser_factory = FakeFactory()
     return service, database
+
+
+@pytest.mark.asyncio
+async def test_batch_guard_and_login_required_key_use_beijing_not_machine_day(
+    tmp_path, monkeypatch, previous_machine_day
+) -> None:
+    assert previous_machine_day.date().isoformat() == "2026-10-17"
+    service, database = setup_service(tmp_path)
+    failed_target, successful_target = database.list_targets()
+    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", ContinuingAdapter)
+
+    sent = await service.run_batch(BatchMode.MANUAL, target_ids=[successful_target.id])
+    duplicate = await service.run_batch(
+        BatchMode.SCHEDULED, target_ids=[successful_target.id]
+    )
+    assert sent.results[0].status is AttemptStatus.SUCCESS
+    assert duplicate.results[0].status is AttemptStatus.DUPLICATE
+    assert database.has_daily_guard(ACCOUNT_KEY, successful_target.id, "2026-10-18")
+    assert not database.has_daily_guard(ACCOUNT_KEY, successful_target.id, "2026-10-17")
+    attempt = database.get_attempt(sent.results[0].attempt_id)
+    assert attempt["run_date"] == "2026-10-18"
+    assert attempt["started_at"] == "2026-10-18T08:30:00+08:00"
+
+    monkeypatch.setattr("spark_keeper.automation.service.DouyinChatAdapter", FatalAdapter)
+    for _ in range(2):
+        failed = await service.run_batch(BatchMode.MANUAL, target_ids=[failed_target.id])
+        assert failed.error_code is ErrorCode.AUTHENTICATION_REQUIRED
+    actions = database.list_pending_actions("login_required")
+    assert len(actions) == 1
+    assert actions[0]["dedupe_key"] == "login:2026-10-18"
+    assert actions[0]["created_at"] == "2026-10-18T08:30:00+08:00"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spark_scan_records_beijing_timestamp(
+    tmp_path, previous_machine_day
+) -> None:
+    _, database = setup_service(tmp_path)
+    cancel = threading.Event()
+    cancel.set()
+
+    result = await scan_contacts(SimpleNamespace(), database.get_account(), cancel=cancel)
+
+    assert result.status is SparkScanStatus.CANCELLED
+    assert result.scanned_at == "2026-10-18T08:30:00+08:00"
+    assert result.account_logged_in_at == database.get_account().logged_in_at
 
 
 @pytest.mark.asyncio

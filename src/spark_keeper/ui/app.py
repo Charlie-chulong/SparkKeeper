@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 from .. import APP_NAME, __version__
 from ..automation.errors import AutomationError
 from ..automation.service import BatchService
+from ..clock import display_beijing_time
 from ..database import Database, today_iso
 from ..display_labels import (
     category_label,
@@ -572,7 +573,7 @@ class SparkKeeperApp(QMainWindow):
         schedule = theme.make_card(
             page,
             title="每日计划与发送节奏",
-            description="到点自动执行；手动与定时发送均在好友间随机等待。等待不能保证避免平台限制。",
+            description="按北京时间（UTC+08:00）到点自动执行，不随电脑时区变化；好友间随机等待不能保证避免平台限制。",
         )
         right.addWidget(schedule)
         self.scheduler_chip = theme.make_chip(schedule, "系统任务未创建")
@@ -581,8 +582,12 @@ class SparkKeeperApp(QMainWindow):
         self.schedule_enabled = QCheckBox("启用")
         self.schedule_enabled.setObjectName("check-schedule-enabled")
         row.addWidget(self.schedule_enabled)
-        self._label(row, "每天")
+        self.schedule_time_label = self._label(row, "每天（北京时间）")
+        self.schedule_time_label.setWordWrap(False)
         self.schedule_time_input = self._input(row, "09:00", name="entry-schedule-time", width=68)
+        self.schedule_time_label.setBuddy(self.schedule_time_input)
+        self.schedule_time_input.setAccessibleName("每日发送时间（北京时间）")
+        self.schedule_time_input.setToolTip("北京时间（UTC+08:00），不随电脑时区变化。")
         row.addStretch()
         self._button(
             row, "保存计划", self._save_plan, name="btn-save-plan", variant="primary", task=True
@@ -724,11 +729,11 @@ class SparkKeeperApp(QMainWindow):
         row = self._row(layout)
         self._button(row, "刷新", self._refresh_history, name="btn-refresh-history")
         self._label(
-            row, "清理仅删除今天以前的记录；今天的防重复依据会保留。", muted=True, stretch=1
+            row, "清理仅删除北京时间今天以前的记录；今天的防重复依据会保留。", muted=True, stretch=1
         )
         self._button(
             row,
-            "清理今天以前的历史",
+            "清理北京时间今天以前的历史",
             self._clear_history,
             name="btn-clear-history",
             variant="danger",
@@ -741,9 +746,10 @@ class SparkKeeperApp(QMainWindow):
         )
         layout.addWidget(card, 1)
         self.history_tree = theme.make_tree(
-            card, ("时间", "好友", "结果", "模式", "人工覆盖", "错误分类", "内容类型")
+            card, ("时间（北京时间）", "好友", "结果", "模式", "人工覆盖", "错误分类", "内容类型")
         )
         self.history_tree.setObjectName("tree-history")
+        self.history_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         card.layout().addWidget(self.history_tree, 1)
         self.history_hint = self._label(
             card.layout(), "暂无发送历史；手动、定时或补发尝试都会记录。", muted=True
@@ -771,8 +777,9 @@ class SparkKeeperApp(QMainWindow):
             page, title="事件列表", description="选中事件查看完整原文；失败截图与跟踪记录默认关闭。"
         )
         layout.addWidget(card, 1)
-        self.logs_tree = theme.make_tree(card, ("时间", "级别", "目标", "分类", "内容"))
+        self.logs_tree = theme.make_tree(card, ("时间（北京时间）", "级别", "目标", "分类", "内容"))
         self.logs_tree.setObjectName("tree-logs")
+        self.logs_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         card.layout().addWidget(self.logs_tree, 1)
         self.logs_tree.itemSelectionChanged.connect(self._show_log_message)
         self.logs_hint = self._label(
@@ -1222,7 +1229,7 @@ class SparkKeeperApp(QMainWindow):
                 (
                     str(row["id"]),
                     (
-                        row["started_at"],
+                        display_beijing_time(str(row["started_at"])),
                         row["target_name"],
                         status_label(str(row["status"])),
                         mode_label(str(row["mode"])),
@@ -1252,7 +1259,7 @@ class SparkKeeperApp(QMainWindow):
                 (
                     str(row["id"]),
                     (
-                        row["created_at"],
+                        display_beijing_time(str(row["created_at"])),
                         level_label(str(row["level"])),
                         target_label(row["target_alias"]) if row["target_alias"] else "—",
                         category_label(str(row["category"])),
@@ -1713,7 +1720,7 @@ class SparkKeeperApp(QMainWindow):
             return
         if inputs.enabled:
             content = self._message_preview(inputs.message_kind, message)
-            preview = f"每天 {inputs.send_time} 自动发送\n目标：{len(targets)} 位启用好友\n好友间随机等待：{delay_min_seconds}–{delay_max_seconds} 秒\n{content}\n\n保存后到点无需再次确认，是否继续？"
+            preview = f"每天 {inputs.send_time}（北京时间，UTC+08:00）自动发送\n不随电脑时区变化。\n目标：{len(targets)} 位启用好友\n好友间随机等待：{delay_min_seconds}–{delay_max_seconds} 秒\n{content}\n\n保存后到点无需再次确认，是否继续？"
             if not targets:
                 theme.show_message(
                     self, APP_NAME, "启用计划前至少需要一位好友。", icon=QMessageBox.Icon.Warning
@@ -1797,7 +1804,7 @@ class SparkKeeperApp(QMainWindow):
             if not theme.confirm(
                 self,
                 APP_NAME,
-                f"以下好友今天已有成功或结果不确定的记录：\n{duplicate_names}\n\n再次发送可能产生重复消息。确定人工覆盖？",
+                f"以下好友在北京时间今天已有成功或结果不确定的记录：\n{duplicate_names}\n\n再次发送可能产生重复消息。确定人工覆盖？",
             ):
                 return
             overrides = duplicates
@@ -1839,7 +1846,7 @@ class SparkKeeperApp(QMainWindow):
     def _clear_history(self) -> None:
         if self.busy or self._closed:
             return
-        if not theme.confirm(self, APP_NAME, "清理今天以前的历史和日志？今天的防重复依据会保留。"):
+        if not theme.confirm(self, APP_NAME, "清理北京时间今天以前的历史和日志？今天的防重复依据会保留。"):
             return
         counts = self.database.clear_history_preserving_today()
         self._refresh_history()
@@ -1913,7 +1920,12 @@ class SparkKeeperApp(QMainWindow):
     def _cancel_current(self) -> None:
         self.cancel_event.set()
         if self._login_running:
-            self._set_status("已请求取消登录；请等待浏览器安全关闭", "warn")
+            self.cancel_button.setEnabled(False)
+            self.cancel_button.setText("正在取消登录…")
+            self._set_status(
+                "已请求取消登录；若浏览器未自行关闭，请只关闭本次由助手打开的浏览器窗口",
+                "warn",
+            )
         elif self._spark_scan_running:
             self._set_status("已请求取消扫描；不会发送消息，请等待当前只读步骤结束", "warn")
         else:
@@ -1966,7 +1978,7 @@ class SparkKeeperApp(QMainWindow):
                     "warn",
                 )
             elif kind == "missed_schedule":
-                scheduled_for = str(payload.get("scheduled_for", ""))
+                scheduled_for = display_beijing_time(str(payload.get("scheduled_for", "")))
                 target_count = int(payload.get("target_count", 0))
                 message = str(payload.get("message_text", ""))
                 message_kind = MessageKind(payload.get("message_kind", "text"))
@@ -1975,7 +1987,7 @@ class SparkKeeperApp(QMainWindow):
                 should_send = theme.confirm(
                     self,
                     APP_NAME,
-                    f"检测到错过的每日任务：{scheduled_for}\n目标：{target_count} 位\n好友间随机等待：{delay_min_seconds}–{delay_max_seconds} 秒\n{content}\n\n现在补发？当天防重复仍会生效。",
+                    f"检测到错过的每日任务（北京时间）：{scheduled_for}\n目标：{target_count} 位\n好友间随机等待：{delay_min_seconds}–{delay_max_seconds} 秒\n{content}\n\n现在补发？当天防重复仍会生效。",
                 )
                 if should_send:
                     self._run_missed_action(action_id, payload)

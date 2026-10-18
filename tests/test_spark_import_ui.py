@@ -126,6 +126,22 @@ def preview(scan, qapp):
         qapp.processEvents()
 
 
+def test_scan_preview_renders_aware_time_in_beijing_without_mutating_scan(scan, qapp):
+    original = replace(scan, scanned_at="2026-10-17T21:00:00-07:00")
+    parent = QWidget()
+    dialog = SparkImportPreview(
+        parent, original, set(), validate=Mock(return_value=True),
+        import_selected=Mock(), close=Mock()
+    )
+    try:
+        assert "扫描时间（北京时间）：2026-10-18 12:00:00" in dialog.limits_label.text()
+        assert original.scanned_at == "2026-10-17T21:00:00-07:00"
+    finally:
+        dialog.close()
+        parent.deleteLater()
+        qapp.processEvents()
+
+
 def row(preview, index):
     return preview.tree.topLevelItem(index)
 

@@ -151,11 +151,13 @@
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev]"
 .venv\Scripts\python.exe -m playwright install chromium
-.venv\Scripts\python.exe -m pytest
+.venv\Scripts\python.exe -m pytest --ignore=tests/test_scheduler_windows.py -m "not live"
 .venv\Scripts\python.exe -m ruff check src tests tools
 .venv\Scripts\python.exe tools\build_payload.py
 .venv\Scripts\python.exe tools\build_installer.py
 ```
+
+上述本机回归排除在线测试及 `test_scheduler_windows.py`：后者会直接创建和删除正式名称的每日任务，只能在没有真实 SparkKeeper 计划的专用测试环境单独运行。Qt 原生界面用例应串行执行，不要同时运行其他抢占窗口焦点的 GUI 验证进程。
 
 ### 只搜索诊断（开发工具）
 

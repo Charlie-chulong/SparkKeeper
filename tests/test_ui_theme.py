@@ -815,6 +815,7 @@ def test_combo_popup_keeps_round_corners_and_selection_after_native_updates(root
     qapp.processEvents()
     combo.showPopup()
     popup = combo.view().window()
+    assert QTest.qWaitForWindowExposed(popup, 3000)
     try:
         for mode in (ThemeMode.DARK, ThemeMode.LIGHT):
             theme.apply_theme(qapp, mode)
@@ -848,7 +849,7 @@ def test_combo_popup_keeps_round_corners_and_selection_after_native_updates(root
         QTest.keyClick(combo.view(), Qt.Key.Key_Escape)
         assert not popup.isVisible() and combo.currentIndex() == 12
         combo.showPopup()
-        QTest.qWait(20)
+        assert QTest.qWaitForWindowExposed(popup, 3000)
         assert not popup.mask().contains(QPoint(0, 0))
         assert popup.mask().contains(popup.rect().center())
     finally:

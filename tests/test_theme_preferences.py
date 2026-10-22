@@ -81,7 +81,7 @@ def choose(window, mode):
     QApplication.processEvents()
     combo = window.theme_combo
     combo.showPopup()
-    QApplication.processEvents()
+    wait_until(lambda: combo.view().isVisible())
     index = combo.model().index(combo.findData(mode.value), 0)
     combo.view().scrollTo(index)
     QTest.mouseClick(

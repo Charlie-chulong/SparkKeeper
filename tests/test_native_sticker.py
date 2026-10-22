@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,7 @@ NATIVE_CHAT_HTML = """
   }
   [contenteditable] { width:620px; height:50px; }
   .messageMsgInputiconAction { width:44px; height:32px; }
+  .semi-modal-wrap { display:none; position:fixed; inset:0; z-index:100; }
   .componentsemojiemojiPanel {
     display:none; position:absolute; left:40px; top:350px; width:700px; height:240px;
   }
@@ -74,14 +76,15 @@ NATIVE_CHAT_HTML = """
     <a href="https://www.douyin.com/user/native-fixture-friend"><span>测试好友</span></a>
   </div>
   <div id="messages"></div>
-  <div class="componentsemojiim-saas-modal"><div class="semi-modal-content">
+  <div class="componentsemojiim-saas-modal">
+  <div class="semi-modal-wrap"><div class="semi-modal-content">
   <div class="componentsemojiemojiPanel">
     <div class="emojiEmojiItememojiItem">
       <div class="emojiEmojiItemimgBox" data-apm-action="EmojiItem"><img></div>
       <div class="emojiEmojiItememojiItemDesc">续火花</div>
     </div>
   </div>
-  </div></div>
+  </div></div></div>
   <div data-e2e="msg-input">
     <div contenteditable="true">保留草稿</div>
     <div class="messageMsgInputinputAction">
@@ -157,8 +160,14 @@ async def native_page() -> AsyncIterator[Page]:
                         panel.parentElement.__reactFiber$nativeFixture;
                     bind(item, {sticker});
                     item.querySelector('img').src = url;
+                    const wrap = modal.querySelector('.semi-modal-wrap');
+                    window.closeNativePanel = event => {
+                        if (event.target === wrap) wrap.style.display = 'none';
+                    };
+                    wrap.addEventListener('click', closeNativePanel);
                     document.querySelector('.messageMsgInputiconAction').onclick = () => {
                         effects.panel++;
+                        wrap.style.display = 'block';
                         panel.style.display = 'block';
                     };
                     document.querySelector('[contenteditable]').oninput = () => effects.inputs++;
@@ -206,15 +215,31 @@ async def native_page() -> AsyncIterator[Page]:
 
 
 @pytest.mark.asyncio
-async def test_validation_opens_only_native_panel_and_preserves_composer() -> None:
+async def test_native_validation_leaves_search_usable_for_next_recipient() -> None:
     async with native_page() as page:
         adapter = DouyinChatAdapter(page)
         await adapter.validate_spark_sticker(native_target())
-        # Revalidation of an already-open panel must not toggle or select it.
-        await adapter.validate_spark_sticker(native_target())
-        assert await page.locator(".componentsemojiemojiPanel").is_visible()
+        search = page.locator(".search")
+        await search.click(timeout=500)
+        await search.fill("第二好友")
+        await page.evaluate("""() => {
+            const link = document.querySelector('.RightPanelHeaderconvHeader a');
+            link.href = 'https://www.douyin.com/user/native-fixture-second';
+            link.querySelector('span').textContent = '第二好友';
+            conversation.id = 'conversation-second';
+            conversation.firstPageParticipant.participants[0].sec_uid = 'native-fixture-second';
+        }""")
+        second = replace(
+            native_target(), id=2, display_name="第二好友", search_query="第二好友",
+            profile_url="https://www.douyin.com/user/native-fixture-second",
+        )
+        await adapter.validate_spark_sticker(second)
+        await search.click(timeout=500)
+        assert not await page.locator(".semi-modal-wrap").is_visible()
         assert await page.locator("[contenteditable]").inner_text() == "保留草稿"
-        assert await page.evaluate("effects") == {"panel": 1, "inputs": 0, "sticker": 0, "send": 0}
+        assert await page.evaluate("({inputs:effects.inputs,sticker:effects.sticker,send:effects.send})") == {
+            "inputs": 0, "sticker": 0, "send": 0,
+        }
         assert await page.evaluate("forbiddenReads") == 0
 
 
@@ -257,6 +282,8 @@ async def test_native_validation_rejects_unsafe_panel_without_selecting(mutation
             await DouyinChatAdapter(page).validate_spark_sticker(native_target())
         assert await page.evaluate("effects") == {"panel": 1, "inputs": 0, "sticker": 0, "send": 0}
         assert await page.locator("[contenteditable]").inner_text() == "保留草稿"
+        await page.locator(".search").click(timeout=500)
+        assert not await page.locator(".semi-modal-wrap").is_visible()
 
 
 @pytest.mark.asyncio
@@ -268,6 +295,24 @@ async def test_wrong_recipient_is_rejected_before_opening_panel() -> None:
         with pytest.raises(TargetIdentityMismatch):
             await DouyinChatAdapter(page).validate_spark_sticker(native_target())
         assert await page.evaluate("effects") == {"panel": 0, "inputs": 0, "sticker": 0, "send": 0}
+
+
+@pytest.mark.asyncio
+async def test_native_validation_stuck_backdrop_is_fatal_without_sending() -> None:
+    async with native_page() as page:
+        await page.evaluate("""() => {
+            document.querySelector('.semi-modal-wrap')
+                .removeEventListener('click', closeNativePanel);
+        }""")
+        page.set_default_timeout(500)
+        with pytest.raises(PageStructureChanged) as caught:
+            await DouyinChatAdapter(page).validate_spark_sticker(native_target())
+        assert caught.value.fatal
+        assert await page.locator(".semi-modal-wrap").is_visible()
+        assert await page.locator("[contenteditable]").inner_text() == "保留草稿"
+        assert await page.evaluate("({sticker:effects.sticker,send:effects.send})") == {
+            "sticker": 0, "send": 0,
+        }
 
 
 @pytest.mark.asyncio

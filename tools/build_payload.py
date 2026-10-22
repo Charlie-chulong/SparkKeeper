@@ -63,6 +63,14 @@ def sha256_file(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def is_runtime_browser_log(name: str) -> bool:
+    """Recognize only the canonical payload-relative Chromium headless runtime log."""
+    return re.fullmatch(
+        r"browsers/chromium_headless_shell-[0-9]+/chrome-headless-shell-win64/debug\.log",
+        name.casefold(),
+    ) is not None
+
+
 def is_sensitive_path(name: str) -> bool:
     parts = name.replace("\\", "/").casefold().split("/")
     filename = parts[-1]
@@ -241,6 +249,13 @@ def verify_build_unchanged(provenance: dict, *, root: Path) -> None:
 
 def write_release_manifest(release_directory: Path, version: str, *, provenance: dict) -> Path:
     reject_sensitive_files(release_directory)
+    # Only the staging tree is modified; never prune the shared Playwright cache.
+    # Validate links first so a runtime-looking path cannot bypass reparse checks.
+    for path in release_directory.rglob("*"):
+        if path.is_file() and is_runtime_browser_log(
+            path.relative_to(release_directory).as_posix()
+        ):
+            path.unlink()
     files = {
         path.relative_to(release_directory).as_posix(): sha256_file(path)
         for path in sorted(release_directory.rglob("*"))

@@ -41,6 +41,20 @@ def bundle(tmp_path):
     return old, new, incoming
 
 
+RUNTIME_DIR = "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64"
+
+
+def add_runtime_browser(directory: Path, *, legacy_log: bool = False) -> Path:
+    manifest_path = directory / "release-manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = {name: (directory / name).read_bytes() for name in data["files"]}
+    files[f"{RUNTIME_DIR}/chrome-headless-shell.exe"] = b"verified browser"
+    if legacy_log:
+        files[f"{RUNTIME_DIR}/debug.log"] = b"original log"
+    manifest(directory, data["version"], files)
+    return directory / RUNTIME_DIR / "debug.log"
+
+
 def probe(tmp_path, code, *, idle=True):
     script = tmp_path / "probe.ps1"
     script.write_text(
@@ -282,12 +296,22 @@ MAINTENANCE_SCENARIOS = [
     "purge-receipt-repair",
     "purge-receipt-foreign-identity",
     "purge-receipt-foreign-target",
+    "runtime-log-repair",
+    "runtime-log-repair-unknown",
+    "uninstall-runtime-log-legacy",
+    "uninstall-runtime-log-unlisted",
+    "uninstall-runtime-log-changed-browser",
+    "uninstall-runtime-log-reparse",
 ]
 
 
 @pytest.mark.parametrize("scenario", MAINTENANCE_SCENARIOS)
 def test_maintenance_transaction_contract(tmp_path, bundle, scenario):
     old, _, incoming = bundle
+    if scenario.startswith(("runtime-log-", "uninstall-runtime-log-")):
+        log = add_runtime_browser(old, legacy_log=scenario.endswith("-legacy") or scenario.startswith("runtime-log-"))
+        log.write_bytes(b"changed runtime output")
+        add_runtime_browser(incoming.parent)
     if scenario.startswith("purge-failure-repair-"):
         shutil.copytree(old, tmp_path / "old-backup")
         if scenario.endswith("-same"):
@@ -305,7 +329,7 @@ def test_maintenance_transaction_contract(tmp_path, bundle, scenario):
     )
     stdout = completed.stdout.decode(errors="replace")
     stderr = completed.stderr.decode(errors="replace")
-    if completed.returncode == 77 and scenario.startswith("purge-junction-"):
+    if completed.returncode == 77 and (scenario.startswith("purge-junction-") or scenario.endswith("-reparse")):
         pytest.skip(stdout.strip())
     assert completed.returncode == 0, f"{scenario}\n{stdout}\n{stderr}"
     assert f"PASS: {scenario}" in stdout
@@ -685,3 +709,66 @@ def test_native_setup_event_failures_are_not_swallowed(native_setup):
             remove_registration()
             if target.exists():
                 shutil.rmtree(target)
+
+
+@pytest.mark.parametrize("log_state", ["changed", "missing", "unlisted"])
+def test_upgrade_retires_runtime_log_then_accepts_regeneration(tmp_path, bundle, log_state):
+    old, new, _ = bundle
+    log = add_runtime_browser(old, legacy_log=log_state != "unlisted")
+    add_runtime_browser(new)
+    if log_state == "missing":
+        log.unlink()
+    else:
+        log.write_bytes(b"changed log")
+    probe(tmp_path, """
+$target = Join-Path $env:PROBE_ROOT 'installed'
+$incoming = Join-Path $env:PROBE_ROOT 'incoming/release-manifest.json'
+$log = Join-Path $target 'browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log'
+Invoke-InstallerPrepare $target $incoming
+Invoke-MaintenanceMutating $target
+Copy-Item -Path (Join-Path $env:PROBE_ROOT 'incoming/*') -Destination $target -Recurse -Force
+Invoke-InstallerFinish $target
+if (Test-Path -LiteralPath $log) { throw 'runtime log not retired' }
+[IO.File]::WriteAllText($log, 'regenerated runtime output')
+Invoke-InstallerPrepare $target $incoming
+Invoke-MaintenanceAbort $target
+[void](Read-ReleaseManifest $target -Installed)
+Invoke-InstallerPrepare $target $incoming
+Invoke-MaintenanceMutating $target
+Copy-Item -Path (Join-Path $env:PROBE_ROOT 'incoming/*') -Destination $target -Recurse -Force
+Invoke-InstallerFinish $target
+if (Test-Path -LiteralPath $log) { throw 'regenerated log not retired' }
+""")
+
+
+def test_upgrade_retires_unlisted_log_with_obsolete_browser_revision(tmp_path, bundle):
+    old, _, _ = bundle
+    log = add_runtime_browser(old)
+    log.write_bytes(b"regenerated runtime output")
+    probe(tmp_path, """
+$target = Join-Path $env:PROBE_ROOT 'installed'
+Invoke-InstallerPrepare $target (Join-Path $env:PROBE_ROOT 'incoming/release-manifest.json')
+Invoke-MaintenanceMutating $target
+Copy-Item -Path (Join-Path $env:PROBE_ROOT 'incoming/*') -Destination $target -Recurse -Force
+Invoke-InstallerFinish $target
+""")
+    assert not (old / RUNTIME_DIR).exists()
+
+
+@pytest.mark.parametrize("with_browser", [False, True])
+def test_installer_input_rejects_runtime_log(tmp_path, bundle, with_browser):
+    old, new, incoming = bundle
+    if with_browser:
+        add_runtime_browser(new, legacy_log=True)
+    else:
+        data = json.loads(incoming.read_text(encoding="utf-8"))
+        data["files"][f"{RUNTIME_DIR}/debug.log"] = "a" * 64
+        incoming.write_text(json.dumps(data), encoding="utf-8")
+    before = {p.relative_to(old): p.read_bytes() for p in old.rglob("*") if p.is_file()}
+    probe(tmp_path, """
+try {
+    Invoke-InstallerPrepare (Join-Path $env:PROBE_ROOT 'installed') (Join-Path $env:PROBE_ROOT 'incoming/release-manifest.json')
+    throw 'expected incoming runtime log rejection'
+} catch { if ($_.Exception.Data['ExitCode'] -ne 20) { throw } }
+""")
+    assert {p.relative_to(old): p.read_bytes() for p in old.rglob("*") if p.is_file()} == before

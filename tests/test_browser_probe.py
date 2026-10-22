@@ -11,6 +11,7 @@ from spark_keeper.automation import douyin_chat
 from spark_keeper.automation.douyin_chat import DouyinChatAdapter, PageState
 from spark_keeper.automation.errors import (
     AutomationError,
+    PageNotReady,
     SendFailed,
     SendUnknown,
     TargetAmbiguous,
@@ -56,6 +57,32 @@ async def test_page_classifier_distinguishes_login_ready_and_verification() -> N
 
             await page.set_content('<input placeholder="搜索好友">')
             assert await DouyinChatAdapter(page).classify_page() is PageState.READY
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_shell_waits_for_sidebar_layout_before_search() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1200, "height": 800})
+        try:
+            await page.set_content("""
+                <div class="componentsLeftPanelwrapper">
+                    <input placeholder="搜索">
+                    <div class="conversationConversationListwrapper">测试好友</div>
+                </div>
+            """)
+            adapter = DouyinChatAdapter(page)
+            assert await adapter.classify_page() is PageState.NOT_READY
+            with pytest.raises(PageNotReady):
+                await adapter.search_targets("测试好友")
+            assert await page.locator("input").input_value() == ""
+
+            await page.add_style_tag(content="""
+                .componentsLeftPanelwrapper { width: 304px; height: 100vh; }
+            """)
+            assert await adapter.classify_page() is PageState.READY
         finally:
             await browser.close()
 
@@ -484,6 +511,93 @@ async def test_unicode_search_submits_keyup_and_waits_for_delayed_results(
             assert json.loads(json.dumps(diagnostic, ensure_ascii=False)) == diagnostic
             assert await page.locator(".chat-action[data-clicked]").count() == 0
             assert await page.locator(".composer").inner_text() == ""
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["found", "empty", "login", "verification"])
+async def test_cold_search_preserves_sync_and_stops_at_safety_boundaries(
+    outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spark_keeper.automation.errors import (
+        AuthenticationRequired,
+        HumanVerificationRequired,
+    )
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1200, "height": 800})
+        try:
+            html = conversation_search_html() + """
+                <script>
+                    const results = document.querySelector('.search-group');
+                    results.style.display = 'none';
+                    window.hydrated = false;
+                    window.queryCommits = 0;
+                    window.unsafeActions = 0;
+                    setTimeout(() => {
+                        window.hydrated = window.searchOutcome !== 'empty';
+                    }, 12000);
+                    document.addEventListener('click', event => {
+                        if (!event.target.matches('input')) window.unsafeActions++;
+                    });
+                    document.addEventListener('keydown', event => {
+                        if (event.key === 'Enter') window.unsafeActions++;
+                    });
+                    document.addEventListener('keyup', event => {
+                        if (event.key !== 'Backspace' || event.target.value !== '测试好友') return;
+                        window.queryCommits++;
+                        if (window.queryCommits === 2
+                            && ['login', 'verification'].includes(window.searchOutcome)) {
+                            document.body.innerHTML = window.searchOutcome === 'login'
+                                ? '<input placeholder="请输入手机号"><div>扫码登录</div>'
+                                : '<div>请完成安全验证</div>';
+                            return;
+                        }
+                        // A cached empty query changes only on a new input event,
+                        // not when asynchronous conversation hydration finishes.
+                        results.style.display = window.hydrated ? '' : 'none';
+                    });
+                </script>
+            """
+            await page.route(
+                "https://www.douyin.com/chat",
+                lambda route: route.fulfill(body=html, content_type="text/html; charset=utf-8"),
+            )
+            await page.route("https://example.test/**", lambda route: route.abort())
+            await page.add_init_script(f"window.searchOutcome = {json.dumps(outcome)}")
+            await page.clock.install()
+            await page.goto(douyin_chat.CHAT_URL)
+            navigations = []
+            page.on("framenavigated", lambda frame: navigations.append(frame.url))
+            real_wait = page.wait_for_timeout
+
+            async def advance_sync(milliseconds):
+                await page.clock.fast_forward(milliseconds)
+                await real_wait(0)
+
+            monkeypatch.setattr(page, "wait_for_timeout", advance_sync)
+            # Bound the empty result without waiting a real minute. Browser
+            # virtual time still exercises the full initial search windows.
+            monkeypatch.setattr(douyin_chat, "SEARCH_HYDRATION_TIMEOUT_SECONDS", 2)
+            adapter = DouyinChatAdapter(page)
+            if outcome in ("login", "verification"):
+                error = AuthenticationRequired if outcome == "login" else HumanVerificationRequired
+                with pytest.raises(error):
+                    await adapter.search_targets("测试好友")
+            else:
+                candidates = await adapter.search_targets("测试好友")
+                if outcome == "found":
+                    assert [c.display_name for c in candidates] == ["测试好友"]
+                else:
+                    assert candidates == []
+                assert adapter._last_candidate_diagnostics["recovery"]["result"] == outcome
+            assert navigations == []
+            assert await page.evaluate("window.unsafeActions") == 0
+            if outcome in ("found", "empty"):
+                assert await page.locator(".composer").inner_text() == ""
         finally:
             await browser.close()
 

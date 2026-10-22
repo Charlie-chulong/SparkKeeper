@@ -127,11 +127,11 @@ function Assert-InstallerIdle([string]$Target) {
     }
 }
 
-function Read-IncomingManifest([string]$Path) {
-    return Assert-IncomingManifest (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+function Read-IncomingManifest([string]$Path, [switch]$Installed) {
+    return Assert-IncomingManifest (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json) -Installed:$Installed
 }
 
-function Assert-IncomingManifest($manifest) {
+function Assert-IncomingManifest($manifest, [switch]$Installed) {
     if ($manifest.format -ne 1 -or $manifest.product -cne 'SparkKeeper' -or
         $manifest.files -isnot [Management.Automation.PSCustomObject]) { Stop-Update 20 '安装包清单无效。' }
     [void](ConvertTo-ReleaseVersion $manifest.version)
@@ -140,6 +140,7 @@ function Assert-IncomingManifest($manifest) {
         $name = $entry.Name
         if ($name -match '(^/|\\|:|(^|/)\.{1,2}(/|$)|//|/$|[\x00-\x1f*?"<>|])' -or
             $name -eq 'release-manifest.json' -or $name -match '^(?i:\.installer/|unins[0-9]*\.(exe|dat|msg)$)' -or
+            (-not $Installed -and (Test-RuntimeLogPath $name)) -or
             -not $names.Add($name) -or
             $entry.Value -isnot [string] -or $entry.Value -notmatch '^[A-Fa-f0-9]{64}$') {
             Stop-Update 20 "安装清单包含不安全路径或校验值：$name"
@@ -148,6 +149,11 @@ function Assert-IncomingManifest($manifest) {
             if ($segment -match '[. ]$' -or $segment -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') {
                 Stop-Update 20 "安装清单包含不安全文件名：$name"
             }
+        }
+    }
+    foreach ($name in $names) {
+        if ((Test-RuntimeLogPath $name) -and -not (Test-InstalledRuntimeLog $name $names)) {
+            Stop-Update 20 "运行时日志缺少清单中的浏览器程序：$name"
         }
     }
     if (-not $names.Contains('SparkKeeper.exe') -or
@@ -176,12 +182,12 @@ function Invoke-InstallerPrepare([string]$Target, [string]$IncomingPath) {
     } elseif (Test-Path -LiteralPath $targetDir) {
         if (-not [IO.Directory]::Exists($targetDir)) { Stop-Update 10 '目标不是文件夹。' }
         if (@(Get-ChildItem -LiteralPath $targetDir -Force).Count) {
-            $installed = Read-ReleaseManifest $targetDir
+            $installed = Read-ReleaseManifest $targetDir -Installed
             if ((Compare-ReleaseVersion (ConvertTo-ReleaseVersion $incoming.version) $installed.Version) -lt 0) {
                 Stop-Update 21 "拒绝降级：$($installed.Version.Text) -> $($incoming.version)，不会回滚数据库。"
             }
             Assert-FilesAvailable $installed.Files $true
-            $old = Read-IncomingManifest (Join-Path $targetDir 'release-manifest.json')
+            $old = Read-IncomingManifest (Join-Path $targetDir 'release-manifest.json') -Installed
         }
     }
     $task = Get-MaintenanceTask
@@ -236,12 +242,22 @@ function Invoke-InstallerFinish([string]$Target) {
         }
     }
     $retired = @{}
+    $known = [Collections.Generic.HashSet[string]]::new($current, [StringComparer]::OrdinalIgnoreCase)
     foreach ($manifest in @($record.oldManifest) + @($record.priorManifests)) {
         if ($null -eq $manifest) { continue }
         foreach ($entry in $manifest.files.PSObject.Properties) {
             if ($current.Contains($entry.Name)) { continue }
+            [void]$known.Add($entry.Name)
             if (-not $retired.ContainsKey($entry.Name)) { $retired[$entry.Name] = @() }
             $retired[$entry.Name] += $entry.Value
+        }
+    }
+    # Retire only the exact runtime log associated with a manifest-known image,
+    # including a regenerated log absent from newer manifests.
+    foreach ($name in @($known)) {
+        if ($name -match '\A(?i:browsers/chromium_headless_shell-[0-9]+/chrome-headless-shell-win64/chrome-headless-shell\.exe)\z') {
+            $log = $name.Substring(0, $name.Length - 'chrome-headless-shell.exe'.Length) + 'debug.log'
+            if (-not $retired.ContainsKey($log)) { $retired[$log] = @() }
         }
     }
     $obsolete = [Collections.Generic.List[string]]::new()
@@ -249,14 +265,18 @@ function Invoke-InstallerFinish([string]$Target) {
         $file = Join-Path $targetDir $name.Replace('/', '\')
         if (-not (Test-Path -LiteralPath $file)) { continue }
         Assert-NoReparsePath $file
-        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
-        if ($hash -inotin $retired[$name]) {
-            Stop-Update 20 "过时文件在安装过程中变化，未删除：$file；计划保持暂停，请保留安装日志并人工处理。"
+        if ([IO.Directory]::Exists($file)) { Stop-Update 20 "过时文件路径不是普通文件：$name" }
+        if (-not (Test-InstalledRuntimeLog $name $known)) {
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+            if ($hash -inotin $retired[$name]) {
+                Stop-Update 20 "过时文件在安装过程中变化，未删除：$file；计划保持暂停，请保留安装日志并人工处理。"
+            }
         }
         $obsolete.Add($file)
     }
-    # Only unchanged manifest members can be retired. Never recursively delete.
+    # Manifest payloads require their hash; runtime logs require a safe unlink.
     foreach ($file in $obsolete) {
+        Assert-NoReparsePath $file
         [IO.File]::Delete($file)
         $parent = [IO.Path]::GetDirectoryName($file)
         while ($parent -ine $targetDir -and @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
@@ -264,7 +284,7 @@ function Invoke-InstallerFinish([string]$Target) {
             $parent = [IO.Path]::GetDirectoryName($parent)
         }
     }
-    [void](Read-ReleaseManifest $targetDir)
+    [void](Read-ReleaseManifest $targetDir -Installed)
     $record.phase = 'verified'
     Write-MaintenanceJournal $record
     $completion = Get-MaintenanceCompletionPath $targetDir

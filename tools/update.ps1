@@ -148,7 +148,18 @@ function Compare-ReleaseVersion($Left, $Right) {
     return $Left.Candidate.CompareTo($Right.Candidate)
 }
 
-function Read-ReleaseManifest([string]$Directory) {
+function Test-RuntimeLogPath([string]$Name) {
+    return $Name -match '\A(?i:browsers/chromium_headless_shell-[0-9]+/chrome-headless-shell-win64/debug\.log)\z'
+}
+
+function Test-InstalledRuntimeLog([string]$Name, [Collections.Generic.HashSet[string]]$KnownNames) {
+    if (-not (Test-RuntimeLogPath $Name)) {
+        return $false
+    }
+    return $KnownNames.Contains($Name.Substring(0, $Name.Length - 'debug.log'.Length) + 'chrome-headless-shell.exe')
+}
+
+function Read-ReleaseManifest([string]$Directory, [switch]$Installed) {
     $files = Get-ReleaseFiles $Directory
     if (-not $files.ContainsKey('release-manifest.json')) {
         Stop-Update 20 "缺少 release-manifest.json：$Directory"
@@ -162,6 +173,9 @@ function Read-ReleaseManifest([string]$Directory) {
         $version = ConvertTo-ReleaseVersion $manifest.version
         $expected = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($entry in $manifest.files.PSObject.Properties) {
+            if (-not $Installed -and (Test-RuntimeLogPath $entry.Name)) {
+                Stop-Update 20 "发行包不得包含运行时日志：$($entry.Name)"
+            }
             $name = $entry.Name
             if ($name -match '(^/|\\|:|(^|/)\.{1,2}(/|$)|//|/$|[\x00-\x1f*?"<>|])' -or
                 $name -eq 'release-manifest.json' -or -not $expected.Add($name)) {
@@ -172,15 +186,30 @@ function Read-ReleaseManifest([string]$Directory) {
                     Stop-Update 20 "清单含不安全文件名：$name"
                 }
             }
-            if ($entry.Value -isnot [string] -or $entry.Value -notmatch '^[A-Fa-f0-9]{64}$' -or
-                -not $files.ContainsKey($name)) {
+            if ($entry.Value -isnot [string] -or $entry.Value -notmatch '^[A-Fa-f0-9]{64}$') {
+                Stop-Update 20 "清单 SHA256 格式错误：$name"
+            }
+        }
+        foreach ($entry in $manifest.files.PSObject.Properties) {
+            $name = $entry.Name
+            if (Test-RuntimeLogPath $name) {
+                if (-not (Test-InstalledRuntimeLog $name $expected)) {
+                    Stop-Update 20 "运行时日志缺少清单中的浏览器程序：$name"
+                }
+                if (Test-Path -LiteralPath (Join-Path $Directory $name.Replace('/', '\')) -PathType Container) {
+                    Stop-Update 20 "运行时日志路径不是普通文件：$name"
+                }
+                continue
+            }
+            if (-not $files.ContainsKey($name)) {
                 Stop-Update 20 "清单文件缺失或 SHA256 格式错误：$name"
             }
             $actual = (Get-FileHash -LiteralPath $files[$name].FullName -Algorithm SHA256).Hash
             if ($actual -ine $entry.Value) { Stop-Update 20 "文件校验失败：$name" }
         }
         foreach ($name in $files.Keys) {
-            if ($name -ne 'release-manifest.json' -and -not $expected.Contains($name)) {
+            if ($name -ne 'release-manifest.json' -and -not $expected.Contains($name) -and
+                -not ($Installed -and (Test-InstalledRuntimeLog $name $expected))) {
                 Stop-Update 20 "目录存在清单之外的文件，拒绝丢弃：$name"
             }
         }
@@ -198,7 +227,7 @@ function Read-ReleaseManifest([string]$Directory) {
 
 function Read-InstalledRelease([string]$Directory, [bool]$LegacyAccepted) {
     if (Test-Path -LiteralPath (Join-Path $Directory 'release-manifest.json')) {
-        return Read-ReleaseManifest $Directory
+        return Read-ReleaseManifest $Directory -Installed
     }
     $files = Get-ReleaseFiles $Directory
     foreach ($item in Get-ChildItem -LiteralPath $Directory -Force) {

@@ -171,6 +171,148 @@ def test_payload_manifest_and_installer_checksum(release_bundle):
     )
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log",
+        "BROWSERS/CHROMIUM_HEADLESS_SHELL-1234/CHROME-HEADLESS-SHELL-WIN64/DEBUG.LOG",
+    ],
+)
+def test_manifest_writer_removes_only_staged_runtime_browser_logs(release_bundle, name):
+    root, program, _ = release_bundle
+    assert build["is_runtime_browser_log"](name)
+    log = program / name
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"volatile browser diagnostic")
+    executable = log.with_name("chrome-headless-shell.exe")
+    executable.write_bytes(b"browser executable")
+    provenance = build["build_provenance"](root)
+    manifest_path = build["write_release_manifest"](program, "3.0.0", provenance=provenance)
+    manifest = json.loads(manifest_path.read_bytes())
+    files_by_name = {path.casefold(): digest for path, digest in manifest["files"].items()}
+    assert not log.exists()
+    assert name.casefold() not in files_by_name
+    assert files_by_name[executable.relative_to(program).as_posix().casefold()] == (
+        build["sha256_file"](executable)
+    )
+    assert manifest["build_provenance"] == provenance
+    installer_build["validate_payload"](program, "3.0.0")
+    executable.write_bytes(b"tampered browser executable")
+    with pytest.raises(RuntimeError, match="SHA256"):
+        installer_build["validate_payload"](program, "3.0.0")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "debug.log",
+        "browsers/debug.log",
+        "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/other.log",
+        "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log.exe",
+        "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/nested/debug.log",
+        "browsers/chromium_headless_shell-next/chrome-headless-shell-win64/debug.log",
+        "browsers/chromium-1234/chrome-win64/debug.log",
+        "other/browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log",
+    ],
+)
+def test_runtime_log_lookalikes_remain_ordinary_integrity_checked_files(release_bundle, name):
+    root, program, _ = release_bundle
+    assert not build["is_runtime_browser_log"](name)
+    path = program / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"ordinary packaged file")
+    manifest_path = build["write_release_manifest"](
+        program, "3.0.0", provenance=build["build_provenance"](root)
+    )
+    assert json.loads(manifest_path.read_bytes())["files"][name] == build["sha256_file"](path)
+    installer_build["validate_payload"](program, "3.0.0")
+    path.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="SHA256"):
+        installer_build["validate_payload"](program, "3.0.0")
+    manifest = json.loads(manifest_path.read_bytes())
+    del manifest["files"][name]
+    manifest_path.write_text(json.dumps(manifest), "utf-8")
+    with pytest.raises(RuntimeError, match="额外文件"):
+        installer_build["validate_payload"](program, "3.0.0")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log",
+        "browsers/../browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log",
+        "/browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log",
+        r"browsers\chromium_headless_shell-1234\chrome-headless-shell-win64\debug.log",
+        "browsers//chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log",
+        "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log.",
+        "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log ",
+        "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log:stream",
+    ],
+)
+def test_unsafe_runtime_log_lookalikes_are_not_exempted(release_bundle, name):
+    _, program, _ = release_bundle
+    assert not build["is_runtime_browser_log"](name)
+    manifest = json.loads((program / "release-manifest.json").read_bytes())
+    manifest["files"][name] = "0" * 64
+    with pytest.raises(ValueError, match="不安全路径"):
+        installer_build["validate_manifest"](json.dumps(manifest).encode(), "3.0.0")
+
+
+@pytest.mark.parametrize("listed,present", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_new_installer_input_rejects_runtime_logs(release_bundle, listed, present, uppercase):
+    _, program, _ = release_bundle
+    name = "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log"
+    if uppercase:
+        name = name.upper()
+    path = program / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.with_name("chrome-headless-shell.exe").write_bytes(b"browser executable")
+    manifest_path = program / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    executable = path.with_name("chrome-headless-shell.exe")
+    manifest["files"][executable.relative_to(program).as_posix()] = build["sha256_file"](
+        executable
+    )
+    if present:
+        path.write_bytes(b"volatile browser diagnostic")
+    if listed:
+        manifest["files"][name] = hashlib.sha256(b"volatile browser diagnostic").hexdigest()
+        with pytest.raises(RuntimeError, match="运行数据"):
+            installer_build["validate_manifest"](json.dumps(manifest).encode(), "3.0.0")
+    manifest_path.write_text(json.dumps(manifest), "utf-8")
+    with pytest.raises(RuntimeError, match="运行数据"):
+        installer_build["validate_payload"](program, "3.0.0")
+    assert path.exists() == present
+
+
+@pytest.mark.parametrize("link_check", ["is_symlink", "is_junction"])
+def test_runtime_log_removal_never_bypasses_reparse_rejection(
+    release_bundle, monkeypatch, link_check
+):
+    root, program, _ = release_bundle
+    log = (
+        program
+        / "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log"
+    )
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"must not unlink through a linked directory")
+    original_check = getattr(Path, link_check)
+    monkeypatch.setattr(
+        Path, link_check, lambda path: path == log.parent or original_check(path)
+    )
+    manifest_path = program / "release-manifest.json"
+    before = manifest_path.read_bytes()
+    with pytest.raises(RuntimeError, match="链接或重解析"):
+        build["write_release_manifest"](
+            program, "3.0.0", provenance=build["build_provenance"](root)
+        )
+    with pytest.raises(RuntimeError, match="链接或重解析"):
+        installer_build["validate_payload"](program, "3.0.0")
+    assert log.read_bytes() == b"must not unlink through a linked directory"
+    assert manifest_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("version", ["3.0.0", "3.0.0rc1", "3.1.2rc10"])
 def test_release_versions(version):
     assert build["validate_version"](version) == version
@@ -987,6 +1129,22 @@ def test_payload_build_binds_only_unchanged_source_and_actual_command(
     playwright.write_bytes(b"synthetic playwright path; never executed")
     browsers = root / ".venv" / "browsers"
     browsers.mkdir()
+    cache_files = {
+        "chrome.exe": b"synthetic browser",
+        "chromium_headless_shell-1234/chrome-headless-shell-win64/chrome-headless-shell.exe": (
+            b"synthetic headless browser"
+        ),
+        "chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log": (
+            b"shared cache runtime log; never modify"
+        ),
+        "chromium_headless_shell-1234/chrome-headless-shell-win64/other.log": (
+            b"ordinary browser file"
+        ),
+    }
+    for name, data in cache_files.items():
+        path = browsers / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
     for key, value in (
         ("ROOT", root),
         ("PYTHON", python),
@@ -1011,11 +1169,13 @@ def test_payload_build_binds_only_unchanged_source_and_actual_command(
             "SparkKeeper.exe",
             "_internal/runtime.dll",
             "_internal/PySide6/plugins/platforms/qwindows.dll",
-            "_internal/playwright/driver/package/.local-browsers/chrome.exe",
         ):
             path = built / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"synthetic installer payload")
+        shutil.copytree(
+            browsers, built / "_internal/playwright/driver/package/.local-browsers"
+        )
         if change_stage == "compile":
             (root / "src" / "spark_keeper" / "app.py").write_bytes(b"source B")
 
@@ -1044,10 +1204,24 @@ def test_payload_build_binds_only_unchanged_source_and_actual_command(
             argument.replace(str(root), "${ROOT}") for argument in commands[1]
         ]
         publish["validate_payload"](output / "SparkKeeper", "3.0.0")
+        manifest_files = json.loads(manifest_path.read_bytes())["files"]
+        for name, content in cache_files.items():
+            staged = output / "SparkKeeper" / "browsers" / name
+            if name.endswith("/debug.log"):
+                assert not staged.exists()
+                assert f"browsers/{name}" not in manifest_files
+            else:
+                assert staged.read_bytes() == content
+                assert manifest_files[f"browsers/{name}"] == build["sha256_file"](staged)
     else:
         with pytest.raises(RuntimeError, match="构建期间"):
             build["main"]()
         assert not manifest_path.exists()
+    assert {
+        path.relative_to(browsers).as_posix(): path.read_bytes()
+        for path in browsers.rglob("*")
+        if path.is_file()
+    } == cache_files
     assert {path: path.read_bytes() for path in historical} == historical
     assert set(output.glob("*.zip")) == {old_archive}
     assert set(output.glob("*.zip.sha256")) == {old_checksum}

@@ -242,6 +242,69 @@ try {
     $script:Task = New-ProbeTask
 
     switch -Regex ($Scenario) {
+        '^runtime-log-repair(-unknown)?$' {
+            $log = Join-Path $target 'browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log'
+            Invoke-InstallerPrepare $target $incoming
+            Invoke-MaintenanceMutating $target
+            [IO.File]::WriteAllText((Join-Path $target 'SparkKeeper.exe'), 'partial copy')
+            [IO.File]::WriteAllText($log, 'runtime output during interrupted maintenance')
+            . Import-ProbeGuard
+            if ($Scenario.EndsWith('-unknown')) {
+                $unknown = $log + '.exe'
+                [IO.File]::WriteAllText($unknown, 'unknown executable')
+                Expect-Code { Invoke-InstallerPrepare $target $incoming } 20
+                Assert-Probe ([IO.File]::ReadAllText($unknown) -ceq 'unknown executable') 'repair discarded log lookalike'
+                Assert-Probe (-not $script:Task.Enabled) 'unknown repair restored task'
+                [IO.File]::Delete($unknown)
+            }
+            Invoke-InstallerPrepare $target $incoming
+            Complete-Install
+            Assert-NoPending
+            Assert-Probe (-not (Test-Path -LiteralPath $log)) 'repair did not retire stale runtime log'
+            Assert-Probe $script:Task.Enabled 'repair did not restore original task state'
+            Assert-DataIntact
+            break
+        }
+        '^uninstall-runtime-log-(legacy|unlisted|changed-browser|reparse)$' {
+            $log = Join-Path $target 'browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log'
+            $browser = Join-Path (Split-Path -Parent $log) 'chrome-headless-shell.exe'
+            Invoke-UninstallPrepare $target
+            [void](Assert-Journal 'uninstall-mutating' 'uninstall')
+            if ($Scenario.EndsWith('-changed-browser')) {
+                [IO.File]::WriteAllText($browser, 'changed executable')
+                Expect-Code { Invoke-UninstallRemoveFiles $target } 20
+                Assert-Probe ([IO.File]::ReadAllText($browser) -ceq 'changed executable') 'uninstall removed changed browser'
+                Assert-Probe (Test-Path -LiteralPath $log) 'uninstall deleted log before all executable checks passed'
+                Assert-Probe (Test-Path -LiteralPath (Join-Path $target 'SparkKeeper.exe')) 'hash rejection partially removed payload'
+                Assert-DataIntact
+                break
+            }
+            if ($Scenario.EndsWith('-reparse')) {
+                [IO.File]::Delete($log)
+                $external = Join-Path $env:PROBE_ROOT 'runtime-log-junction-destination'
+                [void][IO.Directory]::CreateDirectory($external)
+                $externalSentinel = Join-Path $external 'external.txt'
+                [IO.File]::WriteAllText($externalSentinel, 'outside data')
+                $junction = $log
+                try { [void](New-Item -ItemType Junction -Path $junction -Target $external) }
+                catch { [Console]::WriteLine('SKIP: Cannot create isolated junction: ' + $_.Exception.Message); exit 77 }
+                Expect-Code { Invoke-UninstallRemoveFiles $target } 20
+                Assert-Probe ([IO.File]::ReadAllText($externalSentinel) -ceq 'outside data') 'runtime exception followed a junction'
+                Assert-Probe (Test-Path -LiteralPath $browser) 'reparse rejection partially removed payload'
+                Assert-DataIntact
+                break
+            }
+            [IO.File]::WriteAllText($log, 'runtime output after uninstall prepare')
+            . Import-ProbeGuard
+            Invoke-UninstallRemoveFiles $target
+            Assert-Probe (-not (Test-Path -LiteralPath $log)) 'uninstall left runtime log'
+            Assert-Probe (-not (Test-Path -LiteralPath $browser)) 'uninstall left browser'
+            Assert-DataIntact
+            Invoke-UninstallFinish $target
+            Assert-Purged
+            Assert-Probe ($script:DeleteCalls -eq 1) 'uninstall deleted wrong number of fixture tasks'
+            break
+        }
         '^owned-(enabled|disabled|none|principal-account|principal-xml-sid)$' {
             $original = $Scenario -in @('owned-enabled', 'owned-principal-account', 'owned-principal-xml-sid')
             if ($Scenario -eq 'owned-none') { $script:Task = $null }

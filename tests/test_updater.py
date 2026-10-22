@@ -352,3 +352,133 @@ def test_target_mutex_releases_after_failed_update(tmp_path, release_pair):
     runtime.write_bytes(valid)
     result = run_update(tmp_path, source, target)
     assert result.returncode == 0, result.stderr
+
+
+RUNTIME_DIR = "browsers/chromium_headless_shell-1234/chrome-headless-shell-win64"
+
+
+def add_manifest_file(directory: Path, name: str, content: bytes) -> None:
+    path = directory / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    manifest_path = directory / "release-manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["files"][name] = hashlib.sha256(content).hexdigest()
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize("log_state", ["changed", "missing", "unlisted", "uppercase"])
+def test_installed_runtime_log_does_not_block_upgrade(tmp_path, release_pair, log_state):
+    source, target = release_pair
+    directory = RUNTIME_DIR.upper() if log_state == "uppercase" else RUNTIME_DIR
+    add_manifest_file(target, f"{directory}/chrome-headless-shell.exe", b"verified browser")
+    log_name = f"{directory}/debug.log"
+    if log_state != "unlisted":
+        add_manifest_file(target, log_name, b"old log")
+    log = target / log_name
+    if log_state == "missing":
+        log.unlink()
+    else:
+        log.write_bytes(b"new runtime output")
+    old = snapshot(target)
+    result = run_update(tmp_path, source, target)
+    assert result.returncode == 0, result.stderr
+    details = json.loads(result.stdout.splitlines()[-1])
+    assert snapshot(Path(details["Backup"])) == old
+    assert snapshot(target) == snapshot(source)
+
+
+@pytest.mark.parametrize("with_browser", [False, True])
+def test_incoming_manifest_must_not_list_runtime_log(tmp_path, release_pair, with_browser):
+    source, target = release_pair
+    if with_browser:
+        add_manifest_file(source, f"{RUNTIME_DIR}/chrome-headless-shell.exe", b"browser")
+    add_manifest_file(source, f"{RUNTIME_DIR}/debug.log", b"runtime log")
+    old = snapshot(target)
+    result = run_update(tmp_path, source, target)
+    assert result.returncode == 20, result.stderr
+    assert snapshot(target) == old
+
+
+@pytest.mark.parametrize("damage", [
+    "tampered-browser", "missing-browser", "orphan-log", "debug.log",
+    f"{RUNTIME_DIR}/other.log", f"{RUNTIME_DIR}/debug.log.exe",
+    "browsers/chromium_headless_shell-1234x/chrome-headless-shell-win64/debug.log",
+    "browsers/chromium_headless_shell-1234/chrome-win64/debug.log",
+])
+def test_runtime_log_exception_does_not_exempt_other_artifacts(tmp_path, release_pair, damage):
+    source, target = release_pair
+    browser = f"{RUNTIME_DIR}/chrome-headless-shell.exe"
+    if damage != "orphan-log":
+        add_manifest_file(target, browser, b"verified browser")
+    log = target / f"{RUNTIME_DIR}/debug.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"runtime output")
+    if damage == "tampered-browser":
+        (target / browser).write_bytes(b"tampered")
+    elif damage == "missing-browser":
+        (target / browser).unlink()
+    elif damage != "orphan-log":
+        extra = target / damage
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_bytes(b"unknown artifact")
+    old = snapshot(target)
+    result = run_update(tmp_path, source, target)
+    assert result.returncode == 20, result.stderr
+    assert snapshot(target) == old
+
+
+def test_unlisted_runtime_log_is_not_valid_incoming_payload(tmp_path, release_pair):
+    source, target = release_pair
+    add_manifest_file(source, f"{RUNTIME_DIR}/chrome-headless-shell.exe", b"verified browser")
+    (source / RUNTIME_DIR / "debug.log").write_bytes(b"unlisted runtime output")
+    old = snapshot(target)
+    result = run_update(tmp_path, source, target)
+    assert result.returncode == 20, result.stderr
+    assert snapshot(target) == old
+
+
+def test_installed_manifest_cannot_list_runtime_log_without_known_browser(tmp_path, release_pair):
+    source, target = release_pair
+    add_manifest_file(target, f"{RUNTIME_DIR}/debug.log", b"unchanged log")
+    old = snapshot(target)
+    result = run_update(tmp_path, source, target)
+    assert result.returncode == 20, result.stderr
+    assert snapshot(target) == old
+
+
+def test_runtime_log_reparse_is_rejected_before_upgrade(tmp_path, release_pair):
+    source, target = release_pair
+    add_manifest_file(target, f"{RUNTIME_DIR}/chrome-headless-shell.exe", b"verified browser")
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_bytes(b"outside data")
+    junction = target / RUNTIME_DIR / "debug.log"
+    setup = """
+$link = Join-Path $env:UPDATE_TARGET 'browsers/chromium_headless_shell-1234/chrome-headless-shell-win64/debug.log'
+try { [void](New-Item -ItemType Junction -Path $link -Target (Join-Path (Split-Path -Parent (Split-Path -Parent $env:UPDATE_TARGET)) 'external')) }
+catch { [Console]::Error.WriteLine($_.Exception.Message); exit 77 }
+"""
+    try:
+        result = run_update(tmp_path, source, target, setup=setup)
+        if result.returncode == 77:
+            pytest.skip(result.stderr)
+        assert result.returncode == 20, result.stderr
+        assert sentinel.read_bytes() == b"outside data"
+        assert (target / "SparkKeeper.exe").read_bytes() == b"old:SparkKeeper.exe"
+    finally:
+        if junction.exists():
+            junction.rmdir()
+
+
+def test_runtime_log_manifest_entry_cannot_be_a_directory(tmp_path, release_pair):
+    source, target = release_pair
+    add_manifest_file(target, f"{RUNTIME_DIR}/chrome-headless-shell.exe", b"verified browser")
+    add_manifest_file(target, f"{RUNTIME_DIR}/debug.log", b"legacy log")
+    (target / RUNTIME_DIR / "debug.log").unlink()
+    add_manifest_file(target, f"{RUNTIME_DIR}/debug.log/listed.txt", b"not a runtime log")
+    old = snapshot(target)
+    result = run_update(tmp_path, source, target)
+    assert result.returncode == 20, result.stderr
+    assert snapshot(target) == old

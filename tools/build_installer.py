@@ -19,6 +19,7 @@ project_version = _build["project_version"]
 release_version = _build["release_version"]
 sha256_file = _build["sha256_file"]
 is_sensitive_path = _build["is_sensitive_path"]
+is_runtime_browser_log = _build["is_runtime_browser_log"]
 reject_sensitive_files = _build["reject_sensitive_files"]
 validate_provenance = _build["validate_provenance"]
 
@@ -72,7 +73,7 @@ def validate_manifest(content: bytes, version: str) -> dict[str, str]:
         if name.casefold() in folded:
             raise ValueError(f"manifest 含大小写冲突路径：{name}")
         folded.add(name.casefold())
-        if is_sensitive_path(name):
+        if is_sensitive_path(name) or is_runtime_browser_log(name):
             raise RuntimeError(f"发行包含运行数据：{name}")
         if (
             name.casefold() == "release-manifest.json"
@@ -102,7 +103,7 @@ def validate_payload(payload: Path, version: str) -> Path:
     for path in payload.rglob("*"):
         name = path.relative_to(payload).as_posix()
         validate_member(name)
-        if is_sensitive_path(name):
+        if is_sensitive_path(name) or is_runtime_browser_log(name):
             raise RuntimeError(f"发行包含运行数据：{name}")
         if name.casefold() in folded:
             raise ValueError(f"payload 含大小写冲突路径：{name}")

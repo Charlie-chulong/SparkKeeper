@@ -152,11 +152,11 @@ function Read-MaintenanceJournal([string]$Target) {
             $record.phase -cnotin @('prepared', 'paused', 'mutating', 'verified', 'restoring', 'uninstall-mutating', 'uninstall-verified', 'uninstall-purging')) {
             throw '产品、安装身份、目标目录或阶段不匹配'
         }
-        if ($null -ne $record.oldManifest) { [void](Assert-IncomingManifest $record.oldManifest) }
+        if ($null -ne $record.oldManifest) { [void](Assert-IncomingManifest $record.oldManifest -Installed) }
         if ($record.operation -eq 'install' -and $null -eq $record.newManifest) { throw '缺少新清单' }
-        if ($null -ne $record.newManifest) { [void](Assert-IncomingManifest $record.newManifest) }
+        if ($null -ne $record.newManifest) { [void](Assert-IncomingManifest $record.newManifest -Installed) }
         if ($null -eq $record.priorManifests -or $record.priorManifests -isnot [array]) { throw '旧清单列表无效' }
-        foreach ($manifest in $record.priorManifests) { [void](Assert-IncomingManifest $manifest) }
+        foreach ($manifest in $record.priorManifests) { [void](Assert-IncomingManifest $manifest -Installed) }
         if ($null -ne $record.task) {
             if ($record.task.path -cne '\' -or $record.task.name -cne (Get-MaintenanceTaskName) -or
                 $record.task.sid -cne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or
@@ -271,6 +271,11 @@ function Assert-MaintenanceFiles($Record, $Incoming) {
             }
         }
     }
+    foreach ($name in @($known)) {
+        if ($name -match '\A(?i:browsers/chromium_headless_shell-[0-9]+/chrome-headless-shell-win64/chrome-headless-shell\.exe)\z') {
+            [void]$known.Add($name.Substring(0, $name.Length - 'chrome-headless-shell.exe'.Length) + 'debug.log')
+        }
+    }
     $metadata = @('.installer/installer_guard.ps1', '.installer/update.ps1', '.installer/maintenance_tasks.ps1',
         '.installer/uninstall-completed.json', 'unins000.exe', 'unins000.dat', 'unins000.msg')
     [void]$directories.Add('.installer')
@@ -301,8 +306,8 @@ function Test-MaintenanceOriginalFiles($Record) {
         if ($null -eq $Record.oldManifest) {
             return -not (Test-Path -LiteralPath $Record.target) -or @(Get-ChildItem -LiteralPath $Record.target -Force).Count -eq 0
         }
-        [void](Read-ReleaseManifest $Record.target)
-        $current = Read-IncomingManifest (Join-Path $Record.target 'release-manifest.json')
+        [void](Read-ReleaseManifest $Record.target -Installed)
+        $current = Read-IncomingManifest (Join-Path $Record.target 'release-manifest.json') -Installed
         return (Get-MaintenanceManifestDigest $current) -ceq (Get-MaintenanceManifestDigest $Record.oldManifest)
     } catch { return $false }
 }
@@ -351,7 +356,7 @@ function Invoke-UninstallPreflight([string]$Target) {
     $targetDir = Resolve-InstallTarget $Target
     $script:InstallerMetadataAllowed = Test-RegisteredTarget $targetDir
     $record = Read-MaintenanceJournal $targetDir
-    if ($null -eq $record) { [void](Read-ReleaseManifest $targetDir) }
+    if ($null -eq $record) { [void](Read-ReleaseManifest $targetDir -Installed) }
     else {
         $script:InstallerMetadataAllowed = $true
         Assert-MaintenanceFiles $record $record.newManifest
@@ -371,7 +376,7 @@ function Invoke-UninstallPrepare([string]$Target) {
         $record = [pscustomobject]@{
             format = 1; product = 'SparkKeeper'; appIdentity = $AppIdentity; target = $targetDir
             operation = 'uninstall'; phase = 'prepared'; task = New-MaintenanceSnapshot (Get-MaintenanceTask) $targetDir
-            oldManifest = Read-IncomingManifest (Join-Path $targetDir 'release-manifest.json')
+            oldManifest = Read-IncomingManifest (Join-Path $targetDir 'release-manifest.json') -Installed
             newManifest = $null; priorManifests = @(); purgeAuthorized = $true; purgeStarted = $false
         }
     } else { $record.operation = 'uninstall'; $record.phase = 'prepared'; $record.purgeAuthorized = $true }
@@ -398,12 +403,22 @@ function Invoke-UninstallRemoveFiles([string]$Target) {
             $known[$entry.Name] += $entry.Value
         }
     }
+    $knownNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @($known.Keys)) {
+        [void]$knownNames.Add($name)
+        if ($name -match '\A(?i:browsers/chromium_headless_shell-[0-9]+/chrome-headless-shell-win64/chrome-headless-shell\.exe)\z') {
+            $log = $name.Substring(0, $name.Length - 'chrome-headless-shell.exe'.Length) + 'debug.log'
+            if (-not $known.ContainsKey($log)) { $known[$log] = @() }
+        }
+    }
     $files = [Collections.Generic.List[string]]::new()
     foreach ($name in $known.Keys) {
         $file = Join-Path $targetDir $name.Replace('/', '\')
         if (-not (Test-Path -LiteralPath $file)) { continue }
         Assert-NoReparsePath $file
-        if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -notin $known[$name]) {
+        if ([IO.Directory]::Exists($file)) { Stop-Update 20 "待卸载文件路径不是普通文件：$name" }
+        if (-not (Test-InstalledRuntimeLog $name $knownNames) -and
+            (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -notin $known[$name]) {
             Stop-Update 20 "待卸载程序文件已变化，未开始删除：$name；请人工核对或用安装包修复。"
         }
         $files.Add($file)
@@ -431,6 +446,12 @@ function Invoke-UninstallFinish([string]$Target) {
     foreach ($manifest in @($record.oldManifest, $record.newManifest) + @($record.priorManifests)) {
         if ($null -eq $manifest) { continue }
         foreach ($entry in $manifest.files.PSObject.Properties) {
+            if ($entry.Name -match '\A(?i:browsers/chromium_headless_shell-[0-9]+/chrome-headless-shell-win64/chrome-headless-shell\.exe)\z') {
+                $log = $entry.Name.Substring(0, $entry.Name.Length - 'chrome-headless-shell.exe'.Length) + 'debug.log'
+                if (Test-Path -LiteralPath (Join-Path $targetDir $log.Replace('/', '\'))) {
+                    Stop-Update 41 '卸载后仍有浏览器运行时日志，未开始删除计划或用户数据。'
+                }
+            }
             if (Test-Path -LiteralPath (Join-Path $targetDir $entry.Name.Replace('/', '\'))) {
                 Stop-Update 41 '卸载后仍有程序文件，可能被占用；计划保持暂停，请重新安装修复后再卸载。'
             }

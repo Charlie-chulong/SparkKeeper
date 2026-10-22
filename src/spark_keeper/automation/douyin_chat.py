@@ -35,6 +35,7 @@ from .send_state import DeliveryOutcome, DeliverySample, await_delivery_terminal
 
 CHAT_URL = "https://www.douyin.com/chat"
 LOGIN_TIMEOUT_SECONDS = 300
+SEARCH_HYDRATION_TIMEOUT_SECONDS = 120
 
 
 class PageState(StrEnum):
@@ -406,6 +407,18 @@ class DouyinChatAdapter:
                     '账号存在风险', '请完成下方验证', '拖动滑块完成拼图'
                 ])) return 'human_verification';
                 if (loginPanel) return 'login_required';
+
+                // The chat shell can mount before its layout is applied. A
+                // full-width/short sidebar makes row geometry meaningless;
+                // do not report real contacts as absent on that page.
+                const sidebars = [...document.querySelectorAll(
+                    '.componentsLeftPanelwrapper'
+                )].filter(visible);
+                if (sidebars.length && !sidebars.some(element => {
+                    const r = element.getBoundingClientRect();
+                    return r.width <= window.innerWidth * 0.5
+                        && r.height >= window.innerHeight * 0.35;
+                })) return 'not_ready';
 
                 const chatSearch = [...document.querySelectorAll('input')].some(element => {
                     if (!visible(element)) return false;
@@ -1004,8 +1017,46 @@ class DouyinChatAdapter:
         return action, baseline
 
     async def validate_spark_sticker(self, target: Target) -> None:
-        """只打开并核验原生面板，绝不选择表情、编辑正文或触发发送。"""
-        await self._prepare_spark_sticker(target)
+        """核验后关闭原生面板，绝不选择表情、编辑正文或触发发送。"""
+        try:
+            await self._prepare_spark_sticker(target)
+        finally:
+            await self._dismiss_spark_sticker_panel()
+
+    async def _dismiss_spark_sticker_panel(self) -> None:
+        wraps = self.page.locator(
+            ".componentsemojiim-saas-modal .semi-modal-wrap:visible"
+        )
+        count = await wraps.count()
+        if count == 0:
+            return
+        if count != 1:
+            raise PageStructureChanged()
+        # The native modal has no close button and does not handle Escape.
+        # Click only a verified blank backdrop, never a sticker or the editor.
+        position = await wraps.evaluate(
+            """wrap => {
+                const r = wrap.getBoundingClientRect();
+                const positions = [
+                    {x: r.width / 2, y: 8},
+                    {x: 8, y: r.height / 2},
+                    {x: r.width - 8, y: r.height / 2},
+                    {x: r.width / 2, y: r.height - 8}
+                ];
+                return positions.find(({x, y}) =>
+                    x > 0 && x < r.width && y > 0 && y < r.height
+                    && document.elementFromPoint(r.left + x, r.top + y) === wrap
+                ) || null;
+            }"""
+        )
+        if position is None:
+            raise PageStructureChanged()
+        try:
+            await wraps.click(position=position)
+            await wraps.wait_for(state="hidden")
+        except PlaywrightError as exc:
+            # A stuck backdrop must stop this batch, not poison later lookups.
+            raise PageStructureChanged() from exc
 
     async def send_spark_sticker_and_confirm(
         self, target: Target, on_trigger: _TRIGGER_CALLBACK
@@ -1066,40 +1117,15 @@ class DouyinChatAdapter:
     async def _enter_chat_search_query(
         search: Locator,
         query: str,
-        *,
-        recovery: bool = False,
     ) -> None:
         # Unicode insertion lacks a complete key cycle in Chromium. Finish with
         # a normal keyboard edit, preserving the query and never pressing Enter.
         await search.click()
-        if recovery:
-            # A fresh input sequence re-arms the live-search handler after the
-            # initial chat data load races the first query.
-            await search.fill("")
-            await search.fill(query)
-            await search.press("ArrowLeft")
-            await search.press("ArrowRight")
-        else:
-            await search.press("Control+A")
-            await search.press("Backspace")
-            await search.press_sequentially(query, delay=100)
+        await search.press("Control+A")
+        await search.press("Backspace")
+        await search.press_sequentially(query, delay=100)
         await search.press("Space")
         await search.press("Backspace")
-
-    async def _refresh_chat_for_search(self) -> Locator:
-        # The chat search box can render before the IM conversation data is
-        # hydrated. Refresh only after a complete lookup miss, before any
-        # target row is clicked or any message is triggered.
-        await self.page.reload(wait_until="domcontentloaded")
-        state = await self._wait_for_page_state(15)
-        if state is PageState.LOGIN_REQUIRED:
-            raise AuthenticationRequired()
-        if state is PageState.HUMAN_VERIFICATION:
-            raise HumanVerificationRequired()
-        if state is not PageState.READY:
-            raise PageNotReady()
-        await self.page.wait_for_timeout(1500)
-        return await self._chat_search_input()
 
     async def _wait_for_candidate_rows(
         self,
@@ -1118,6 +1144,7 @@ class DouyinChatAdapter:
                 await self._enter_chat_search_query(search, query)
             for attempt in range(20):
                 await self.page.wait_for_timeout(250)
+                await self._require_ready()
                 rows = await self._extract_candidate_rows(query, search)
                 self._last_candidate_diagnostics.update(
                     poll_count=attempt + 1,
@@ -1133,31 +1160,42 @@ class DouyinChatAdapter:
 
         if not self.page.url.startswith(CHAT_URL):
             return []
-        # A first target can race chat-data hydration even though the search
-        # box already made the page look ready. One fresh page load is allowed
-        # for navigation-only recovery; it never retries a send.
+        # Initial IM synchronization can take longer than both empty windows.
+        # Reloading here restarts that synchronization. Keep the page alive and
+        # resubmit because an empty search need not update when data arrives.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SEARCH_HYDRATION_TIMEOUT_SECONDS
         recovery_diagnostic = {
-            "strategy": "reload_and_fill",
+            "strategy": "wait_and_resubmit",
             "attempted": True,
+            "timeout_seconds": SEARCH_HYDRATION_TIMEOUT_SECONDS,
         }
-        self._last_candidate_diagnostics["recovery"] = recovery_diagnostic
-        search = await self._refresh_chat_for_search()
-        await self._enter_chat_search_query(search, query, recovery=True)
-        for attempt in range(20):
-            await self.page.wait_for_timeout(250)
-            rows = await self._extract_candidate_rows(query, search)
-            self._last_candidate_diagnostics.update(
-                poll_count=attempt + 1,
-                poll_wait_ms=(attempt + 1) * 250,
-                query_submissions=3,
-                total_poll_count=40 + attempt + 1,
-                total_poll_wait_ms=10_000 + (attempt + 1) * 250,
-                previous_search_attempts=list(previous_search_attempts),
-            )
-            if rows:
-                recovery_diagnostic["result"] = "found"
-                self._last_candidate_diagnostics["recovery"] = recovery_diagnostic
-                return rows
+        submission = 2
+        total_poll_count = 40
+        while loop.time() < deadline:
+            await self._require_ready()
+            search = await self._chat_search_input()
+            await self._enter_chat_search_query(search, query)
+            submission += 1
+            for attempt in range(20):
+                if loop.time() >= deadline:
+                    break
+                await self.page.wait_for_timeout(250)
+                await self._require_ready()
+                rows = await self._extract_candidate_rows(query, search)
+                total_poll_count += 1
+                self._last_candidate_diagnostics.update(
+                    poll_count=attempt + 1,
+                    poll_wait_ms=(attempt + 1) * 250,
+                    query_submissions=submission,
+                    total_poll_count=total_poll_count,
+                    total_poll_wait_ms=total_poll_count * 250,
+                    previous_search_attempts=list(previous_search_attempts),
+                    recovery=recovery_diagnostic,
+                )
+                if rows:
+                    recovery_diagnostic["result"] = "found"
+                    return rows
         recovery_diagnostic["result"] = "empty"
         self._last_candidate_diagnostics["recovery"] = recovery_diagnostic
         return []
